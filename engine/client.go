@@ -44,6 +44,8 @@ type Client struct {
 	Upstream sp.Vector
 	// Epoch is the cloud epoch last synced under.
 	Epoch string
+	// LastRefused is what the upstream refused in the last round (diagnostics and status).
+	LastRefused []sp.Refusal
 }
 
 // SyncResult summarises one round.
@@ -122,6 +124,7 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		}
 		res.Pushed += len(req.Items)
 		res.Refused += len(pr.Refused)
+		c.LastRefused = pr.Refused
 		if !progress {
 			break
 		}
@@ -169,6 +172,17 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// ReofferPending reports whether the cloud epoch changed and this node has not yet finished
+// re-offering what the cloud may have lost (S16 item 4). A device whose upstream is the hub must then
+// also sync with the cloud directly: a hub may hold only a placeholder for a slot whose body the
+// restored cloud lost, and then the origin is the only node that can deliver it.
+func (c *Client) ReofferPending(ctx context.Context) bool {
+	cfg := c.E.Config()
+	var v string
+	_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error { v, _, _ = tx.GetMeta(metaReoffer); return nil })
+	return v == "1"
 }
 
 func (c *Client) placeholders(ctx context.Context) ([]sp.Ref, error) {

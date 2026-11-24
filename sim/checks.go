@@ -3,6 +3,7 @@ package sim
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -99,6 +100,9 @@ func (w *World) Quiesce(ctx context.Context, maxRounds int) QuiesceReport {
 			_, _ = w.Hub.SyncUpstream(ctx)
 		}
 		sig := w.signature(ctx)
+		if os.Getenv("SYNC_DEBUG") != "" && w.HubUp != nil && len(w.Hub.LastRefused()) > 0 {
+			fmt.Printf("round %d hub refused: %+v\n", r, w.Hub.LastRefused()[:min(3, len(w.Hub.LastRefused()))])
+		}
 		if sig == prev {
 			same++
 			if same >= 2 {

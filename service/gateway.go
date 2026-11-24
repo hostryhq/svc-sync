@@ -142,6 +142,8 @@ func (t tenantTrust) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	return pub, err == nil
 }
 
+func (t tenantTrust) CloudKey() (*ecdsa.PublicKey, bool) { return t.op, t.op != nil }
+
 // engineFor returns the tenant's engine.
 func (g *Gateway) engineFor(tenant string) *engine.Engine {
 	g.mu.Lock()

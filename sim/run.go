@@ -415,6 +415,24 @@ func (r *runner) finish(ctx context.Context) *Result {
 	if !rep.Converged {
 		res.Problems = append(res.Problems, Problem{"quiesce", fmt.Sprintf("no quiescence in %d rounds", rep.Rounds)})
 	}
+	if os.Getenv("SYNC_DEBUG") != "" {
+		_, cv, _ := w.CloudState(ctx)
+		hv, _ := w.Hub.Engine().Vector(ctx)
+		for _, d := range w.Devices {
+			dv, _ := d.Eng.Vector(ctx)
+			fmt.Printf("DBG %s vs cloud: %s | vs hub: %s | keylost=%v\n", d.ID, vecDiff(dv, cv), vecDiff(dv, hv), d.KeyLost)
+		}
+		fmt.Printf("DBG hub vs cloud: %s\n", vecDiff(hv, cv))
+		_ = w.Hub.Engine().Config().Store.InTx(ctx, w.Tenant, func(tx repository.Tx) error {
+			sq, _ := tx.SealSeqs("outlet:"+w.Outlet, "dev-02-pos", 0)
+			fmt.Printf("DBG hub seals for dev-02: %v\n", sq)
+			recs, _ := tx.Range("outlet:"+w.Outlet, "dev-02-pos", 8, 30, 30)
+			for _, r := range recs {
+				fmt.Printf("DBG hub slot %d status=%s body=%v\n", r.Seq, r.Status, r.Body != "")
+			}
+			return nil
+		})
+	}
 	// Phase A: verdicts as the table says, and what devices are told equals what the cloud holds.
 	res.Problems = append(res.Problems, w.CheckVerdicts(ctx, r.exp)...)
 	res.Problems = append(res.Problems, w.CheckReadBack(ctx)...)

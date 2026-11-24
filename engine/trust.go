@@ -82,3 +82,13 @@ func (c *CredCache) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	pub, err := e.Cred.PubKey()
 	return pub, err == nil
 }
+
+// CloudKey returns the gateway op-signing key from the pack.
+func (c *CredCache) CloudKey() (*ecdsa.PublicKey, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, k := range c.cloudKeys {
+		return k, true
+	}
+	return nil, false
+}

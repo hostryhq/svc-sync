@@ -130,6 +130,20 @@ func (g *Gateway) Release(ctx context.Context, tenant string, ref sp.Ref, o Rele
 			return err
 		}
 		status = v.Status
+		if (v.Status == repository.StAccepted || v.Status == repository.StFlagged) && hasMark(v.Marks, MarkUnsealed) {
+			// The tail has no origin seal: the gateway endorses the released op so that peers can take it.
+			if _, _, _, have, err := tx.GetSeal(rec.Stream, rec.Origin, rec.Seq); err != nil {
+				return err
+			} else if !have {
+				sl, err := sp.MakeSeal(g.cfg.OpKey, rec.Origin, rec.Stream, rec.Seq, rec.H)
+				if err != nil {
+					return err
+				}
+				if err := tx.PutSeal(rec.Stream, rec.Origin, rec.Seq, rec.H, sl.Kid, sl.Sig); err != nil {
+					return err
+				}
+			}
+		}
 		return g.stored(tx, e, rec, p, v)
 	})
 	if err == nil && status != "" {

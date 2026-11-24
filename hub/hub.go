@@ -113,7 +113,7 @@ func (h *Hub) streamOK(stream string) bool {
 
 // authorize: the hub stores ops only of unrevoked devices of its own outlet (and cloud origins
 // re-offered by a device), in streams inside the outlet's binding.
-func (h *Hub) authorize(_ repository.Tx, _ engine.Caller, origin, stream string, _ bool) string {
+func (h *Hub) authorize(_ repository.Tx, c engine.Caller, origin, stream string, _ bool) string {
 	if !h.streamOK(stream) {
 		return sp.ReasonStream
 	}
@@ -123,7 +123,9 @@ func (h *Hub) authorize(_ repository.Tx, _ engine.Caller, origin, stream string,
 	if _, ok := h.cache.Get(origin); !ok {
 		return sp.ReasonOrigin
 	}
-	if h.IsRevoked(origin) {
+	// Revocation is enforced where ops are first accepted, not on pull, so the history of a
+	// since-revoked device stays readable (S17).
+	if c.ID != "upstream" && h.IsRevoked(origin) {
 		return sp.ReasonRevoked
 	}
 	return ""
@@ -348,4 +350,12 @@ func decodeProof(hd http.Header) (sp.HubProof, error) {
 		return p, err
 	}
 	return p, json.Unmarshal(raw, &p)
+}
+
+// LastRefused is what the cloud refused in the last upstream round.
+func (h *Hub) LastRefused() []sp.Refusal {
+	if h.cl == nil {
+		return nil
+	}
+	return h.cl.LastRefused
 }

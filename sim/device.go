@@ -171,6 +171,10 @@ func (d *Device) Sync(ctx context.Context) error {
 		}
 	} else {
 		d.W.Via.HubOK++
+		if d.HubC.ReofferPending(ctx) && !d.KeyLost {
+			// After a cloud restore the origin re-offers directly: the hub may hold only a placeholder.
+			_ = d.SyncCloud(ctx)
+		}
 	}
 	d.reuploadRecoveries(ctx)
 	return err

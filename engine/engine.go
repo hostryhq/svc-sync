@@ -829,7 +829,7 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			}
 			steps = append(steps, step{p: &Parsed{Item: it}})
 			prevH = it.H
-			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && chainOK && sl.H == it.H && sl.Verify(pub) {
+			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && chainOK && sl.H == it.H && e.sealOK(sl, pub) {
 				covered = i + 1
 				steps[i].sealed = true
 			}
@@ -851,7 +851,7 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 		steps = append(steps, step{p: &Parsed{Item: it, Body: b}, ph: b.PH})
 		prevH = it.H
-		if s, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && s.H == it.H && s.Verify(pub) {
+		if s, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && s.H == it.H && e.sealOK(s, pub) {
 			covered = i + 1
 			steps[i].sealed = true
 		}
@@ -1283,4 +1283,21 @@ func (e *Engine) RecoveryUpload(ctx context.Context, old string, up sp.Vector, l
 		return nil
 	})
 	return req, err
+}
+
+// sealOK accepts a seal made by the origin, or an endorsement by the gateway op-signing key. The
+// gateway endorses the released unsealed tail of a key-lost origin (A1.3 item 6) so that peers may
+// take the ops after an owner released them; the endorsement is what the seal-less tail lacks.
+func (e *Engine) sealOK(s sp.Seal, originPub *ecdsa.PublicKey) bool {
+	if s.Verify(originPub) {
+		return true
+	}
+	if ck, ok := e.cfg.Trust.(interface {
+		CloudKey() (*ecdsa.PublicKey, bool)
+	}); ok {
+		if pub, ok := ck.CloudKey(); ok && pub != nil {
+			return s.Verify(pub)
+		}
+	}
+	return false
 }
