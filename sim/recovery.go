@@ -45,6 +45,9 @@ func (w *World) RecoverDevice(d *Device, byOwner bool) (*Recovery, error) {
 
 // ActivateRecovery activates the installation with a recovery code.
 func (w *World) ActivateRecovery(d *Device, code string) (*Recovery, error) {
+	if bound, ok := w.Identity.RecoveryCodeDevice(code); !ok || bound != d.ID {
+		return nil, ErrRecoveryCode // a code for another device is refused (KL6)
+	}
 	old := d.ID
 	d.Recovered = append(d.Recovered, old)
 	newID := fmt.Sprintf("%s-r%d", old, len(d.Recovered))
@@ -115,6 +118,9 @@ func (w *World) UploadRevokedDrain(ctx context.Context, d *Device, oldID string,
 	tok := w.Token(auth.TypeDrain, oldID, "")
 	return w.CloudTransportToken("dev-cloud:"+oldID, tok).QuarantineUpload(ctx, items)
 }
+
+// ErrRecoveryCode is returned for a code that is not for this installation.
+var ErrRecoveryCode = errors.New("sim: recovery code is not for this device")
 
 // ErrStuck is returned when a bounded loop does not finish.
 var ErrStuck = errors.New("sim: did not settle")

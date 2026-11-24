@@ -41,6 +41,7 @@ type Stats struct {
 	Crashes, HubKills, HubWipes, Rollbacks      int
 	KeyLosses, Injected, Partitions, QuiesceRds int
 	Net                                         NetStats
+	HubOK, HubFail, CloudDirect                 int
 }
 
 // Result is the outcome of one run.
@@ -444,6 +445,7 @@ func (r *runner) finish(ctx context.Context) *Result {
 		}
 	}
 	r.st.Net = w.Net.Stats
+	r.st.HubOK, r.st.HubFail, r.st.CloudDirect = w.Via.HubOK, w.Via.HubFail, w.Via.CloudDirect
 	res.Stats = r.st
 	res.Trace = r.trace
 	if len(res.Trace) > 400 {

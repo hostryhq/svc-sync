@@ -65,6 +65,9 @@ func main() {
 		agg.KeyLosses += a.KeyLosses
 		agg.Injected += a.Injected
 		agg.Partitions += a.Partitions
+		agg.HubOK += a.HubOK
+		agg.HubFail += a.HubFail
+		agg.CloudDirect += a.CloudDirect
 		agg.Net.Calls += a.Net.Calls
 		agg.Net.Lost += a.Net.Lost
 		agg.Net.LostAck += a.Net.LostAck
@@ -107,6 +110,7 @@ func main() {
 	fmt.Printf("\n%d runs in %s, %d with divergences %v\n", total, time.Since(start).Round(time.Second), failed, seeds)
 	fmt.Printf("ops=%d bills=%d held=%d voided=%d flagged=%d injected=%d | crashes=%d hub-restarts=%d hub-wipes=%d cloud-rollbacks=%d key-losses=%d partitions=%d\n",
 		agg.Ops, agg.Bills, agg.Held, agg.Voided, agg.Flagged, agg.Injected, agg.Crashes, agg.HubKills, agg.HubWipes, agg.Rollbacks, agg.KeyLosses, agg.Partitions)
+	fmt.Printf("device syncs: via hub=%d, hub failed=%d, fell back to cloud=%d\n", agg.HubOK, agg.HubFail, agg.CloudDirect)
 	fmt.Printf("network: calls=%d lost=%d lost-acks=%d duplicates=%d stale-replays=%d\n", agg.Net.Calls, agg.Net.Lost, agg.Net.LostAck, agg.Net.Dups, agg.Net.Replays)
 	if failed > 0 {
 		os.Exit(1)

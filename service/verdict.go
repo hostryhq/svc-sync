@@ -298,7 +298,7 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 	}
 	if v.Void && !p.Opaque {
 		_, err := e.RecordAndSealTx(tx, engine.Input{Stream: rec.Stream, Intent: sp.IntentVoid, Muts: []sp.Mut{{
-			E: "sync_void", ID: sp.Ref{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq}.Key(), K: sp.KInsert,
+			E: "sync_void", ID: sp.VoidID(sp.Ref{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq}), K: sp.KInsert,
 			F: map[string]any{"origin": rec.Origin, "stream": rec.Stream, "seq": rec.Seq, "reason": sp.VoidReasonCloud},
 		}}})
 		return err

@@ -164,7 +164,13 @@ func (d *Device) SyncCloud(ctx context.Context) error {
 func (d *Device) Sync(ctx context.Context) error {
 	err := d.SyncHub(ctx)
 	if err != nil {
+		d.W.Via.HubFail++
 		err = d.SyncCloud(ctx)
+		if err == nil {
+			d.W.Via.CloudDirect++
+		}
+	} else {
+		d.W.Via.HubOK++
 	}
 	d.reuploadRecoveries(ctx)
 	return err
@@ -344,9 +350,19 @@ func (d *Device) KDSOp(rng *Rand) (sp.Item, error) {
 func (d *Device) PriceOp(rng *Rand) (sp.Item, error) {
 	item := fmt.Sprintf("menu-%d", rng.Range(1, 5))
 	var prev string
-	d.Eng.WithState(func(s *engine.State) { prev = s.FieldStamp("menu_item", item, "price_paise") })
-	return d.Do(pManager, engine.Input{Stream: "brand:" + d.W.Brand, Intent: "menu.price.set", Muts: []sp.Mut{
-		{E: "menu_item", ID: item, K: sp.KSet, F: map[string]any{"price_paise": int64(rng.Range(50, 400) * 100)}, Prev: map[string]string{"price_paise": prev}}}})
+	var exists bool
+	d.Eng.WithState(func(s *engine.State) {
+		prev = s.FieldStamp("menu_item", item, "price_paise")
+		_, exists = s.Row("menu_item", item)
+	})
+	price := int64(rng.Range(50, 400) * 100)
+	m := sp.Mut{E: "menu_item", ID: item, K: sp.KSet, F: map[string]any{"price_paise": price}, Prev: map[string]string{"price_paise": prev}}
+	if !exists {
+		// First sight of the item: an insert with its name, so the row exists. Concurrent inserts
+		// of one id from two devices merge field by field like any other last-writer-wins edit.
+		m = sp.Mut{E: "menu_item", ID: item, K: sp.KInsert, F: map[string]any{"name": item, "price_paise": price}, Prev: map[string]string{"price_paise": prev}}
+	}
+	return d.Do(pManager, engine.Input{Stream: "brand:" + d.W.Brand, Intent: "menu.price.set", Muts: []sp.Mut{m}})
 }
 
 // ActivateSeriesOp is a manager's offline activation of the device's dormant series (S7).

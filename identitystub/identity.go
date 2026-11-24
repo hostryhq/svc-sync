@@ -471,3 +471,20 @@ func (i *Identity) InAnyPackOf(tenant, outlet, actor string) bool {
 	}
 	return false
 }
+
+// PinTokenFailure counts a failed PIN check at the pin token request against the same counter the
+// gateway uses (A1.2 item 4: failures at the token request and at the gateway share it).
+func (i *Identity) PinTokenFailure(tenant, actor, device, sid string) {
+	i.CheckProof(tenant, device, actor, sid, "bogus-at-token-request", false)
+}
+
+// RecoveryCodeDevice names the device a recovery code is bound to.
+func (i *Identity) RecoveryCodeDevice(code string) (string, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	r := i.recs[code]
+	if r == nil {
+		return "", false
+	}
+	return r.Old, true
+}

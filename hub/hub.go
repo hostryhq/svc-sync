@@ -22,6 +22,9 @@ import (
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
+// PubKey is an ECDSA public key.
+type PubKey = ecdsa.PublicKey
+
 // Config builds a Hub.
 type Config struct {
 	Tenant, Outlet, Brand string
@@ -168,8 +171,15 @@ func (h *Hub) Hello(ctx context.Context, p api.Principal, req sp.HelloRequest) (
 	if h.cl != nil {
 		epoch = h.cl.Epoch
 	}
+	// cloud_vector is what the cloud confirmed to this hub at its last upstream contact: a device
+	// may treat its ops under it as delivered to the cloud (delivery state in_cloud via the hub).
+	var cv sp.Vector
+	if h.cl != nil {
+		cv = h.cl.Upstream
+	}
 	return sp.HelloResponse{
-		Protocol: sp.ProtocolVersion, Role: string(engine.RoleHub), NodeID: h.cfg.Cred.Cred.DeviceID,
+		CloudVector: cv,
+		Protocol:    sp.ProtocolVersion, Role: string(engine.RoleHub), NodeID: h.cfg.Cred.Cred.DeviceID,
 		Time: h.cfg.Now().UTC().Format(time.RFC3339Nano), Epoch: epoch, Vector: v, MinSupportedVersion: "0.0.0",
 		Streams: []string{"outlet:" + h.cfg.Outlet, "tenant:" + h.cfg.Tenant},
 	}, nil

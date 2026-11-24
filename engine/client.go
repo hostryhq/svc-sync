@@ -225,16 +225,18 @@ func (t *HTTPTransport) do(ctx context.Context, method, path string, in, out any
 			return err
 		}
 	}
-	var rdr io.Reader
+	wire := body
 	gz := false
 	if len(body) > 1024 {
 		var buf bytes.Buffer
 		w := gzip.NewWriter(&buf)
 		_, _ = w.Write(body)
 		_ = w.Close()
-		rdr, gz = &buf, true
-	} else if body != nil {
-		rdr = bytes.NewReader(body)
+		wire, gz = buf.Bytes(), true
+	}
+	var rdr io.Reader
+	if wire != nil {
+		rdr = bytes.NewReader(wire)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(t.Base, "/")+path, rdr)
 	if err != nil {
@@ -245,7 +247,8 @@ func (t *HTTPTransport) do(ctx context.Context, method, path string, in, out any
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 	if t.Authorize != nil {
-		if err := t.Authorize(req, body); err != nil {
+		// Credentials cover the bytes on the wire (compressed when compressed).
+		if err := t.Authorize(req, wire); err != nil {
 			return err
 		}
 	}

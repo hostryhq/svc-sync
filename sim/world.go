@@ -59,6 +59,8 @@ type World struct {
 	HubUp   *engine.Client
 	HubH    http.Handler
 
+	// Via counts which upstream device syncs used.
+	Via     struct{ HubOK, HubFail, CloudDirect int }
 	Devices []*Device
 	byID    map[string]*Device
 }

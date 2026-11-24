@@ -341,3 +341,6 @@ type SnapshotRow struct {
 	Fields map[string]any `json:"f"`
 	Gone   bool           `json:"gone,omitempty"`
 }
+
+// VoidID is the row id of the sync_void record that names a refused op: "<stream>|<origin>|<seq>".
+func VoidID(r Ref) string { return r.Stream + "|" + r.Origin + "|" + strconv.FormatInt(r.Seq, 10) }
