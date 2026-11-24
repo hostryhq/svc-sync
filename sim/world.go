@@ -30,6 +30,8 @@ type WorldOptions struct {
 	Pos, Waiters, KDS int
 	// CloudDSN selects the gateway store: empty means SQLite in Dir, "postgres://..." the dev stack.
 	CloudDSN string
+	// Start is the fake clock's start; zero means 09:00 IST on 24 Nov 2026.
+	Start time.Time
 	// NoHub builds a world with no LAN hub.
 	NoHub bool
 }
@@ -74,6 +76,9 @@ var managerPerms = append(append([]string{}, cashierPerms...), "menu.edit", "ser
 func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) {
 	clk := testkit.NewClock()
 	clk.Set(time.Date(2026, 11, 24, 3, 30, 0, 0, time.UTC)) // 09:00 IST
+	if !opt.Start.IsZero() {
+		clk.Set(opt.Start)
+	}
 	w := &World{Ctx: ctx, Opt: opt, Clock: clk, Net: NewNet(rng.R), Tenant: testkit.ContextA().TenantID.String(), Outlet: testkit.ContextA().OutletID.String(),
 		Brand: testkit.ContextB().OutletID.String(), byID: map[string]*Device{}}
 	id, err := identitystub.New(clk.Now, nil)
@@ -142,7 +147,13 @@ func (w *World) startGateway() error {
 func (w *World) RestartGateway() error { return w.startGateway() }
 
 func (w *World) cloudClient(link, device string, typ auth.TokenType, subject string) *http.Client {
-	return &http.Client{Transport: w.Net.RoundTripper(link, w.CloudH)}
+	return &http.Client{Transport: w.Net.RoundTripper(link, w.cloudIndirect())}
+}
+
+// cloudIndirect resolves the gateway handler per call, so a restart or restore of the gateway
+// does not strand transports created earlier.
+func (w *World) cloudIndirect() http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { w.CloudH.ServeHTTP(rw, r) })
 }
 
 // Token mints a device or drain token (the identity service's job in production).
@@ -244,4 +255,37 @@ func removeDBFiles(path string) {
 	for _, s := range []string{"", "-wal", "-shm"} {
 		_ = os.Remove(path + s)
 	}
+}
+
+// SnapshotCloud takes a consistent copy of the gateway database (a backup).
+func (w *World) SnapshotCloud(name string) error {
+	path := filepath.Join(w.Opt.Dir, "snap-"+name+".db")
+	removeDBFiles(path)
+	_, err := w.GWStore.DB().ExecContext(w.Ctx, "VACUUM INTO '"+path+"'")
+	return err
+}
+
+// RestoreCloud replaces the gateway database with a backup and stamps a new restore epoch, as
+// hostry-restore does (ADR-0006 H6), then restarts the gateway.
+func (w *World) RestoreCloud(name, epoch string) error {
+	snap := filepath.Join(w.Opt.Dir, "snap-"+name+".db")
+	live := filepath.Join(w.Opt.Dir, "cloud.db")
+	if err := w.GWStore.Close(); err != nil {
+		return err
+	}
+	removeDBFiles(live)
+	raw, err := os.ReadFile(snap)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(live, raw, 0o600); err != nil {
+		return err
+	}
+	if w.GWStore, err = repository.Open("file:" + live); err != nil {
+		return err
+	}
+	if err := repository.SetPlatformMeta(w.Ctx, w.GWStore, service.MetaEpochID, epoch); err != nil {
+		return err
+	}
+	return w.startGateway()
 }

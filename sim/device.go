@@ -16,6 +16,9 @@ import (
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
+// NumRec is a legal number and the origin that allocated it.
+type NumRec struct{ Number, Origin string }
+
 // Device is a simulated tablet, counter or KDS with a local store and the real sync engine.
 type Device struct {
 	W      *World
@@ -31,9 +34,10 @@ type Device struct {
 	HubC   *engine.Client
 	CloudC *engine.Client
 
-	KeyLost   bool
-	Crashes   int
-	Recovered []string // old origins this installation adopted
+	KeyLost    bool
+	Crashes    int
+	Recovered  []string // old origins this installation adopted
+	Recoveries []*Recovery
 
 	sessions  map[string]string
 	n         int
@@ -44,8 +48,8 @@ type Device struct {
 	lastSeal  time.Time
 	// Recorded is every op this installation recorded under any of its origins.
 	Recorded []sp.Ref
-	// Numbers are the legal numbers it allocated, in order.
-	Numbers []string
+	// Numbers are the legal numbers it allocated, in order, with the origin that numbered them.
+	Numbers []NumRec
 }
 
 type seriesSrc struct{ d *Device }
@@ -158,10 +162,24 @@ func (d *Device) SyncCloud(ctx context.Context) error {
 
 // Sync talks to the hub when it answers, otherwise to the cloud (S2, S12).
 func (d *Device) Sync(ctx context.Context) error {
-	if err := d.SyncHub(ctx); err == nil {
-		return nil
+	err := d.SyncHub(ctx)
+	if err != nil {
+		err = d.SyncCloud(ctx)
 	}
-	return d.SyncCloud(ctx)
+	d.reuploadRecoveries(ctx)
+	return err
+}
+
+// reuploadRecoveries repeats the recovery upload of every adopted origin: a no-op when the cloud
+// holds the attested tail, and the re-offer of it after a cloud restore (A1.3 item 10).
+func (d *Device) reuploadRecoveries(ctx context.Context) {
+	for _, rc := range d.Recoveries {
+		for i := 0; i < 20; i++ {
+			if done, err := d.W.UploadRecovery(ctx, d, rc); err != nil || done {
+				break
+			}
+		}
+	}
 }
 
 // SealTick stores a seal at least every 5 minutes while the device holds unpushed ops (A1.3 item 8).
@@ -208,7 +226,7 @@ func (d *Device) record(in engine.Input, noSession bool) (sp.Item, error) {
 	d.Recorded = append(d.Recorded, sp.Ref{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq})
 	if in.DocType != "" {
 		if b, err := sp.DecodeBody(it.Body); err == nil && b.Doc != nil {
-			d.Numbers = append(d.Numbers, b.Doc.Number)
+			d.Numbers = append(d.Numbers, NumRec{b.Doc.Number, it.Origin})
 		}
 	}
 	return it, nil

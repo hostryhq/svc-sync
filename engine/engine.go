@@ -829,6 +829,10 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			}
 			steps = append(steps, step{p: &Parsed{Item: it}})
 			prevH = it.H
+			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && chainOK && sl.H == it.H && sl.Verify(pub) {
+				covered = i + 1
+				steps[i].sealed = true
+			}
 			continue
 		}
 		if sp.Hash(it.Body) != it.H {

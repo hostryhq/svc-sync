@@ -18,7 +18,7 @@ func (d *Device) LoseKey() { d.KeyLost = true }
 
 // CloudTransportToken is a transport to the gateway with an explicit token (drain tokens).
 func (w *World) CloudTransportToken(link, token string) *engine.HTTPTransport {
-	return &engine.HTTPTransport{Base: "http://cloud", Client: &http.Client{Transport: w.Net.RoundTripper(link, w.CloudH)},
+	return &engine.HTTPTransport{Base: "http://cloud", Client: &http.Client{Transport: w.Net.RoundTripper(link, w.cloudIndirect())},
 		Authorize: func(r *http.Request, _ []byte) error {
 			r.Header.Set("Authorization", "Bearer "+token)
 			return nil
@@ -80,7 +80,9 @@ func (w *World) ActivateRecovery(d *Device, code string) (*Recovery, error) {
 	if err := d.open(); err != nil {
 		return nil, err
 	}
-	return &Recovery{Old: old, New: newID, RecID: rec.ID}, nil
+	rc := &Recovery{Old: old, New: newID, RecID: rec.ID}
+	d.Recoveries = append(d.Recoveries, rc)
+	return rc, nil
 }
 
 // UploadRecovery pushes the old origin's unconfirmed ops through the recovery drain token until

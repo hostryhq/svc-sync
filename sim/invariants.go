@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
@@ -22,11 +23,22 @@ type Expectations struct {
 	// Foreign lists numbers deliberately claimed in a series that belongs to another device; they
 	// are excluded from the uniqueness check (the register marks them instead).
 	Foreign map[string]bool
+	// Reasons and Origins are holds that are allowed without a per-op expectation: a skewed
+	// clock quarantines every later last-writer-wins op of that device for a while, and a
+	// recovered origin's whole uploaded tail is held.
+	Reasons map[string]bool
+	Origins map[string]bool
 }
+
+// AllowReason permits any quarantine with this reason.
+func (e *Expectations) AllowReason(r string) { e.Reasons[r] = true }
+
+// AllowOrigin permits quarantines of every op of this origin (a recovered, key-lost origin).
+func (e *Expectations) AllowOrigin(o string) { e.Origins[o] = true }
 
 // NewExpectations returns an empty oracle.
 func NewExpectations() *Expectations {
-	return &Expectations{Ops: map[string]Expect{}, Foreign: map[string]bool{}}
+	return &Expectations{Ops: map[string]Expect{}, Foreign: map[string]bool{}, Reasons: map[string]bool{}, Origins: map[string]bool{}}
 }
 
 // Add records an expectation for an op item.
@@ -101,7 +113,7 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 	wantHash, wantDet, wantPay := cs.Hash(), cs.DetectorHash(), sumPayments(cs)
 	for _, n := range nodes {
 		if vecString(n.vec) != vecString(cvec) {
-			bad("vector", "%s differs from cloud\n  node : %s\n  cloud: %s", n.name, vecString(n.vec), vecString(cvec))
+			bad("vector", "%s differs from cloud: %s%s", n.name, vecDiff(n.vec, cvec), slotDetail(cloud, n.vec, cvec))
 		}
 		if h := n.st.Hash(); h != wantHash {
 			bad("state-hash", "%s state hash differs from cloud (%d rows vs %d)", n.name, n.st.RowCount(), cs.RowCount())
@@ -135,18 +147,10 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 	// 3. Every op a device recorded is at the cloud; nothing a device recorded was dropped.
 	for _, d := range w.Devices {
 		for _, ref := range d.Recorded {
-			r, ok := cloud[ref.Key()]
+			_, ok := cloud[ref.Key()]
 			if !ok {
 				bad("lost-op", "%s recorded by %s is not at the cloud", ref.Key(), d.ID)
 				continue
-			}
-			if r.Status == repository.StVoided || r.Status == repository.StQuarantined {
-				// allowed only when the oracle expects it
-				if exp == nil || exp.Ops[ref.Key()].Status == "" {
-					if r.Status == repository.StQuarantined {
-						bad("unexpected-hold", "%s ended %s (%s)", ref.Key(), r.Status, r.Reason)
-					}
-				}
 			}
 		}
 	}
@@ -155,17 +159,18 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 	// no finalised document ever voided.
 	seen := map[string]string{}
 	for _, d := range w.Devices {
-		for _, n := range d.Numbers {
+		for _, nr := range d.Numbers {
+			n := nr.Number
 			if len(n) > 16 {
 				bad("number-length", "%q is longer than 16 characters", n)
 			}
-			if exp != nil && exp.Foreign[n+"@"+d.ID] {
+			if exp != nil && exp.Foreign[n+"@"+nr.Origin] {
 				continue
 			}
-			if o, dup := seen[n]; dup && o != d.ID {
-				bad("number-unique", "%s issued by both %s and %s", n, o, d.ID)
+			if o, dup := seen[n]; dup && o != nr.Origin {
+				bad("number-unique", "%s issued by both %s and %s", n, o, nr.Origin)
 			}
-			seen[n] = d.ID
+			seen[n] = nr.Origin
 		}
 	}
 	rep, err := w.GW.Register(ctx, w.Tenant)
@@ -183,23 +188,126 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 		}
 	}
 
-	// 6. Verdict oracle.
-	if exp != nil {
-		keys := make([]string, 0, len(exp.Ops))
-		for k := range exp.Ops {
-			keys = append(keys, k)
+	return ps
+}
+
+// CheckVerdicts runs the verdict oracle before the manager's review: every injected op ends in the
+// state the S11 table gives it, no trading fact is dropped, and no op is held that nobody
+// provoked.
+func (w *World) CheckVerdicts(ctx context.Context, exp *Expectations) []Problem {
+	var ps []Problem
+	bad := func(check, f string, a ...any) { ps = append(ps, Problem{check, fmt.Sprintf(f, a...)}) }
+	cloud, err := readAll(ctx, w.GWStore, w.Tenant)
+	if err != nil {
+		return []Problem{{"read-cloud", err.Error()}}
+	}
+	keys := make([]string, 0, len(exp.Ops))
+	for k := range exp.Ops {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		want := exp.Ops[k]
+		r, ok := cloud[k]
+		switch {
+		case !ok:
+			bad("verdict", "%s expected %s but the cloud has no such slot (a trading fact was dropped)", k, want.Status)
+		case exp.Origins[r.Origin] && (r.Reason == "revoked" || r.Reason == "unsealed_tail"):
+			// the op reached the cloud only through the recovery upload: the revoked-origin and
+			// unsealed-tail rows come before the rest of the table
+		case r.Status == repository.StQuarantined && exp.Reasons[r.Reason] && r.Status != want.Status:
+			// held for an earlier row of the table (a recovered origin, a clock-dragged device)
+		case r.Status != want.Status || (want.Reason != "" && r.Reason != want.Reason):
+			bad("verdict", "%s expected %s/%s, got %s/%s", k, want.Status, want.Reason, r.Status, r.Reason)
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			want := exp.Ops[k]
-			r, ok := cloud[k]
-			switch {
-			case !ok:
-				bad("verdict", "%s expected %s but the cloud has no such slot (a trading fact was dropped)", k, want.Status)
-			case r.Status != want.Status || (want.Reason != "" && r.Reason != want.Reason):
-				bad("verdict", "%s expected %s/%s, got %s/%s", k, want.Status, want.Reason, r.Status, r.Reason)
+	}
+	for k, r := range cloud {
+		if r.Status != repository.StQuarantined {
+			continue
+		}
+		if _, listed := exp.Ops[k]; listed || exp.Reasons[r.Reason] || exp.Origins[r.Origin] {
+			continue
+		}
+		bad("unexpected-hold", "%s ended quarantined (%s) with nothing provoking it", k, r.Reason)
+	}
+	return ps
+}
+
+// CheckReadBack asserts A1.2: after a direct pull from the cloud each device's own_held list is
+// exactly the cloud's quarantined slots of its origin, with only the three coarse codes.
+func (w *World) CheckReadBack(ctx context.Context) []Problem {
+	var ps []Problem
+	cloud, _ := readAll(ctx, w.GWStore, w.Tenant)
+	for _, d := range w.Devices {
+		if d.KeyLost {
+			continue
+		}
+		if err := d.SyncCloud(ctx); err != nil {
+			ps = append(ps, Problem{"read-back", fmt.Sprintf("%s: %v", d.ID, err)})
+			continue
+		}
+		want := map[string]string{}
+		for k, r := range cloud {
+			if r.Origin == d.ID && r.Status == repository.StQuarantined {
+				want[k] = engine.HoldCode(r.Reason)
+			}
+		}
+		got := map[string]string{}
+		for _, h := range d.CloudC.OwnHeld {
+			got[sp.Ref{Origin: h.Origin, Stream: h.Stream, Seq: h.Seq}.Key()] = h.Code
+			switch h.Code {
+			case sp.HoldPending, sp.HoldManager, sp.HoldSupport:
+			default:
+				ps = append(ps, Problem{"read-back", fmt.Sprintf("%s was told %q: not one of the three hold codes", d.ID, h.Code)})
+			}
+		}
+		if len(got) != len(want) {
+			ps = append(ps, Problem{"read-back", fmt.Sprintf("%s shows %d slots needing attention, the cloud holds %d", d.ID, len(got), len(want))})
+			continue
+		}
+		for k, c := range want {
+			if got[k] != c {
+				ps = append(ps, Problem{"read-back", fmt.Sprintf("%s slot %s: told %q, cloud code %q", d.ID, k, got[k], c)})
 			}
 		}
 	}
 	return ps
+}
+
+func vecDiff(a, b sp.Vector) string {
+	var out []string
+	keys := map[string]bool{}
+	for k := range a {
+		keys[k] = true
+	}
+	for k := range b {
+		keys[k] = true
+	}
+	var ks []string
+	for k := range keys {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	for _, k := range ks {
+		if a[k] != b[k] {
+			o, st, _ := sp.SplitVKey(k)
+			out = append(out, fmt.Sprintf("%s [%.8s]: node %d cloud %d", o, st, a[k], b[k]))
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
+// slotDetail lists the cloud's state for the first slots a node lacks, to explain a stalled pull.
+func slotDetail(cloud map[string]repository.OpRec, node, cvec sp.Vector) string {
+	var out []string
+	for k, c := range cvec {
+		o, st, _ := sp.SplitVKey(k)
+		for q := node[k] + 1; q <= c && q <= node[k]+3; q++ {
+			if r, ok := cloud[sp.Ref{Origin: o, Stream: st, Seq: q}.Key()]; ok {
+				out = append(out, fmt.Sprintf("%s#%d=%s/%s", o, q, r.Status, r.Reason))
+			}
+		}
+	}
+	sort.Strings(out)
+	return " {" + strings.Join(out, ", ") + "}"
 }
