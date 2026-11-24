@@ -32,6 +32,8 @@ type WorldOptions struct {
 	CloudDSN string
 	// Start is the fake clock's start; zero means 09:00 IST on 24 Nov 2026.
 	Start time.Time
+	// Outbox publishes accepted ops to the transactional outbox (Postgres only).
+	Outbox bool
 	// NoHub builds a world with no LAN hub.
 	NoHub bool
 }
@@ -133,7 +135,7 @@ func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) 
 }
 
 func (w *World) startGateway() error {
-	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: false})
+	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox})
 	if err != nil {
 		return err
 	}

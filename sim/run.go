@@ -353,7 +353,7 @@ func (r *runner) inject(ctx context.Context, step int) error {
 		var prev string
 		d.Eng.WithState(func(s *engine.State) { prev = s.FieldStamp("menu_item", "menu-9", "price_paise") })
 		it, err := d.record(engine.Input{Stream: "brand:" + r.w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid, Proof: "bogus-proof",
-			Muts: []sp.Mut{{E: "menu_item", ID: "menu-9", K: sp.KSet, F: map[string]any{"price_paise": int64(1)}, Prev: map[string]string{"price_paise": prev}}}}, true)
+			Muts: []sp.Mut{{E: "menu_item", ID: "menu-9", K: sp.KInsert, F: map[string]any{"name": "forged", "price_paise": int64(1)}, Prev: map[string]string{"price_paise": prev}}}}, true)
 		add(it, err, repository.StVoided, service.ReasonProofFailed)
 	case 4: // a member removed while the outlet was offline keeps selling: flagged, never rejected
 		if !r.removed || !r.w.Identity.InAnyPack(r.w.Tenant, d.ID, pLeaver) {

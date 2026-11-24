@@ -103,6 +103,18 @@ func main() {
 	go h.RunUpstream(ctx, 500*time.Millisecond)
 	fx["hub_url"] = serve(ctx, *hubAddr, h.Handler())
 
+	hpk, err := x509.MarshalPKCS8PrivateKey(hubKey.Priv)
+	check(err)
+	hp := hub.Pack{Tenant: tenant, Outlet: outlet, Brand: brand, Cred: hubCred, PKCS8: base64.RawURLEncoding.EncodeToString(hpk),
+		IdentityPub: sp.EncodePub(id.IdentityPub()), CloudKeys: map[string]string{id.CloudKey.Kid: id.CloudKey.PublicB64()}, Peers: peers,
+		Members: []string{"m1"}, SeriesOwner: map[string]string{}, CloudURL: cloudURL}
+	for _, d := range devices {
+		for _, sr := range d["series"].([]map[string]string) {
+			hp.SeriesOwner[sr["code"]] = d["device_id"].(string)
+		}
+	}
+	hraw, _ := json.MarshalIndent(hp, "", "  ")
+	check(os.WriteFile(*out+".hub-pack.json", hraw, 0o600))
 	raw, _ := json.MarshalIndent(fx, "", "  ")
 	check(os.WriteFile(*out, raw, 0o600))
 	fmt.Printf("devstack up: cloud %s hub %s fixture %s\n", cloudURL, fx["hub_url"], *out)
