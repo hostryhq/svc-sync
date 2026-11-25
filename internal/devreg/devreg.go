@@ -17,12 +17,14 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	auth "github.com/hostryhq/go-auth"
 	"github.com/hostryhq/go-auth/authtest"
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/svc-sync/directory"
+	"github.com/hostryhq/svc-sync/hub"
 	"github.com/hostryhq/svc-sync/identitystub"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -46,6 +48,56 @@ type Registry struct {
 	ID     *identitystub.Identity
 	Issuer *authtest.Issuer
 	Now    func() time.Time
+	// CloudURL is the gateway's own URL as a hub reaches it; it goes into the hub pack (empty: the hub syncs on its LAN only).
+	CloudURL string
+
+	mu      sync.Mutex
+	hubKeys map[string]string // tenant|device -> PKCS#8 of a hub key this registry generated
+}
+
+// keep remembers the key of a hub the registry generated, so that GET /dev/v1/hub-packs/{device_id} can write the
+// hub's pack again after devices and series were added.
+func (r *Registry) keep(tenant, device, pkcs8 string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.hubKeys == nil {
+		r.hubKeys = map[string]string{}
+	}
+	r.hubKeys[tenant+"|"+device] = pkcs8
+}
+
+// hubPack builds the pack cmd/hub reads (hub.LoadPack): the hub's credential and key, the identity and gateway keys,
+// the credentials of the outlet's other devices, the members its devices' packs list and the owner of every series.
+func (r *Registry) hubPack(tenant, device string) (hub.Pack, bool) {
+	r.mu.Lock()
+	pkcs8, ok := r.hubKeys[tenant+"|"+device]
+	r.mu.Unlock()
+	cred, cok := r.ID.Credential(tenant, device)
+	if !ok || !cok {
+		return hub.Pack{}, false
+	}
+	p := hub.Pack{Tenant: tenant, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID, Cred: cred, PKCS8: pkcs8,
+		IdentityPub: sp.EncodePub(r.ID.IdentityPub()), CloudKeys: map[string]string{r.ID.CloudKey.Kid: r.ID.CloudKey.PublicB64()},
+		Members: r.ID.MembersOfOutlet(tenant, cred.Cred.OutletID), SeriesOwner: map[string]string{}, CloudURL: r.CloudURL}
+	for _, c := range r.ID.Devices(tenant, cred.Cred.OutletID) {
+		if c.Cred.DeviceID == device {
+			continue
+		}
+		p.Peers = append(p.Peers, c)
+		for _, s := range r.ID.SeriesOf(tenant, c.Cred.DeviceID) {
+			p.SeriesOwner[s.Code] = c.Cred.DeviceID
+		}
+	}
+	return p, true
+}
+
+func (r *Registry) hubPackRoute(w http.ResponseWriter, req *http.Request) {
+	p, ok := r.hubPack(req.URL.Query().Get("tenant_id"), req.PathValue("device_id"))
+	if !ok {
+		problem(w, http.StatusNotFound, "no such hub, or its key was not generated here")
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 // maxBody bounds a request.
@@ -58,6 +110,7 @@ func (r *Registry) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /dev/v1/members", r.setMember)
 	mux.HandleFunc("POST /dev/v1/manual-books", r.registerBook)
 	mux.HandleFunc("GET /dev/v1/trust", r.trust)
+	mux.HandleFunc("GET /dev/v1/hub-packs/{device_id}", r.hubPackRoute)
 }
 
 // SeriesSpec is a series issued to a device under a code the caller chose (the code tenancy issued).
@@ -86,8 +139,9 @@ type RegisterRequest struct {
 	// registry generates a key pair and returns the private half (pkcs8), for harnesses that hold no key.
 	Kid string `json:"kid"`
 	Pub string `json:"pub"`
-	// PackVersion is the version of the offline pack issued to the device (default "1").
-	PackVersion string       `json:"pack_version"`
+	// PackVersion is the version of the offline pack issued to the device, an integer of at least 1 (default 1).
+	// It is the pack_v the device's client sends on every op (ADR-0005 A3.1).
+	PackVersion int          `json:"pack_version"`
 	Series      []SeriesSpec `json:"series"`
 	Members     []MemberSpec `json:"members"`
 	// TTLSeconds is the lifetime of the token returned (default 14 minutes, at most 24 hours).
@@ -104,6 +158,9 @@ type RegisterResponse struct {
 	PKCS8       string                  `json:"pkcs8,omitempty"`
 	Series      []map[string]string     `json:"series"`
 	Peers       []sp.CredentialEnvelope `json:"peers,omitempty"`
+	PackVersion int                     `json:"pack_version"`
+	// HubPack is the file cmd/hub reads (SYNC_HUB_PACK), present for a hub registered with a generated key.
+	HubPack *hub.Pack `json:"hub_pack,omitempty"`
 }
 
 func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
@@ -164,8 +221,12 @@ func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
 	}
 	r.members(in.TenantID, in.Members)
 	pv := in.PackVersion
-	if pv == "" {
-		pv = "1"
+	if pv == 0 {
+		pv = 1
+	}
+	if pv < 1 {
+		problem(w, http.StatusBadRequest, "pack_version is an integer of at least 1")
+		return
 	}
 	r.ID.IssuePack(in.TenantID, in.DeviceID, pv, 30*24*time.Hour)
 	for _, s := range []string{"outlet:" + in.OutletID, "tenant:" + in.TenantID, "brand:" + in.BrandID} {
@@ -173,11 +234,19 @@ func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
 			r.ID.DeclareStream(in.TenantID, s)
 		}
 	}
-	out := RegisterResponse{DeviceID: in.DeviceID, Credential: cred, IdentityPub: sp.EncodePub(r.ID.IdentityPub()),
+	if kind == sp.KindHub && pkcs8 != "" {
+		r.keep(in.TenantID, in.DeviceID, pkcs8)
+	}
+	out := RegisterResponse{DeviceID: in.DeviceID, PackVersion: pv, Credential: cred, IdentityPub: sp.EncodePub(r.ID.IdentityPub()),
 		CloudKeys: map[string]string{r.ID.CloudKey.Kid: r.ID.CloudKey.PublicB64()}, Token: r.token(in.TenantID, in.DeviceID, in.TTLSeconds), PKCS8: pkcs8,
 		Series: []map[string]string{}, Peers: r.ID.Devices(in.TenantID, in.OutletID)}
 	for _, s := range r.ID.SeriesOf(in.TenantID, in.DeviceID) {
 		out.Series = append(out.Series, map[string]string{"code": s.Code, "docType": s.DocType, "state": s.State})
+	}
+	if kind == sp.KindHub {
+		if p, ok := r.hubPack(in.TenantID, in.DeviceID); ok {
+			out.HubPack = &p
+		}
 	}
 	writeJSON(w, http.StatusCreated, out)
 }
@@ -240,7 +309,7 @@ type memberRequest struct {
 	TenantID string `json:"tenant_id"`
 	MemberSpec
 	// PackVersion re-issues the pack of every device of the tenant under this version so the member is listed.
-	PackVersion string `json:"pack_version"`
+	PackVersion int `json:"pack_version"`
 }
 
 func (r *Registry) setMember(w http.ResponseWriter, req *http.Request) {
@@ -254,8 +323,12 @@ func (r *Registry) setMember(w http.ResponseWriter, req *http.Request) {
 	}
 	r.members(in.TenantID, []MemberSpec{in.MemberSpec})
 	pv := in.PackVersion
-	if pv == "" {
-		pv = "1"
+	if pv == 0 {
+		pv = 1
+	}
+	if pv < 1 {
+		problem(w, http.StatusBadRequest, "pack_version is an integer of at least 1")
+		return
 	}
 	for _, d := range r.ID.DevicesOf(in.TenantID) {
 		r.ID.IssuePack(in.TenantID, d, pv, 30*24*time.Hour)

@@ -131,7 +131,7 @@ func (tg Target) send(t *testing.T, method, path string, req *http.Request, out 
 
 func record(t *testing.T, n *node, code string) sp.Item {
 	t.Helper()
-	it, err := n.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + n.eng.Config().Outlet, Intent: "payment.record", Actor: "m1", SID: "s1", PackV: "v1",
+	it, err := n.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + n.eng.Config().Outlet, Intent: "payment.record", Actor: "m1", SID: "s1", PackV: 1,
 		Muts: []sp.Mut{{E: "payment", ID: "pay-1", K: sp.KInsert, F: map[string]any{"amount_paise": int64(1000)}}}})
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +200,7 @@ func Run(t *testing.T, tg Target) {
 		_ = b
 		a.eng = engine.New(engine.Config{Role: engine.RoleDevice, Tenant: tg.Tenant, Outlet: tg.Outlet, Origin: a.d.ID, Key: a.d.Key, Store: a.eng.Config().Store, Trust: a.eng.Config().Trust,
 			Clock: sp.NewClock(tg.Now), Series: series(b.d.SaleCode)})
-		it, err := a.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + tg.Outlet, Intent: "bill.finalize", Actor: "m1", SID: "s1", PackV: "v1", DocType: "tax_invoice",
+		it, err := a.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + tg.Outlet, Intent: "bill.finalize", Actor: "m1", SID: "s1", PackV: 1, DocType: "tax_invoice",
 			MutsFn: func(n string) []sp.Mut {
 				return []sp.Mut{{E: "bill", ID: "b1", K: sp.KInsert, F: map[string]any{"number": n, "total_paise": int64(100)}}}
 			}})

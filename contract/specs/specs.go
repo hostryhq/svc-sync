@@ -1,7 +1,7 @@
 // Package specs reads the sync contract of record from a checkout of the api-specs repository:
 // openapi/sync/v1/openapi.yaml, sync/conformance/v1.json, sync/intents/*.yaml and entities/. svc-sync
 // keeps no copy; the checkout is found through API_SPECS_DIR or as a sibling directory
-// (../api-specs, then ../api-specs-p2). contract/README.md names the pinned version.
+// (../api-specs-p2 first, then ../api-specs). contract/README.md names the pinned version.
 package specs
 
 import (
@@ -25,7 +25,7 @@ func Dir() (string, error) {
 	}
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Join(filepath.Dir(file), "..", "..")
-	for _, n := range []string{"api-specs", "api-specs-p2"} {
+	for _, n := range []string{"api-specs-p2", "api-specs"} {
 		d := filepath.Join(root, "..", n)
 		if _, err := os.Stat(filepath.Join(d, "openapi", "sync", "v1", "openapi.yaml")); err == nil {
 			return d, nil

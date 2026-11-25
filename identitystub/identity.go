@@ -31,10 +31,11 @@ const codeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // no I, O, 0, 1 (S7)
 
 // Types shared with the gateway.
 type (
-	Pack        = directory.Pack
-	SeriesInfo  = directory.SeriesInfo
-	ProofResult = directory.ProofResult
-	RecoveryRec = directory.RecoveryRec
+	Pack          = directory.Pack
+	SeriesInfo    = directory.SeriesInfo
+	ProofResult   = directory.ProofResult
+	ProofQuestion = directory.ProofQuestion
+	RecoveryRec   = directory.RecoveryRec
 )
 
 // Device is a registered device.
@@ -42,7 +43,7 @@ type Device struct {
 	Env     sp.CredentialEnvelope
 	Revoked bool
 	Reason  string
-	Packs   map[string]Pack
+	Packs   map[int]Pack
 }
 
 // Proof results.
@@ -81,6 +82,9 @@ type Identity struct {
 	recs     map[string]*RecoveryRec
 	down     bool
 	drained  map[string]map[string]int64
+	reports  map[string]directory.DrainReport
+	strong   map[string]*strongRow
+	idem     map[string]ProofResult
 	seq      int
 }
 
@@ -123,7 +127,7 @@ func (i *Identity) ActivatePub(tenant, outlet, brand, id, kind, kid, pub, recove
 	if err != nil {
 		return env, err
 	}
-	i.devices[id] = &Device{Env: env, Packs: map[string]Pack{}}
+	i.devices[id] = &Device{Env: env, Packs: map[int]Pack{}}
 	return env, nil
 }
 
@@ -162,7 +166,7 @@ func (i *Identity) Revoke(device, reason string) {
 }
 
 // RecordDrained implements directory.DrainRecorder: the stub remembers the last report per device.
-func (i *Identity) RecordDrained(_ context.Context, tenant, device string, through map[string]int64) error {
+func (i *Identity) RecordDrained(_ context.Context, tenant, device string, rep directory.DrainReport) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	d, ok := i.devices[device]
@@ -172,8 +176,20 @@ func (i *Identity) RecordDrained(_ context.Context, tenant, device string, throu
 	if i.drained == nil {
 		i.drained = map[string]map[string]int64{}
 	}
-	i.drained[device] = through
+	i.drained[device] = rep.Through
+	if i.reports == nil {
+		i.reports = map[string]directory.DrainReport{}
+	}
+	i.reports[device] = rep
 	return nil
+}
+
+// DrainReportOf returns the full report RecordDrained last stored for a device (the statement and its series).
+func (i *Identity) DrainReportOf(device string) (directory.DrainReport, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	r, ok := i.reports[device]
+	return r, ok
 }
 
 // Drained returns what RecordDrained last stored for a device.
@@ -277,6 +293,12 @@ func (i *Identity) Series(tenant, code string) (SeriesInfo, bool) {
 	return *s, true
 }
 
+// SeriesFor implements directory.Directory. The stub can tell a series of another device from one that was
+// never issued, so the gateway keeps its foreign_series / unknown_series marks apart.
+func (i *Identity) SeriesFor(tenant, _, _, code string) (SeriesInfo, bool) {
+	return i.Series(tenant, code)
+}
+
 // SeriesOf lists the series issued to a device.
 func (i *Identity) SeriesOf(tenant, device string) []SeriesInfo {
 	i.mu.Lock()
@@ -324,7 +346,7 @@ func (i *Identity) WithdrawPermission(tenant, id, perm string) {
 }
 
 // IssuePack records a pack for a device: the members and permissions as they are now.
-func (i *Identity) IssuePack(tenant, device, version string, ttl time.Duration) {
+func (i *Identity) IssuePack(tenant, device string, version int, ttl time.Duration) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	d := i.devices[device]
@@ -346,7 +368,7 @@ func (i *Identity) IssuePack(tenant, device, version string, ttl time.Duration) 
 }
 
 // PackFor returns the pack of a given version issued to the device.
-func (i *Identity) PackFor(tenant, device, version string) (Pack, bool) {
+func (i *Identity) PackFor(tenant, device string, version int) (Pack, bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	d := i.devices[device]
@@ -374,19 +396,21 @@ func (i *Identity) InAnyPack(tenant, device, actor string) bool {
 }
 
 // StillHolds reports whether the member exists now and still holds the permission.
-func (i *Identity) StillHolds(tenant, actor, perm string) bool {
+func (i *Identity) StillHolds(tenant, _, actor, perm string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	m := i.members[tenant][actor]
 	return m != nil && !m.removed && m.perms[perm]
 }
 
-// MintProof makes the proof a device holds for a member: valid proofs derive from a secret the
-// stub shares with the test devices; an invalid proof is any other string.
-func (i *Identity) MintProof(device, actor string) string {
+// MintProof makes the proof a device holds for a question: valid proofs derive from a secret the stub shares with
+// the test devices and are bound to every field identity binds (session: device, member, session id, pack_v,
+// pin_v and the opening time; approval: those of the approval record). An invalid proof is any other string.
+func (i *Identity) MintProof(q ProofQuestion) string {
 	mac := hmac.New(sha256.New, i.secret)
-	mac.Write([]byte(device + "|" + actor))
-	return "p1:" + hex.EncodeToString(mac.Sum(nil))[:24]
+	fmt.Fprintf(mac, "%s|%s|%s|%s|%d|%d|%s|%s|%s|%s|%s|%s|%s", q.Kind, q.Device, q.Member, q.SID, q.PackV, q.PinV, q.OpenedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		q.ApprovalID, q.Permission, q.Target, q.Requester, q.ActionHash, q.ApprovedAt.UTC().Format("2006-01-02T15:04:05.000Z"))
+	return "p2:" + hex.EncodeToString(mac.Sum(nil))[:24]
 }
 
 const (
@@ -395,16 +419,33 @@ const (
 	failCapDay = 10
 )
 
-// CheckProof verifies a session or action proof and keeps the shared failure counter (A1.2 item 4).
-// configClass is accepted for the interface; a locked pair is answered `locked` for every op kind.
-// A failure counts once per sid.
-func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configClass bool) ProofResult {
+// VerifyProof verifies a session or approval proof and keeps the shared failure counter (A1.2 item 4). A locked
+// pair is answered `locked` for every op kind. A failure counts once per proof (sid or approval id plus a digest
+// of the wrong proof), and a question repeated under the same Key is a replay: the first answer, counted once.
+func (i *Identity) VerifyProof(tenant string, q ProofQuestion) ProofResult {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.down {
 		return ProofUnavailable
 	}
-	pk := pairKey{tenant, actor, device}
+	ik := tenant + "|" + q.Key
+	if q.Key != "" {
+		if r, ok := i.idem[ik]; ok {
+			return r
+		}
+	}
+	r := i.verify(tenant, q)
+	if q.Key != "" {
+		if i.idem == nil {
+			i.idem = map[string]ProofResult{}
+		}
+		i.idem[ik] = r
+	}
+	return r
+}
+
+func (i *Identity) verify(tenant string, q ProofQuestion) ProofResult {
+	pk := pairKey{tenant, q.Member, q.Device}
 	f := i.fail[pk]
 	if f == nil {
 		f = &failures{sids: map[string]time.Time{}}
@@ -416,24 +457,66 @@ func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configCl
 		// checked or counted any more: the counter is capped at the lock (RB5).
 		return ProofLocked
 	}
-	if proof == "" {
+	if q.Proof == "" {
 		return ProofMissing
 	}
-	mac := hmac.New(sha256.New, i.secret)
-	mac.Write([]byte(device + "|" + actor))
-	if hmac.Equal([]byte(proof), []byte("p1:"+hex.EncodeToString(mac.Sum(nil))[:24])) {
+	if hmac.Equal([]byte(q.Proof), []byte(i.MintProof(q))) {
 		return ProofValid
 	}
 	// Each distinct wrong proof counts (key: sid plus proof digest); an identical retry does not.
-	// Invalid proofs of sales count too, so tampering on trading ops locks the pair and raises the
-	// alert (RB1).
-	ph := sha256.Sum256([]byte(proof))
-	fk := sid + "|" + hex.EncodeToString(ph[:12])
+	ph := sha256.Sum256([]byte(q.Proof))
+	id := q.SID
+	if q.Kind == directory.ProofKindApproval {
+		id = q.ApprovalID
+	}
+	fk := id + "|" + hex.EncodeToString(ph[:12])
 	if _, seen := f.sids[fk]; !seen {
 		f.sids[fk] = i.now()
 		i.refreshLock(f)
 	}
 	return ProofInvalid
+}
+
+// CheckProof is VerifyProof for a session proof asked without an idempotency key (a new question each time).
+func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, _ bool) ProofResult {
+	return i.VerifyProof(tenant, ProofQuestion{Kind: directory.ProofKindSession, Device: device, Member: actor, SID: sid, Proof: proof})
+}
+
+type strongRow struct {
+	facts directory.SessionFacts
+}
+
+// OpenStrong records a strong session (identity's own session, issued after an online sign-in).
+func (i *Identity) OpenStrong(tenant, sid, member, device string, issued time.Time) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.strong == nil {
+		i.strong = map[string]*strongRow{}
+	}
+	i.strong[tenant+"|"+sid] = &strongRow{facts: directory.SessionFacts{Member: member, Device: device, Issued: issued}}
+}
+
+// EndStrong ends a strong session at the given time (the revocation feed's `session` subject).
+func (i *Identity) EndStrong(tenant, sid string, at time.Time) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if r := i.strong[tenant+"|"+sid]; r != nil {
+		r.facts.Ended = at
+	}
+}
+
+// StrongSession implements directory.Directory.
+func (i *Identity) StrongSession(tenant, sid string) (directory.SessionFacts, directory.Lookup) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.down {
+		return directory.SessionFacts{}, directory.Unreachable
+	}
+	r := i.strong[tenant+"|"+sid]
+	if r == nil {
+		return directory.SessionFacts{}, directory.NotFound
+	}
+	return r.facts, directory.Found
 }
 
 func (i *Identity) refreshLock(f *failures) {
@@ -586,4 +669,28 @@ func (i *Identity) RecoveryCodeDevice(code string) (string, bool) {
 		return "", false
 	}
 	return r.Old, true
+}
+
+// MembersOfOutlet lists, sorted, the members that appear in a pack issued to any device of the outlet: the staff a
+// hub's pack lists (S8).
+func (i *Identity) MembersOfOutlet(tenant, outlet string) []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	set := map[string]bool{}
+	for _, d := range i.devices {
+		if d.Env.Cred.TenantID != tenant || d.Env.Cred.OutletID != outlet {
+			continue
+		}
+		for _, p := range d.Packs {
+			for m := range p.Members {
+				set[m] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for m := range set {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
 }

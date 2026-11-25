@@ -18,7 +18,7 @@ func TestDistinctWrongProofsOnOneSessionLock(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		id.CheckProof("t1", "dev", "m1", "sid-1", fmt.Sprintf("wrong-%d", i), true)
 	}
-	if got := id.CheckProof("t1", "dev", "m1", "sid-1", id.MintProof("dev", "m1"), true); got != ProofLocked {
+	if got := id.CheckProof("t1", "dev", "m1", "sid-1", id.MintProof(ProofQuestion{Kind: "session", Device: "dev", Member: "m1", SID: "sid-1"}), true); got != ProofLocked {
 		t.Fatalf("right proof after 50 distinct wrong ones = %v, want locked", got)
 	}
 }

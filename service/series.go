@@ -6,6 +6,7 @@ import (
 
 	"github.com/hostryhq/go-common/events"
 	"github.com/hostryhq/go-common/ids"
+	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -44,7 +45,7 @@ func (g *Gateway) noteSeriesClose(tx repository.Tx, rec repository.OpRec, b sp.B
 			}
 			continue
 		}
-		if si, found := g.cfg.Dir.Series(tx.Tenant(), code); !found || si.Device != rec.Origin {
+		if si, found := g.seriesOfOrigin(tx.Tenant(), rec.Origin, code); !found || si.Device != rec.Origin {
 			if err := g.alert(tx, "vendor", "high", "series_close_foreign", rec); err != nil {
 				return err
 			}
@@ -164,4 +165,10 @@ func (g *Gateway) SeriesState(tx repository.Tx, code, fy string) (last int64, re
 		return 0, false, false, err
 	}
 	return st.Last, st.Done, true, nil
+}
+
+// seriesOfOrigin asks the directory for a series code as the origin device sees it.
+func (g *Gateway) seriesOfOrigin(tenant, origin, code string) (directory.SeriesInfo, bool) {
+	cred, _ := g.cfg.Dir.Credential(tenant, origin)
+	return g.cfg.Dir.SeriesFor(tenant, origin, cred.Cred.OutletID, code)
 }

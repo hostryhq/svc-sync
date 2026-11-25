@@ -11,6 +11,7 @@ package identityclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -118,6 +119,12 @@ type ProofCheck struct {
 	PackV, PinV                   int
 	OpenedAt                      time.Time
 	Proof, ActionHash             string
+	// Key is the Idempotency-Key, derived by the gateway from (origin, stream, seq): a retry or a re-offer of the
+	// same op is a replay and never counts a failed proof twice. Empty means a fresh key (a new question).
+	Key string
+	// Approval fields (kind approval): taken from the approval record of the approval.grant op.
+	ApprovalID, Permission, Target, RequesterID, Reason string
+	ApprovedAt                                          time.Time
 }
 
 // Verdict is identity's answer about a proof. Locked is answered without a check and for every kind of op.
@@ -131,9 +138,24 @@ type Verdict struct {
 func (c *Client) VerifyProof(ctx context.Context, tenant string, in ProofCheck) (Verdict, error) {
 	body := identity.ProofVerification{Kind: identity.ProofVerificationKindSession, DeviceId: in.DeviceID, MemberId: in.MemberID,
 		PackV: in.PackV, PinV: in.PinV, Proof: in.Proof}
-	if in.ActionHash != "" {
+	if in.ApprovalID != "" || in.ActionHash != "" {
 		body.Kind = identity.ProofVerificationKindApproval
-		body.ActionHash = &in.ActionHash
+		opt := func(v string) *string {
+			if v == "" {
+				return nil
+			}
+			return &v
+		}
+		body.ActionHash = opt(in.ActionHash)
+		body.ApprovalId = opt(in.ApprovalID)
+		body.Permission = opt(in.Permission)
+		body.Target = opt(in.Target)
+		body.RequesterId = opt(in.RequesterID)
+		body.Reason = opt(in.Reason)
+		if !in.ApprovedAt.IsZero() {
+			t := in.ApprovedAt.UTC()
+			body.ApprovedAt = &t
+		}
 	}
 	if in.SessionID != "" {
 		body.SessionId = &in.SessionID
@@ -142,7 +164,10 @@ func (c *Client) VerifyProof(ctx context.Context, tenant string, in ProofCheck) 
 		t := in.OpenedAt.UTC()
 		body.OpenedAt = &t
 	}
-	idem := newKey()
+	idem := in.Key
+	if idem == "" {
+		idem = newKey()
+	}
 	var out *identity.VerifyProofResponse
 	status, err := c.attempt(ctx, tenant, func(ctx context.Context, edit identity.RequestEditorFn) (int, error) {
 		r, err := c.c.VerifyProofWithResponse(ctx, &identity.VerifyProofParams{IdempotencyKey: idem}, body, edit)
@@ -156,7 +181,7 @@ func (c *Client) VerifyProof(ctx context.Context, tenant string, in ProofCheck) 
 		return Verdict{}, err
 	}
 	if status != http.StatusOK || out.JSON200 == nil {
-		return Verdict{}, refusal(status)
+		return Verdict{}, answer(status)
 	}
 	v := Verdict{Valid: out.JSON200.Valid, Label: string(out.JSON200.Label)}
 	if out.JSON200.Locked != nil {
@@ -173,7 +198,10 @@ type PackHistory struct {
 
 // CheckPackHistory asks whether a member or a series code was issued to the device in pack packV.
 func (c *Client) CheckPackHistory(ctx context.Context, tenant, device string, packV int, member, seriesCode string) (PackHistory, error) {
-	body := identity.PackHistoryCheck{DeviceId: device, PackV: packV}
+	body := identity.PackHistoryCheck{DeviceId: device}
+	if packV > 0 { // absent means any pack issued to the device (A3.2 row 7)
+		body.PackV = &packV
+	}
 	if member != "" {
 		body.MemberId = &member
 	}
@@ -204,6 +232,8 @@ type Revocation struct {
 	ID, Subject, Tenant string
 	Device              bool // subject_type device; otherwise a session
 	At                  time.Time
+	// Reason is revoked or key_lost for a device (A3.2 row 5); RecoveryID names the recovery of a key_lost one.
+	Reason, RecoveryID string
 }
 
 // Revocations reads one page of the revocation feed after cursor. The feed is platform-wide, so the service
@@ -230,7 +260,14 @@ func (c *Client) Revocations(ctx context.Context, cursor string) (items []Revoca
 		return nil, "", refusal(status)
 	}
 	for _, r := range out.JSON200.Items {
-		items = append(items, Revocation{ID: r.Id, Subject: r.SubjectId, Tenant: r.OrganisationId, Device: r.SubjectType == identity.RevocationSubjectTypeDevice, At: r.RevokedAt})
+		rv := Revocation{ID: r.Id, Subject: r.SubjectId, Tenant: r.OrganisationId, Device: r.SubjectType == identity.RevocationSubjectTypeDevice, At: r.RevokedAt}
+		if r.Reason != nil {
+			rv.Reason = string(*r.Reason)
+		}
+		if r.RecoveryId != nil {
+			rv.RecoveryID = *r.RecoveryId
+		}
+		items = append(items, rv)
 	}
 	if out.JSON200.NextCursor != nil {
 		next = *out.JSON200.NextCursor
@@ -238,19 +275,50 @@ func (c *Client) Revocations(ctx context.Context, cursor string) (items []Revoca
 	return items, next, nil
 }
 
-// RecordDrained tells identity that a revoked device's stream is stored through the given sequences (stream
-// name to highest sequence); identity starts the wipe delay on its own clock. A replay is safe.
-func (c *Client) RecordDrained(ctx context.Context, tenant, device string, through map[string]int64) error {
+// DrainReport is what the gateway tells identity once a device-signed drain statement is satisfied (A3.3 items 4
+// and 5): the heads it stores per stream, the series list copied from the statement and the statement itself.
+type DrainReport struct {
+	// Key is the Idempotency-Key: one key per statement until identity answers.
+	Key       string
+	Through   map[string]int64
+	Series    []DrainSeries
+	Statement json.RawMessage
+}
+
+// DrainSeries is one entry of the statement's series list.
+type DrainSeries struct {
+	SeriesID, FY string
+	LastNumber   int64
+}
+
+// RecordDrained tells identity that a revoked device is drained, with the statement it signed itself. Identity
+// verifies the statement, checks the series set and starts the wipe delay on its own clock. A replay is safe.
+func (c *Client) RecordDrained(ctx context.Context, tenant, device string, rep DrainReport) error {
 	body := identity.RecordDrain{DrainedThrough: []identity.StreamSequence{}}
-	names := make([]string, 0, len(through))
-	for n := range through {
+	names := make([]string, 0, len(rep.Through))
+	for n := range rep.Through {
 		names = append(names, n)
 	}
 	sortStrings(names)
 	for _, n := range names {
-		body.DrainedThrough = append(body.DrainedThrough, identity.StreamSequence{Stream: n, Seq: int(through[n])})
+		body.DrainedThrough = append(body.DrainedThrough, identity.StreamSequence{Stream: n, Seq: int(rep.Through[n])})
 	}
-	idem := newKey()
+	series := []identity.DrainSeries{}
+	for _, s := range rep.Series {
+		series = append(series, identity.DrainSeries{SeriesId: s.SeriesID, Fy: s.FY, LastNumber: int(s.LastNumber)})
+	}
+	body.Series = &series
+	if len(rep.Statement) > 0 {
+		var st identity.DrainStatement
+		if err := json.Unmarshal(rep.Statement, &st); err != nil {
+			return err
+		}
+		body.Statement = &st
+	}
+	idem := rep.Key
+	if idem == "" {
+		idem = newKey()
+	}
 	var out *identity.RecordDeviceDrainedResponse
 	status, err := c.attempt(ctx, tenant, func(ctx context.Context, edit identity.RequestEditorFn) (int, error) {
 		r, err := c.c.RecordDeviceDrainedWithResponse(ctx, device, &identity.RecordDeviceDrainedParams{IdempotencyKey: idem}, body, edit)
@@ -267,7 +335,7 @@ func (c *Client) RecordDrained(ctx context.Context, tenant, device string, throu
 		return nil
 	}
 	if status != http.StatusOK || out.JSON200 == nil {
-		return refusal(status)
+		return answer(status)
 	}
 	return nil
 }

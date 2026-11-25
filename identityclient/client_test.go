@@ -15,7 +15,6 @@ import (
 	"time"
 
 	auth "github.com/hostryhq/go-auth"
-	"github.com/hostryhq/svc-sync/directory"
 )
 
 func testClient(t *testing.T, h http.HandlerFunc) *Client {
@@ -62,16 +61,5 @@ func TestRetryReusesTheKeyAndTheTokenNamesTheTenant(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0] == "" || keys[0] != keys[1] || tenants[0] != "tenant-a" || tenants[1] != "tenant-a" {
 		t.Fatalf("keys %v tenants %v", keys, tenants)
-	}
-	// Two outages in a row: the caller is told "unavailable".
-	d := &Directory{Client: testClient(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }),
-		Proof: func(_, _, _, _ string) (ProofParams, bool) { return ProofParams{PackV: 1, PinV: 1}, true }}
-	if got := d.CheckProof("t", "d", "m", "s", "p", false); got != directory.ProofUnavailable {
-		t.Fatalf("an outage must never read as a verdict: %v", got)
-	}
-	// No pack and PIN versions known (the op does not carry them): never "valid".
-	d.Proof = nil
-	if got := d.CheckProof("t", "d", "m", "s", "p", false); got != directory.ProofUnavailable {
-		t.Fatalf("without pin_v and opened_at the check cannot be asked: %v", got)
 	}
 }

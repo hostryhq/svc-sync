@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/directory/dirtest"
 )
 
@@ -17,7 +18,11 @@ func TestStubAnswersLockedLikeRealIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dirtest.Run(t, dirtest.Target{Dir: id, Tenant: "t1", Device: "dev", Actor: "m1",
-		Valid: func(string) string { return id.MintProof("dev", "m1") },
+	dirtest.Run(t, dirtest.Target{Dir: id, Tenant: "t1",
+		Valid: func(sid string) directory.ProofQuestion {
+			q := directory.ProofQuestion{Kind: directory.ProofKindSession, Device: "dev", Member: "m1", SID: sid, PackV: 1, PinV: 1, OpenedAt: now}
+			q.Proof = id.MintProof(q)
+			return q
+		},
 		Wrong: func(i int) string { return fmt.Sprintf("wrong-%d", i) }})
 }

@@ -55,6 +55,14 @@ type vectorFile struct {
 		Ops   int
 		Valid bool
 	} `json:"emit_batch"`
+	DrainStatement []struct {
+		Case, Pub     string
+		Statement     DrainStatement
+		SignedMessage string `json:"signed_message"`
+		StatementJCS  string `json:"statement_jcs"`
+		StatementHash string `json:"statement_hash"`
+		SigValid      bool   `json:"sig_valid"`
+	} `json:"drain_statement"`
 	ExamplePack map[string]string `json:"example_pack"`
 }
 
@@ -149,6 +157,33 @@ func TestCanonicalRejectsFractionsAndExponents(t *testing.T) {
 	for _, in := range []string{`{"a":1.5}`, `{"a":1e3}`, `{"a":9007199254740993}`} {
 		if _, err := Canonicalize([]byte(in)); err == nil {
 			t.Fatalf("%s must be refused (integer-only subset)", in)
+		}
+	}
+}
+
+func TestDrainStatementVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.DrainStatement) < 3 {
+		t.Fatal("drain_statement vectors are required (ADR-0005 A3.3)")
+	}
+	for _, c := range v.DrainStatement {
+		msg, err := c.Statement.SignedMessage()
+		if err != nil || msg != c.SignedMessage {
+			t.Errorf("%s: signed message %q (%v), vector %q", c.Case, msg, err, c.SignedMessage)
+		}
+		pub, err := DecodePub(c.Pub)
+		if err != nil {
+			t.Fatalf("%s: %v", c.Case, err)
+		}
+		if got := c.Statement.Verify(pub); got != c.SigValid {
+			t.Errorf("%s: signature valid=%v, vector says %v", c.Case, got, c.SigValid)
+		}
+		raw, err := drainJCS(c.Statement, true)
+		if err != nil || string(raw) != c.StatementJCS {
+			t.Errorf("%s: JCS with sig differs from the vector (%v)", c.Case, err)
+		}
+		if h, err := c.Statement.Hash(); err != nil || h != c.StatementHash {
+			t.Errorf("%s: statement_hash %s (%v), vector %s", c.Case, h, err, c.StatementHash)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -275,9 +276,11 @@ type Input struct {
 	IntentV  int
 	Actor    string
 	SID      string
-	PackV    string
+	PackV    int
 	Approval string
 	Proof    string
+	// PinV accompanies Proof (session.open of a pin session, approval.grant; ADR-0005 A3.1).
+	PinV int
 	// DocType allocates the next legal number of the device's series for this document type.
 	DocType string
 	// Muts builds the mutations; number is the allocated legal number (empty without DocType).
@@ -362,7 +365,7 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	}
 	b := sp.Body{
 		V: 1, Origin: origin, Stream: in.Stream, Seq: seq + 1, PH: ph, HLC: e.cfg.Clock.Next().String(), Clk: in.Clk,
-		TenantID: e.cfg.Tenant, Actor: in.Actor, SID: in.SID, PackV: in.PackV, Approval: in.Approval, Proof: in.Proof,
+		TenantID: e.cfg.Tenant, Actor: in.Actor, SID: in.SID, PackV: in.PackV, Approval: in.Approval, Proof: in.Proof, PinV: in.PinV,
 		Intent: in.Intent, IntentV: in.IntentV, At: at.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 	if b.Clk == "" {
@@ -950,7 +953,17 @@ func groupItems(items []sp.Item) []*group {
 		}
 		g.items = append(g.items, it)
 	}
+	// Outlet streams first: a session.open is an outlet op, and the ops of its session in a brand or tenant stream
+	// are judged from the stored session row (ADR-0005 A3.1 item 3), so the row must exist when they are judged.
+	sort.SliceStable(out, func(i, j int) bool { return streamRank(out[i].stream) < streamRank(out[j].stream) })
 	return out
+}
+
+func streamRank(stream string) int {
+	if strings.HasPrefix(stream, "outlet:") {
+		return 0
+	}
+	return 1
 }
 
 // HoldCode maps a quarantine reason to the coarse code a device may be told (A1.2).

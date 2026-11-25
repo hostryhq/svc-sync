@@ -77,7 +77,7 @@ func main() {
 		peers = append(peers, cred)
 		sale := id.IssueSeries(tenant, name, "tax_invoice", directory.SeriesActive)
 		cn := id.IssueSeries(tenant, name, "credit_note", directory.SeriesActive)
-		id.IssuePack(tenant, name, "p1", 30*24*time.Hour)
+		id.IssuePack(tenant, name, 1, 30*24*time.Hour)
 		pk, err := x509.MarshalPKCS8PrivateKey(kp.Priv)
 		check(err)
 		devices = append(devices, map[string]any{"device_id": name, "kid": kp.Kid, "pub": kp.PublicB64(),

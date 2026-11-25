@@ -3,10 +3,12 @@
 // the answer, and the stub once answered `locked` for configuration ops only while real identity
 // answers it for every op kind (security final verdict, Phase 1). It runs against the stub
 // (identitystub/locked_test.go) and against the real identity service through identityclient
-// (identityreal, a module of its own so that svc-identity stays out of this module's graph).
+// (identityreal, a module of its own so that svc-identity stays out of this module's graph, and
+// identityreal/live_test.go against a running identity).
 package dirtest
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/hostryhq/svc-sync/directory"
@@ -14,10 +16,11 @@ import (
 
 // Target is a directory under test with the hooks a test needs to drive the failure counter.
 type Target struct {
-	Dir                   directory.Directory
-	Tenant, Device, Actor string
-	// Valid returns the proof the device holds for the actor in session sid (a session proof is bound to it).
-	Valid func(sid string) string
+	Dir    directory.Directory
+	Tenant string
+	// Valid returns the question a device holding the actor's PIN asks in session sid: every field a session
+	// proof is bound to (device, member, pack_v, pin_v, opening time) and the valid proof itself.
+	Valid func(sid string) directory.ProofQuestion
 	// Wrong returns the i-th distinct wrong proof.
 	Wrong func(i int) string
 }
@@ -25,25 +28,33 @@ type Target struct {
 // Run executes the contract.
 func Run(t *testing.T, tg Target) {
 	t.Helper()
-	check := func(sid, proof string, config bool) directory.ProofResult {
-		return tg.Dir.CheckProof(tg.Tenant, tg.Device, tg.Actor, sid, proof, config)
+	n := 0
+	ask := func(sid, proof string) directory.ProofResult {
+		q := tg.Valid(sid)
+		if proof != "" {
+			q.Proof = proof
+		}
+		n++
+		q.Key = fmt.Sprintf("dirtest/%d", n) // a new op each time: never a replay
+		return tg.Dir.VerifyProof(tg.Tenant, q)
 	}
-	if got := check("s0", tg.Valid("s0"), false); got != directory.ProofValid {
+	if got := ask("s0", ""); got != directory.ProofValid {
 		t.Fatalf("a valid proof answers valid, got %v", got)
 	}
-	if got := check("s0", tg.Wrong(0), false); got != directory.ProofInvalid {
-		t.Fatalf("a wrong trading proof answers invalid, got %v", got)
+	if got := ask("s0", tg.Wrong(0)); got != directory.ProofInvalid {
+		t.Fatalf("a wrong proof answers invalid, got %v", got)
 	}
-	// Distinct wrong proofs lock the pair (5 in 15 minutes).
+	// Distinct wrong proofs lock the pair (5 in 15 minutes). The question is the same for every kind of op the
+	// proof later covers: identity never learns whether the op is a sale or a configuration change.
 	for i := 1; i < 6; i++ {
-		check("s0", tg.Wrong(i), i%2 == 0)
+		ask("s0", tg.Wrong(i))
 	}
-	for _, config := range []bool{true, false} {
-		if got := check("s1", tg.Valid("s1"), config); got != directory.ProofLocked {
-			t.Fatalf("a locked pair answers locked for every op kind (config=%v), got %v", config, got)
+	for i := 0; i < 2; i++ {
+		if got := ask("s1", ""); got != directory.ProofLocked {
+			t.Fatalf("a locked pair answers locked, got %v", got)
 		}
-		if got := check("s1", tg.Wrong(100), config); got != directory.ProofLocked {
-			t.Fatalf("a wrong proof on a locked pair still answers locked (config=%v), got %v", config, got)
+		if got := ask("s1", tg.Wrong(100+i)); got != directory.ProofLocked {
+			t.Fatalf("a wrong proof on a locked pair still answers locked, got %v", got)
 		}
 	}
 }

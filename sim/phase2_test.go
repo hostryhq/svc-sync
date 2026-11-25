@@ -312,27 +312,3 @@ func TestHoldDecisionConditions(t *testing.T) {
 		t.Fatal("the owner must be told of a release")
 	}
 }
-
-// A revoked device that is drained is reported to identity with the highest sequence the gateway stores per
-// stream of its own ops; a device that is not revoked is not reported; nothing reports on its own.
-func TestReportDrainedSendsTheStoredSequencesOfARevokedDevice(t *testing.T) {
-	w, _ := newTestWorld(t, 71, WorldOptions{Pos: 1, NoHub: true})
-	a := w.Devices[0]
-	it := must(a.OrderOp(NewRand(5)))
-	w.toCloud(t, a)
-	if err := w.GW.ReportDrained(bg, w.Tenant, a.ID); err != service.ErrNotFound {
-		t.Fatalf("a device that is not revoked is not drained: %v", err)
-	}
-	w.Identity.Revoke(a.ID, "stolen")
-	if _, ok := w.Identity.Drained(a.ID); ok {
-		t.Fatal("the gateway must not report a drain on its own")
-	}
-	if err := w.GW.ReportDrained(bg, w.Tenant, a.ID); err != nil {
-		t.Fatal(err)
-	}
-	got, ok := w.Identity.Drained(a.ID)
-	vec := must(w.GW.EngineFor(w.Tenant).Vector(bg))
-	if !ok || got[it.Stream] != vec[sp.VKey(a.ID, it.Stream)] || got[it.Stream] < it.Seq {
-		t.Fatalf("reported %v, stored %v", got, vec)
-	}
-}

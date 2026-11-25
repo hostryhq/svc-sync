@@ -145,7 +145,7 @@ type Dev struct {
 	d    *Double
 }
 
-// NewDevice registers a device with a sale and a credit-note series and a pack "v1".
+// NewDevice registers a device with a sale and a credit-note series and pack version 1.
 func (d *Double) NewDevice(kind string) (*Dev, error) {
 	d.mu.Lock()
 	d.devices++
@@ -163,7 +163,7 @@ func (d *Double) NewDevice(kind string) (*Dev, error) {
 	if kind == sp.KindPOS || kind == sp.KindWaiter {
 		dv.Sale = d.Identity.IssueSeries(Tenant, id, "tax_invoice", directory.SeriesActive)
 	}
-	d.Identity.IssuePack(Tenant, id, "v1", 30*24*time.Hour)
+	d.Identity.IssuePack(Tenant, id, 1, 30*24*time.Hour)
 	return dv, nil
 }
 

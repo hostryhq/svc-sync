@@ -1,5 +1,5 @@
 # Client for the internal routes of the identity contract that the sync gateway calls (x-service-callers: sync).
-# Regenerate: make gen-identity (needs api-specs bundled: run `make bundle` in api-specs first).
+# Regenerate: /mnt/d/40_Projects/Ventures/hostry-repos/api-specs-p2/.tools/bin/oapi-codegen -config oapi-codegen-identity.yaml <api-specs>/build/identity.yaml (run `make bundle` in api-specs first).
 package: identity
 output: identityclient/gen/identity.gen.go
 generate:
@@ -11,3 +11,8 @@ output-options:
     - recordDeviceDrained
     - verifyProof
     - checkPackHistory
+    - getDeviceCredential
+    - getPackGrants
+    - getMemberGrants
+    - getDeviceRecovery
+    - getSession

@@ -18,7 +18,7 @@ func TestManualBookEntryMapsToRegisteredSeries(t *testing.T) {
 	a := w.Devices[0]
 	w.Identity.IssueManualBook(w.Tenant, "BKB", w.Outlet)
 	w.Identity.SetMember(w.Tenant, pCashier, append([]string{"bill.manual_entry"}, cashierPerms...)...)
-	w.Identity.IssuePack(w.Tenant, a.ID, "v1", 24*time.Hour)
+	w.Identity.IssuePack(w.Tenant, a.ID, 1, 24*time.Hour)
 	entry := func(code string) sp.Item {
 		a.SetBadSeries(code)
 		defer a.SetBadSeries("")
@@ -59,7 +59,7 @@ func TestManualBookClosedAndOtherOutlet(t *testing.T) {
 	w, _ := newTestWorld(t, 43, WorldOptions{Pos: 1})
 	a := w.Devices[0]
 	w.Identity.SetMember(w.Tenant, pCashier, append([]string{"bill.manual_entry"}, cashierPerms...)...)
-	w.Identity.IssuePack(w.Tenant, a.ID, "v1", 24*time.Hour)
+	w.Identity.IssuePack(w.Tenant, a.ID, 1, 24*time.Hour)
 	w.Identity.IssueManualBook(w.Tenant, "BKC", w.Outlet)
 	w.Identity.SetSeriesState(w.Tenant, "BKC", "closed")
 	w.Identity.IssueManualBook(w.Tenant, "BKO", "some-other-outlet")

@@ -35,7 +35,18 @@ const (
 	IntentVoid        = "sync.void"
 	IntentPIIErase    = "sync.pii.erase"
 	IntentSessionOpen = "session.open"
+	// IntentApprovalGrant is the manager override at the counter; it carries an action proof (ADR-0005 section 8).
+	IntentApprovalGrant = "approval.grant"
 )
+
+// Session types of a session.open (ADR-0005 section 7). Only a pin session carries a proof (A3.1).
+const (
+	SessionPin    = "pin"
+	SessionStrong = "strong"
+)
+
+// TimeLayout is the layout of Body.At.
+const TimeLayout = "2006-01-02T15:04:05.000Z"
 
 // Mut is one generic mutation inside an op.
 type Mut struct {
@@ -74,11 +85,15 @@ type Body struct {
 	TenantID string `json:"tenant_id"`
 	Actor    string `json:"actor,omitempty"`
 	SID      string `json:"sid,omitempty"`
-	PackV    string `json:"pack_v,omitempty"`
+	// PackV is the offline pack version, a JSON integer >= 1 on every device-origin op (ADR-0005 A3.1).
+	PackV    int    `json:"pack_v,omitempty"`
 	Approval string `json:"approval,omitempty"`
-	// Proof is the opaque PIN-derived session or action proof (ADR-0005 section 7-8). Only the
-	// cloud can check it; a hub never looks at it.
-	Proof   string `json:"proof,omitempty"`
+	// Proof is the opaque PIN-derived session or action proof (ADR-0005 section 7-8). It travels only on
+	// session.open of a pin session and on approval.grant, together with PinV (A3.1). Only the cloud can
+	// check it; a hub never looks at it.
+	Proof string `json:"proof,omitempty"`
+	// PinV is the PIN version the proof was made under: the actor's on session.open, the approver's on approval.grant.
+	PinV    int    `json:"pin_v,omitempty"`
 	Intent  string `json:"intent"`
 	IntentV int    `json:"intent_v"`
 	At      string `json:"at"`
@@ -331,6 +346,9 @@ type PushRequest struct {
 	// a node re-offering after a cloud restore also sends endorsed ops the cloud already holds
 	// as quarantined, so that the cloud can take them as released.
 	Endorsements []Endorsement `json:"endorsements,omitempty"`
+	// DrainStatement is the device-signed list of everything a revoked device holds: the last, empty upload of
+	// a drain (ADR-0005 A3.3). Only quarantine-upload reads it.
+	DrainStatement *DrainStatement `json:"drain_statement,omitempty"`
 }
 
 // PushResponse reports what the upstream now holds.

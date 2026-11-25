@@ -68,11 +68,41 @@ func hasMark(marks []string, m string) bool {
 	return false
 }
 
-// judge gives an op that passed chain and seal checks its verdict, in the order of S11 with the
+// judge gives an op that passed chain and seal checks its verdict. When the directory could not answer a question
+// while the op was judged, the verdict is not trusted (ADR-0005 A3.2 failure rule): a configuration op or a held
+// sale waits (config_pending, judged again by ReverifyPending), and an op stored as accepted or flagged carries the
+// pending mark. An unanswered question is never "found", "held" or "valid".
+func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
+	f, faulty := g.cfg.Dir.(directory.Faulty)
+	var before uint64
+	if faulty {
+		before = f.Faults()
+	}
+	v := g.judgeOnce(tx, p, vc, rel)
+	if !faulty || f.Faults() == before || strings.HasPrefix(p.Item.Origin, engine.CloudOriginPrefix) {
+		return v
+	}
+	switch v.Status {
+	case repository.StVoided:
+		return engine.Verdict{Status: repository.StQuarantined, Reason: ReasonConfigPending}
+	case repository.StQuarantined:
+		switch v.Reason {
+		case ReasonForeignSeries, ReasonActorUnknown, ReasonIntentNotAllow, ReasonPermAbsent, ReasonPermWithdrawn, ReasonProofFailed, ReasonProofLocked:
+			return engine.Verdict{Status: repository.StQuarantined, Reason: ReasonConfigPending}
+		}
+	case repository.StAccepted, repository.StFlagged:
+		if !hasMark(v.Marks, MarkProofPending) {
+			v.Marks = append(v.Marks, MarkProofPending)
+		}
+	}
+	return v
+}
+
+// judgeOnce gives an op that passed chain and seal checks its verdict, in the order of S11 with the
 // two A1.1 rows after "origin device is revoked" and A1.3's row for the unsealed tail. rel is
 // non-nil when a manager has released the op: the holds that caused the quarantine are skipped
 // and the remaining checks still run ("checked as above").
-func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
+func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
 	tenant := tx.Tenant()
 	origin := p.Item.Origin
 	dir := g.cfg.Dir
@@ -111,6 +141,9 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	if known && b.IntentV > in.MaxV {
 		return quarantine(ReasonOpaque) // no upcaster for this intent_v (S13)
+	}
+	if b.PackV < 1 {
+		return quarantine(ReasonMalformed) // every device-origin op carries pack_v, an integer of at least 1 (A3.1 item 1)
 	}
 	var marks []string
 	if rel != nil {
@@ -155,7 +188,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 			codes[code] = true
 		}
 		for _, doc := range docs {
-			si, found := dir.Series(tenant, doc.SeriesCode())
+			si, found := dir.SeriesFor(tenant, origin, cred.Cred.OutletID, doc.SeriesCode())
 			switch {
 			case found && si.ManualBook():
 				// A paper bill book: entry-only, typed numbers from a billing device of one of its outlets.
@@ -226,7 +259,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	// a sale never does (S11, A1.2 item 4).
 	proof := directory.ProofValid
 	if !devActor {
-		proof = dir.CheckProof(tenant, origin, b.Actor, b.SID, b.Proof, config)
+		proof = g.proofOf(tx, p)
 	}
 	switch proof {
 	case directory.ProofValid:
@@ -263,7 +296,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 			flag(MarkPermissionFlag)
 		} else {
 			at, _ := time.Parse("2006-01-02T15:04:05.000Z", b.At)
-			if !dir.StillHolds(tenant, b.Actor, in.Permission) || (!pack.Expires.IsZero() && at.After(pack.Expires)) {
+			if !dir.StillHolds(tenant, cred.Cred.OutletID, b.Actor, in.Permission) || (!pack.Expires.IsZero() && at.After(pack.Expires)) {
 				if config {
 					return void(ReasonPermWithdrawn)
 				}

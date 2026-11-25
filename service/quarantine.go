@@ -465,11 +465,28 @@ func (g *Gateway) QuarantineUpload(ctx context.Context, tenant string, c engine.
 			return sp.PushResponse{}, err
 		}
 	}
-	res, err := e.Ingest(ctx, engine.IngestReq{Items: req.Items, Seals: req.Seals, Attestations: valid, Caller: c, Recovery: true})
+	items, beyond, err := g.filterBeyondStatement(ctx, tenant, drainOrigin(c), req.Items)
+	if err != nil {
+		return sp.PushResponse{}, err
+	}
+	refused = append(refused, beyond...)
+	res, err := e.Ingest(ctx, engine.IngestReq{Items: items, Seals: req.Seals, Attestations: valid, Caller: c, Recovery: true})
 	if err != nil {
 		return sp.PushResponse{}, err
 	}
 	resp := sp.PushResponse{Epoch: g.Epoch(), Vector: res.Vector, Held: res.Held, Refused: append(refused, res.Refused...)}
+	if req.DrainStatement != nil {
+		// The signed statement is the one thing that can report a drain (A3.3); it is judged after this upload's
+		// own ops are stored, so that "the gateway holds exactly the stated ops" is read from the stored state.
+		ok, err := g.acceptDrainStatement(ctx, tenant, c, req.DrainStatement)
+		if err != nil {
+			return resp, err
+		}
+		resp.Drained = ok
+		if ok {
+			_, _ = g.ReportPendingDrains(ctx, tenant) // best effort now; the worker repeats until identity answers
+		}
+	}
 	if c.Recovers != "" && len(valid) > 0 {
 		vec, err := e.Vector(ctx)
 		if err != nil {

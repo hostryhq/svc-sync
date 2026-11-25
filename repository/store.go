@@ -93,6 +93,36 @@ type Recovery struct {
 	Drained                             bool
 }
 
+// Session verdicts (ADR-0005 A3.1 item 3). Empty means identity has not been asked yet (the open was held before
+// its proof was judged).
+const (
+	VerdictValid   = "valid"
+	VerdictInvalid = "invalid"
+	VerdictLocked  = "locked"
+	VerdictPending = "pending"
+)
+
+// SessionRow is one session of an origin: who opened it, under which pack and PIN version and when, and identity's
+// verdict on its proof. One row per (tenant, origin, sid), whatever stream the ops of the session are in.
+type SessionRow struct {
+	Origin, SID, Type, Actor string
+	PackV, PinV              int
+	OpenedAt                 string
+	Verdict                  string
+}
+
+// Drain statement states (ADR-0005 A3.3).
+const (
+	DrainSatisfied = "satisfied" // every check held; the report to identity is pending
+	DrainReported  = "reported"  // identity has recorded it
+	DrainRefused   = "refused"   // kept as fork evidence; nothing was reported
+)
+
+// DrainRec is a device-signed drain statement the gateway holds.
+type DrainRec struct {
+	Origin, Hash, Statement, State, Detail string
+}
+
 // Alert is an owner or vendor alert raised by a verdict.
 type Alert struct {
 	Tenant, Audience, Severity, Kind, Detail string
@@ -154,6 +184,19 @@ type Tx interface {
 	ErasePII(stream, origin string, seq int64) error
 	PutSession(origin, sid, stype string) error
 	SessionType(origin, sid string) (string, bool, error)
+	// PutSessionRow stores the session with the verdict of its proof. A row whose verdict is already final
+	// (valid, invalid, locked) is never overwritten: identity is asked once.
+	PutSessionRow(r SessionRow) error
+	GetSession(origin, sid string) (SessionRow, bool, error)
+	// PendingSessions lists the sessions whose proof identity has not answered.
+	PendingSessions() ([]SessionRow, error)
+	PutApprovalVerdict(origin, approvalID, verdict string) error
+	GetApprovalVerdict(origin, approvalID string) (string, bool, error)
+	PutDrain(d DrainRec) error
+	Drains(origin string) ([]DrainRec, error)
+	SetDrainState(origin, hash, state string) error
+	// DrainsByState lists the statements in a state across origins.
+	DrainsByState(state string) ([]DrainRec, error)
 	PutRegister(e RegisterEntry) error
 	SetRegisterState(origin, stream string, seq int64, state, mark string) error
 	Register() ([]RegisterEntry, error)
@@ -573,6 +616,91 @@ func (t *sqlTx) SessionType(origin, sid string) (string, bool, error) {
 		return "", false, nil
 	}
 	return v, err == nil, err
+}
+
+const sessionCols = `origin, sid, stype, actor, pack_v, pin_v, opened_at, verdict`
+
+func (t *sqlTx) PutSessionRow(r SessionRow) error {
+	return t.exec(`INSERT INTO sessions (tenant_id, origin, sid, stype, actor, pack_v, pin_v, opened_at, verdict) VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT (tenant_id, origin, sid) DO UPDATE SET stype = excluded.stype, actor = excluded.actor, pack_v = excluded.pack_v,
+		pin_v = excluded.pin_v, opened_at = excluded.opened_at, verdict = excluded.verdict
+		WHERE sessions.verdict = '' OR sessions.verdict = 'pending'`,
+		t.tenant, r.Origin, r.SID, r.Type, r.Actor, r.PackV, r.PinV, r.OpenedAt, r.Verdict)
+}
+
+func (t *sqlTx) GetSession(origin, sid string) (SessionRow, bool, error) {
+	r := SessionRow{}
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT `+sessionCols+` FROM sessions WHERE tenant_id=? AND origin=? AND sid=?`), t.tenant, origin, sid).
+		Scan(&r.Origin, &r.SID, &r.Type, &r.Actor, &r.PackV, &r.PinV, &r.OpenedAt, &r.Verdict)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SessionRow{}, false, nil
+	}
+	return r, err == nil, err
+}
+
+func (t *sqlTx) PendingSessions() ([]SessionRow, error) {
+	rows, err := t.query(`SELECT `+sessionCols+` FROM sessions WHERE tenant_id=? AND verdict='pending' ORDER BY origin, sid`, t.tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionRow
+	for rows.Next() {
+		var r SessionRow
+		if err := rows.Scan(&r.Origin, &r.SID, &r.Type, &r.Actor, &r.PackV, &r.PinV, &r.OpenedAt, &r.Verdict); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (t *sqlTx) PutApprovalVerdict(origin, approvalID, verdict string) error {
+	return t.exec(`INSERT INTO approval_verdicts (tenant_id, origin, approval_id, verdict) VALUES (?,?,?,?)
+		ON CONFLICT (tenant_id, origin, approval_id) DO UPDATE SET verdict = excluded.verdict WHERE approval_verdicts.verdict = 'pending'`,
+		t.tenant, origin, approvalID, verdict)
+}
+
+func (t *sqlTx) GetApprovalVerdict(origin, approvalID string) (string, bool, error) {
+	var v string
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT verdict FROM approval_verdicts WHERE tenant_id=? AND origin=? AND approval_id=?`), t.tenant, origin, approvalID).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return v, err == nil, err
+}
+
+func (t *sqlTx) PutDrain(d DrainRec) error {
+	return t.exec(`INSERT INTO drain_statements (tenant_id, origin, hash, statement, state, detail) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+		t.tenant, d.Origin, d.Hash, d.Statement, d.State, d.Detail)
+}
+
+func (t *sqlTx) scanDrains(rows *sql.Rows, err error) ([]DrainRec, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DrainRec
+	for rows.Next() {
+		var d DrainRec
+		if err := rows.Scan(&d.Origin, &d.Hash, &d.Statement, &d.State, &d.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (t *sqlTx) Drains(origin string) ([]DrainRec, error) {
+	return t.scanDrains(t.query(`SELECT origin, hash, statement, state, detail FROM drain_statements WHERE tenant_id=? AND origin=? ORDER BY hash`, t.tenant, origin))
+}
+
+func (t *sqlTx) DrainsByState(state string) ([]DrainRec, error) {
+	return t.scanDrains(t.query(`SELECT origin, hash, statement, state, detail FROM drain_statements WHERE tenant_id=? AND state=? ORDER BY origin, hash`, t.tenant, state))
+}
+
+func (t *sqlTx) SetDrainState(origin, hash, state string) error {
+	return t.exec(`UPDATE drain_statements SET state=? WHERE tenant_id=? AND origin=? AND hash=?`, state, t.tenant, origin, hash)
 }
 
 func (t *sqlTx) PutRegister(e RegisterEntry) error {

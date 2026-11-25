@@ -63,6 +63,24 @@ func (e DeviceKind) Valid() bool {
 	}
 }
 
+// Defines values for DeviceRecoveryState.
+const (
+	Closed DeviceRecoveryState = "closed"
+	Open   DeviceRecoveryState = "open"
+)
+
+// Valid indicates whether the value is a known member of the DeviceRecoveryState enum.
+func (e DeviceRecoveryState) Valid() bool {
+	switch e {
+	case Closed:
+		return true
+	case Open:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for DeviceState.
 const (
 	DeviceStateActive  DeviceState = "active"
@@ -144,6 +162,24 @@ func (e ProofVerificationKind) Valid() bool {
 	}
 }
 
+// Defines values for RevocationReason.
+const (
+	RevocationReasonKeyLost RevocationReason = "key_lost"
+	RevocationReasonRevoked RevocationReason = "revoked"
+)
+
+// Valid indicates whether the value is a known member of the RevocationReason enum.
+func (e RevocationReason) Valid() bool {
+	switch e {
+	case RevocationReasonKeyLost:
+		return true
+	case RevocationReasonRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RevocationSubjectType.
 const (
 	RevocationSubjectTypeDevice  RevocationSubjectType = "device"
@@ -215,15 +251,160 @@ type Device struct {
 	State DeviceState `json:"state"`
 }
 
+// DeviceCredential The identity-signed credential of a device as the offline pack carries it (ADR-0005 A3.2 row 1). `not_after` is not part of this answer; the gateway ignores it.
+type DeviceCredential struct {
+	// BrandId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	BrandId *Id `json:"brand_id,omitempty"`
+
+	// DeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	DeviceId Id `json:"device_id"`
+
+	// Kid Key id.
+	//
+	// Example: dev-4a5e-1
+	Kid string `json:"kid"`
+
+	// Kind Device kind (ADR-0005 section 4).
+	//
+	// Example: pos
+	Kind DeviceKind `json:"kind"`
+
+	// OutletId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	OutletId Id `json:"outlet_id"`
+
+	// Pub Uncompressed X9.62 P-256 point, base64url (the sync wire form of the key).
+	Pub string `json:"pub"`
+
+	// Recovers Old device this one adopted by key-loss recovery (ADR-0002 A1.3).
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	Recovers *Id `json:"recovers,omitempty"`
+
+	// TenantId Organisation.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	TenantId Id `json:"tenant_id"`
+}
+
 // DeviceKind Device kind (ADR-0005 section 4).
 //
 // Example: pos
 type DeviceKind string
 
+// DeviceRecovery A key-loss recovery record (ADR-0002 A1.3; ADR-0005 A3.2 row 4). Never carries the recovery code.
+type DeviceRecovery struct {
+	// ApproverId Member who approved the recovery.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	ApproverId Id `json:"approver_id"`
+
+	// Id Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	Id Id `json:"id"`
+
+	// NewDeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	NewDeviceId Id `json:"new_device_id"`
+
+	// OldDeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	OldDeviceId Id `json:"old_device_id"`
+
+	// RecoveredAt RFC 3339 instant in UTC.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	RecoveredAt Timestamp `json:"recovered_at"`
+
+	// State open until the old device's drain is recorded, then closed.
+	//
+	// Example: open
+	State DeviceRecoveryState `json:"state"`
+}
+
+// DeviceRecoveryState open until the old device's drain is recorded, then closed.
+//
+// Example: open
+type DeviceRecoveryState string
+
 // DeviceState Device lifecycle state: active, then revoked, then drained, then wiped; or revoked, then lost.
 //
 // Example: active
 type DeviceState string
+
+// DrainSeries The last document number of one series, as the device stated it.
+type DrainSeries struct {
+	// Fy Financial year, four digits.
+	//
+	// Example: 2627
+	Fy string `json:"fy"`
+
+	// LastNumber Last running number the device allocated from the series; 0 when it never used it.
+	//
+	// Example: 123
+	LastNumber int `json:"last_number"`
+
+	// SeriesId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	SeriesId Id `json:"series_id"`
+}
+
+// DrainStatement The device-signed list of everything a revoked device holds and its last document numbers (ADR-0005 A3.3, domain tag `hostry-drain-v1`). Ordinary drain: `by` = `origin`, signed with the revoked device's key. Key loss: `by` = the adopting device, `rec` = the recovery id, signed with the new key.
+type DrainStatement struct {
+	// At Signing time, RFC 3339 UTC.
+	At string `json:"at"`
+
+	// By Signing device id.
+	By string `json:"by"`
+
+	// Kid Signing key id.
+	Kid string `json:"kid"`
+
+	// Origin The drained device.
+	Origin string `json:"origin"`
+
+	// Rec Recovery record id (key loss only).
+	Rec *string `json:"rec,omitempty"`
+
+	// Series Every series in the device's pack, in the fields of a `series_close` record; 0 when never used.
+	Series []struct {
+		// Code Three-character series code.
+		Code string `json:"code"`
+
+		// Fy Financial year, four digits.
+		Fy string `json:"fy"`
+
+		// LastNumber Last running number allocated from the series, 0 when never used.
+		LastNumber int64 `json:"last_number"`
+
+		// SeriesId Series id.
+		SeriesId string `json:"series_id"`
+	} `json:"series"`
+
+	// Sig ES256 of "hostry-drain-v1\n" + canonical JSON of the statement without `sig`.
+	Sig string `json:"sig"`
+
+	// Streams Every stream in which the device's log holds an own-origin op, with its head.
+	Streams []struct {
+		// H Hash of that op.
+		H string `json:"h"`
+
+		// Seq Last own-origin seq in the stream.
+		Seq int64 `json:"seq"`
+
+		// Stream Stream.
+		Stream string `json:"stream"`
+	} `json:"streams"`
+}
 
 // Id Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
 //
@@ -234,6 +415,64 @@ type Id = string
 //
 // Example: hardware
 type KeyProtection string
+
+// MemberGrants A member's status and effective permissions at an outlet now (ADR-0005 A3.2 row 3).
+type MemberGrants struct {
+	// MemberId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	MemberId Id `json:"member_id"`
+
+	// OutletId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	OutletId Id `json:"outlet_id"`
+
+	// Permissions Effective permission strings at the outlet now; empty for a removed member.
+	Permissions []string `json:"permissions"`
+
+	// RemovedAt When the member was removed, when removed.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	RemovedAt *Timestamp `json:"removed_at,omitempty"`
+
+	// Status Member state (as in a pack).
+	//
+	// Example: active
+	Status string `json:"status"`
+}
+
+// PackGrants What one issued pack version granted to a device (ADR-0005 A3.2 row 2).
+type PackGrants struct {
+	// IssuedAt RFC 3339 instant in UTC.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	IssuedAt Timestamp `json:"issued_at"`
+
+	// Members Each member listed in the pack with the permissions it granted.
+	Members []struct {
+		// MemberId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+		//
+		// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+		MemberId Id `json:"member_id"`
+
+		// Permissions Permission strings the pack granted the member at the device outlet.
+		Permissions []string `json:"permissions"`
+	} `json:"members"`
+
+	// OfflineValidUntil RFC 3339 instant in UTC.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	OfflineValidUntil Timestamp `json:"offline_valid_until"`
+
+	// PackV Pack version.
+	//
+	// Example: 7
+	PackV int `json:"pack_v"`
+
+	// SeriesCodes Series codes of that pack version.
+	SeriesCodes []string `json:"series_codes"`
+}
 
 // PackHistoryCheck Was the member and/or series code issued to the device in the given pack?
 type PackHistoryCheck struct {
@@ -247,10 +486,10 @@ type PackHistoryCheck struct {
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	MemberId *Id `json:"member_id,omitempty"`
 
-	// PackV Pack version.
+	// PackV Pack version. Absent means any pack issued to the device (ADR-0005 A3.2 row 7; the quarantine case).
 	//
 	// Example: 7
-	PackV int `json:"pack_v"`
+	PackV *int `json:"pack_v,omitempty"`
 
 	// SeriesCode Series code to look up.
 	//
@@ -367,6 +606,16 @@ type ProofVerification struct {
 	// Example: sha256:cf03a846706f29a88ba61a212f79e7c224142fdd5df92fc1d7ed8bb1283fb8c8
 	ActionHash *string `json:"action_hash,omitempty"`
 
+	// ApprovalId Approval record id (kind approval). Taken, with the fields below, from the approval record of the `approval.grant` op (ADR-0005 section 8, A3.1 item 2); all are bound by the action proof.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	ApprovalId *Id `json:"approval_id,omitempty"`
+
+	// ApprovedAt Time of the approval record (kind approval).
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	ApprovedAt *Timestamp `json:"approved_at,omitempty"`
+
 	// DeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
 	//
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
@@ -392,6 +641,11 @@ type ProofVerification struct {
 	// Example: 7
 	PackV int `json:"pack_v"`
 
+	// Permission Permission the approval cites (kind approval).
+	//
+	// Example: bill.void
+	Permission *string `json:"permission,omitempty"`
+
 	// PinV PIN version of the proof.
 	//
 	// Example: 2
@@ -402,10 +656,21 @@ type ProofVerification struct {
 	// Example: proof.example
 	Proof string `json:"proof"`
 
+	// Reason Reason on the approval record (kind approval).
+	Reason *string `json:"reason,omitempty"`
+
+	// RequesterId Member who asked for the approval; equal to member_id for an own sensitive action (kind approval).
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	RequesterId *Id `json:"requester_id,omitempty"`
+
 	// SessionId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
 	//
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	SessionId *Id `json:"session_id,omitempty"`
+
+	// Target Target record the approval is for (kind approval).
+	Target *string `json:"target,omitempty"`
 }
 
 // ProofVerificationKind Proof kind.
@@ -417,6 +682,12 @@ type ProofVerificationKind string
 type RecordDrain struct {
 	// DrainedThrough Sequence stored per device stream.
 	DrainedThrough []StreamSequence `json:"drained_through"`
+
+	// Series The last number per series, copied from the device-signed statement (ADR-0005 A3.3 item 5). Must be exactly the series identity issued to the device (422 drain.series_mismatch, vendor alert, nothing recorded). Empty only for a device that never held a series (kds, hub).
+	Series *[]DrainSeries `json:"series,omitempty"`
+
+	// Statement The device-signed list of everything a revoked device holds and its last document numbers (ADR-0005 A3.3, domain tag `hostry-drain-v1`). Ordinary drain: `by` = `origin`, signed with the revoked device's key. Key loss: `by` = the adopting device, `rec` = the recovery id, signed with the new key.
+	Statement *DrainStatement `json:"statement,omitempty"`
 }
 
 // Revocation A device or session revocation (tenant-id-only feed, no personal data).
@@ -430,6 +701,16 @@ type Revocation struct {
 	//
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	OrganisationId Id `json:"organisation_id"`
+
+	// Reason Why a device was revoked (ADR-0005 A3.2 row 5). `key_lost` is a revocation by recovery (the old device of a key-loss recovery) and carries `recovery_id`; absent on a session. The gateway's only source of revocation.
+	//
+	// Example: revoked
+	Reason *RevocationReason `json:"reason,omitempty"`
+
+	// RecoveryId The recovery record, present when reason is key_lost.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	RecoveryId *Id `json:"recovery_id,omitempty"`
 
 	// RevokedAt RFC 3339 instant in UTC.
 	//
@@ -447,6 +728,11 @@ type Revocation struct {
 	SubjectType RevocationSubjectType `json:"subject_type"`
 }
 
+// RevocationReason Why a device was revoked (ADR-0005 A3.2 row 5). `key_lost` is a revocation by recovery (the old device of a key-loss recovery) and carries `recovery_id`; absent on a session. The gateway's only source of revocation.
+//
+// Example: revoked
+type RevocationReason string
+
 // RevocationSubjectType What was revoked.
 //
 // Example: device
@@ -459,6 +745,34 @@ type RevocationPage struct {
 
 	// NextCursor Opaque cursor for the next page; absent when there are no more results.
 	NextCursor *string `json:"next_cursor,omitempty"`
+}
+
+// SessionFacts Fixed facts of a strong session (ADR-0005 A3.2 row 6). The end arrives on listRevocations.
+type SessionFacts struct {
+	// DeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	DeviceId *Id `json:"device_id,omitempty"`
+
+	// EndedAt When the session ended or was revoked, when it has.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	EndedAt *Timestamp `json:"ended_at,omitempty"`
+
+	// IssuedAt RFC 3339 instant in UTC.
+	//
+	// Example: 2026-11-24T13:05:11.120Z
+	IssuedAt Timestamp `json:"issued_at"`
+
+	// MemberId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	MemberId Id `json:"member_id"`
+
+	// SessionId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	//
+	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
+	SessionId Id `json:"session_id"`
 }
 
 // StreamSequence Highest sequence of one device stream.
@@ -507,6 +821,12 @@ type ValidationFailed = Problem
 type RecordDeviceDrainedParams struct {
 	// IdempotencyKey Client-generated unique key, 1-128 visible ASCII characters (a UUIDv7 is recommended). A replay with the same key and request returns the original status and body without repeating the effect. The same key with a different request returns 422 (code idempotency.mismatch); the same key while the first request is still in progress returns 409 (code idempotency.in_progress); an invalid key returns 422 (code idempotency.key_invalid). Records expire after 24 hours. An operation whose response carries a one-time secret (token, refresh token, code, code half, grant, offline pack) never has that response stored: its replay returns 409 (code idempotency.replay_secret) and the client repeats the operation with a new key. Token-issuing operations (sessions, refresh, device and drain tokens) are not recorded; a replay runs again and meets the credential checks.
 	IdempotencyKey IdempotencyKey `json:"Idempotency-Key"`
+}
+
+// GetMemberGrantsParams defines parameters for GetMemberGrants.
+type GetMemberGrantsParams struct {
+	// OutletId Outlet the effective permissions are computed for.
+	OutletId Id `form:"outlet_id" json:"outlet_id"`
 }
 
 // CheckPackHistoryParams defines parameters for CheckPackHistory.
@@ -613,6 +933,13 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 // The interface specification for the client above.
 type ClientInterface interface {
 
+	// GetDeviceCredential The identity-signed credential of a device, in any state
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
+	GetDeviceCredential(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// RecordDeviceDrainedWithBody Record that a device is drained
 	//
 	// Takes any type of body and a specified content type.
@@ -626,6 +953,27 @@ type ClientInterface interface {
 	//
 	// Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
 	RecordDeviceDrained(ctx context.Context, deviceId Id, params *RecordDeviceDrainedParams, body RecordDeviceDrainedJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetPackGrants What an issued offline pack granted
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 2). Identity keeps the permission sets of each pack version (stored once per digest, for the same 13 months as the pack history). Immutable, so cached without expiry; 404 pack_unknown is cached for 60 seconds.
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/packs/{pack_v}/grants (the `GetPackGrants` operationId).
+	GetPackGrants(ctx context.Context, deviceId Id, packV int, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetDeviceRecovery The key-loss recovery record of an old device
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 4). `device_id` is the old (lost) device. Never returns the recovery code. Found records are cached without expiry (single use); 404 is not cached.
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/recovery (the `GetDeviceRecovery` operationId).
+	GetDeviceRecovery(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetMemberGrants A member's status and effective permissions at an outlet now
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 3; section 7 question 6, "then current grants"). Cached by the gateway for 60 seconds.
+	//
+	// Corresponds with GET /internal/v1/members/{member_id}/grants (the `GetMemberGrants` operationId).
+	GetMemberGrants(ctx context.Context, memberId Id, params *GetMemberGrantsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CheckPackHistoryWithBody Was a member or series code issued to the device in a pack?
 	//
@@ -659,6 +1007,30 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /internal/v1/revocations (the `ListRevocations` operationId).
 	ListRevocations(ctx context.Context, params *ListRevocationsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetSession The fixed facts of a strong session
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 6; A3.1 item 5: a strong session carries no proof). The fields never change, so the gateway caches them without expiry; the end of the session arrives on listRevocations (`subject_type: session`).
+	//
+	// Corresponds with GET /internal/v1/sessions/{session_id} (the `GetSession` operationId).
+	GetSession(ctx context.Context, sessionId Id, reqEditors ...RequestEditorFn) (*http.Response, error)
+}
+
+// GetDeviceCredential The identity-signed credential of a device, in any state
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
+func (c *Client) GetDeviceCredential(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetDeviceCredentialRequest(c.Server, deviceId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
 }
 
 // RecordDeviceDrainedWithBody Record that a device is drained
@@ -685,6 +1057,57 @@ func (c *Client) RecordDeviceDrainedWithBody(ctx context.Context, deviceId Id, p
 // Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
 func (c *Client) RecordDeviceDrained(ctx context.Context, deviceId Id, params *RecordDeviceDrainedParams, body RecordDeviceDrainedJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewRecordDeviceDrainedRequest(c.Server, deviceId, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetPackGrants What an issued offline pack granted
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 2). Identity keeps the permission sets of each pack version (stored once per digest, for the same 13 months as the pack history). Immutable, so cached without expiry; 404 pack_unknown is cached for 60 seconds.
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/packs/{pack_v}/grants (the `GetPackGrants` operationId).
+func (c *Client) GetPackGrants(ctx context.Context, deviceId Id, packV int, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetPackGrantsRequest(c.Server, deviceId, packV)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetDeviceRecovery The key-loss recovery record of an old device
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 4). `device_id` is the old (lost) device. Never returns the recovery code. Found records are cached without expiry (single use); 404 is not cached.
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/recovery (the `GetDeviceRecovery` operationId).
+func (c *Client) GetDeviceRecovery(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetDeviceRecoveryRequest(c.Server, deviceId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetMemberGrants A member's status and effective permissions at an outlet now
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 3; section 7 question 6, "then current grants"). Cached by the gateway for 60 seconds.
+//
+// Corresponds with GET /internal/v1/members/{member_id}/grants (the `GetMemberGrants` operationId).
+func (c *Client) GetMemberGrants(ctx context.Context, memberId Id, params *GetMemberGrantsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetMemberGrantsRequest(c.Server, memberId, params)
 	if err != nil {
 		return nil, err
 	}
@@ -778,6 +1201,57 @@ func (c *Client) ListRevocations(ctx context.Context, params *ListRevocationsPar
 	return c.Client.Do(req)
 }
 
+// GetSession The fixed facts of a strong session
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 6; A3.1 item 5: a strong session carries no proof). The fields never change, so the gateway caches them without expiry; the end of the session arrives on listRevocations (`subject_type: session`).
+//
+// Corresponds with GET /internal/v1/sessions/{session_id} (the `GetSession` operationId).
+func (c *Client) GetSession(ctx context.Context, sessionId Id, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetSessionRequest(c.Server, sessionId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// NewGetDeviceCredentialRequest constructs an http.Request for the GetDeviceCredential method
+func NewGetDeviceCredentialRequest(server string, deviceId Id) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "device_id", deviceId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := "/internal/v1/devices/" + pathParam0 + "/credential"
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewRecordDeviceDrainedRequest calls the generic RecordDeviceDrained builder with application/json body
 func NewRecordDeviceDrainedRequest(server string, deviceId Id, params *RecordDeviceDrainedParams, body RecordDeviceDrainedJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -833,6 +1307,138 @@ func NewRecordDeviceDrainedRequestWithBody(server string, deviceId Id, params *R
 
 		req.Header.Set("Idempotency-Key", headerParam0)
 
+	}
+
+	return req, nil
+}
+
+// NewGetPackGrantsRequest constructs an http.Request for the GetPackGrants method
+func NewGetPackGrantsRequest(server string, deviceId Id, packV int) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "device_id", deviceId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "pack_v", packV, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := "/internal/v1/devices/" + pathParam0 + "/packs/" + pathParam1 + "/grants"
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetDeviceRecoveryRequest constructs an http.Request for the GetDeviceRecovery method
+func NewGetDeviceRecoveryRequest(server string, deviceId Id) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "device_id", deviceId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := "/internal/v1/devices/" + pathParam0 + "/recovery"
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetMemberGrantsRequest constructs an http.Request for the GetMemberGrants method
+func NewGetMemberGrantsRequest(server string, memberId Id, params *GetMemberGrantsParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "member_id", memberId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := "/internal/v1/members/" + pathParam0 + "/grants"
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "outlet_id", params.OutletId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
 	}
 
 	return req, nil
@@ -1010,6 +1616,40 @@ func NewListRevocationsRequest(server string, params *ListRevocationsParams) (*h
 	return req, nil
 }
 
+// NewGetSessionRequest constructs an http.Request for the GetSession method
+func NewGetSessionRequest(server string, sessionId Id) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "session_id", sessionId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := "/internal/v1/sessions/" + pathParam0
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 func (c *Client) applyEditors(ctx context.Context, req *http.Request, additionalEditors []RequestEditorFn) error {
 	for _, r := range c.RequestEditors {
 		if err := r(ctx, req); err != nil {
@@ -1054,6 +1694,15 @@ func WithBaseURL(baseURL string) ClientOption {
 // ClientWithResponsesInterface is the interface specification for the client with responses above.
 type ClientWithResponsesInterface interface {
 
+	// GetDeviceCredentialWithResponse The identity-signed credential of a device, in any state
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
+	GetDeviceCredentialWithResponse(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*GetDeviceCredentialResponse, error)
+
 	// RecordDeviceDrainedWithBodyWithResponse Record that a device is drained
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
@@ -1067,6 +1716,33 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
 	RecordDeviceDrainedWithResponse(ctx context.Context, deviceId Id, params *RecordDeviceDrainedParams, body RecordDeviceDrainedJSONRequestBody, reqEditors ...RequestEditorFn) (*RecordDeviceDrainedResponse, error)
+
+	// GetPackGrantsWithResponse What an issued offline pack granted
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 2). Identity keeps the permission sets of each pack version (stored once per digest, for the same 13 months as the pack history). Immutable, so cached without expiry; 404 pack_unknown is cached for 60 seconds.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/packs/{pack_v}/grants (the `GetPackGrants` operationId).
+	GetPackGrantsWithResponse(ctx context.Context, deviceId Id, packV int, reqEditors ...RequestEditorFn) (*GetPackGrantsResponse, error)
+
+	// GetDeviceRecoveryWithResponse The key-loss recovery record of an old device
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 4). `device_id` is the old (lost) device. Never returns the recovery code. Found records are cached without expiry (single use); 404 is not cached.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /internal/v1/devices/{device_id}/recovery (the `GetDeviceRecovery` operationId).
+	GetDeviceRecoveryWithResponse(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*GetDeviceRecoveryResponse, error)
+
+	// GetMemberGrantsWithResponse A member's status and effective permissions at an outlet now
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 3; section 7 question 6, "then current grants"). Cached by the gateway for 60 seconds.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /internal/v1/members/{member_id}/grants (the `GetMemberGrants` operationId).
+	GetMemberGrantsWithResponse(ctx context.Context, memberId Id, params *GetMemberGrantsParams, reqEditors ...RequestEditorFn) (*GetMemberGrantsResponse, error)
 
 	// CheckPackHistoryWithBodyWithResponse Was a member or series code issued to the device in a pack?
 	//
@@ -1102,6 +1778,77 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /internal/v1/revocations (the `ListRevocations` operationId).
 	ListRevocationsWithResponse(ctx context.Context, params *ListRevocationsParams, reqEditors ...RequestEditorFn) (*ListRevocationsResponse, error)
+
+	// GetSessionWithResponse The fixed facts of a strong session
+	//
+	// Sync gateway directory question (ADR-0005 A3.2 row 6; A3.1 item 5: a strong session carries no proof). The fields never change, so the gateway caches them without expiry; the end of the session arrives on listRevocations (`subject_type: session`).
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /internal/v1/sessions/{session_id} (the `GetSession` operationId).
+	GetSessionWithResponse(ctx context.Context, sessionId Id, reqEditors ...RequestEditorFn) (*GetSessionResponse, error)
+}
+
+type GetDeviceCredentialResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *DeviceCredential
+	// ApplicationproblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationproblemJSON401 *Unauthorized
+	// ApplicationproblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationproblemJSON403 *Forbidden
+	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationproblemJSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetDeviceCredentialResponse) GetJSON200() *DeviceCredential {
+	return r.JSON200
+}
+
+// GetApplicationproblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetDeviceCredentialResponse) GetApplicationproblemJSON401() *Unauthorized {
+	return r.ApplicationproblemJSON401
+}
+
+// GetApplicationproblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetDeviceCredentialResponse) GetApplicationproblemJSON403() *Forbidden {
+	return r.ApplicationproblemJSON403
+}
+
+// GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetDeviceCredentialResponse) GetApplicationproblemJSON404() *NotFound {
+	return r.ApplicationproblemJSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetDeviceCredentialResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetDeviceCredentialResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetDeviceCredentialResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetDeviceCredentialResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
 }
 
 type RecordDeviceDrainedResponse struct {
@@ -1117,6 +1864,8 @@ type RecordDeviceDrainedResponse struct {
 	ApplicationproblemJSON404 *NotFound
 	// ApplicationproblemJSON409 the response for an HTTP 409 `application/problem+json` response
 	ApplicationproblemJSON409 *Conflict
+	// ApplicationproblemJSON422 the response for an HTTP 422 `application/problem+json` response
+	ApplicationproblemJSON422 *ValidationFailed
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -1144,6 +1893,11 @@ func (r RecordDeviceDrainedResponse) GetApplicationproblemJSON409() *Conflict {
 	return r.ApplicationproblemJSON409
 }
 
+// GetApplicationproblemJSON422 returns the response for an HTTP 422 `application/problem+json` response
+func (r RecordDeviceDrainedResponse) GetApplicationproblemJSON422() *ValidationFailed {
+	return r.ApplicationproblemJSON422
+}
+
 // GetBody returns the raw response body bytes
 func (r RecordDeviceDrainedResponse) GetBody() []byte {
 	return r.Body
@@ -1167,6 +1921,192 @@ func (r RecordDeviceDrainedResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r RecordDeviceDrainedResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetPackGrantsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *PackGrants
+	// ApplicationproblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationproblemJSON401 *Unauthorized
+	// ApplicationproblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationproblemJSON403 *Forbidden
+	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationproblemJSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetPackGrantsResponse) GetJSON200() *PackGrants {
+	return r.JSON200
+}
+
+// GetApplicationproblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetPackGrantsResponse) GetApplicationproblemJSON401() *Unauthorized {
+	return r.ApplicationproblemJSON401
+}
+
+// GetApplicationproblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetPackGrantsResponse) GetApplicationproblemJSON403() *Forbidden {
+	return r.ApplicationproblemJSON403
+}
+
+// GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetPackGrantsResponse) GetApplicationproblemJSON404() *NotFound {
+	return r.ApplicationproblemJSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetPackGrantsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetPackGrantsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetPackGrantsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetPackGrantsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetDeviceRecoveryResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *DeviceRecovery
+	// ApplicationproblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationproblemJSON401 *Unauthorized
+	// ApplicationproblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationproblemJSON403 *Forbidden
+	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationproblemJSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetDeviceRecoveryResponse) GetJSON200() *DeviceRecovery {
+	return r.JSON200
+}
+
+// GetApplicationproblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetDeviceRecoveryResponse) GetApplicationproblemJSON401() *Unauthorized {
+	return r.ApplicationproblemJSON401
+}
+
+// GetApplicationproblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetDeviceRecoveryResponse) GetApplicationproblemJSON403() *Forbidden {
+	return r.ApplicationproblemJSON403
+}
+
+// GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetDeviceRecoveryResponse) GetApplicationproblemJSON404() *NotFound {
+	return r.ApplicationproblemJSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetDeviceRecoveryResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetDeviceRecoveryResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetDeviceRecoveryResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetDeviceRecoveryResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetMemberGrantsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *MemberGrants
+	// ApplicationproblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationproblemJSON401 *Unauthorized
+	// ApplicationproblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationproblemJSON403 *Forbidden
+	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationproblemJSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetMemberGrantsResponse) GetJSON200() *MemberGrants {
+	return r.JSON200
+}
+
+// GetApplicationproblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetMemberGrantsResponse) GetApplicationproblemJSON401() *Unauthorized {
+	return r.ApplicationproblemJSON401
+}
+
+// GetApplicationproblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetMemberGrantsResponse) GetApplicationproblemJSON403() *Forbidden {
+	return r.ApplicationproblemJSON403
+}
+
+// GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetMemberGrantsResponse) GetApplicationproblemJSON404() *NotFound {
+	return r.ApplicationproblemJSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetMemberGrantsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetMemberGrantsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetMemberGrantsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetMemberGrantsResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -1352,6 +2292,83 @@ func (r ListRevocationsResponse) ContentType() string {
 	return ""
 }
 
+type GetSessionResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *SessionFacts
+	// ApplicationproblemJSON401 the response for an HTTP 401 `application/problem+json` response
+	ApplicationproblemJSON401 *Unauthorized
+	// ApplicationproblemJSON403 the response for an HTTP 403 `application/problem+json` response
+	ApplicationproblemJSON403 *Forbidden
+	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
+	ApplicationproblemJSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetSessionResponse) GetJSON200() *SessionFacts {
+	return r.JSON200
+}
+
+// GetApplicationproblemJSON401 returns the response for an HTTP 401 `application/problem+json` response
+func (r GetSessionResponse) GetApplicationproblemJSON401() *Unauthorized {
+	return r.ApplicationproblemJSON401
+}
+
+// GetApplicationproblemJSON403 returns the response for an HTTP 403 `application/problem+json` response
+func (r GetSessionResponse) GetApplicationproblemJSON403() *Forbidden {
+	return r.ApplicationproblemJSON403
+}
+
+// GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
+func (r GetSessionResponse) GetApplicationproblemJSON404() *NotFound {
+	return r.ApplicationproblemJSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetSessionResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetSessionResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetSessionResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetSessionResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// GetDeviceCredentialWithResponse The identity-signed credential of a device, in any state
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
+func (c *ClientWithResponses) GetDeviceCredentialWithResponse(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*GetDeviceCredentialResponse, error) {
+	rsp, err := c.GetDeviceCredential(ctx, deviceId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetDeviceCredentialResponse(rsp)
+}
+
 // RecordDeviceDrainedWithBodyWithResponse Record that a device is drained
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
@@ -1376,6 +2393,51 @@ func (c *ClientWithResponses) RecordDeviceDrainedWithResponse(ctx context.Contex
 		return nil, err
 	}
 	return ParseRecordDeviceDrainedResponse(rsp)
+}
+
+// GetPackGrantsWithResponse What an issued offline pack granted
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 2). Identity keeps the permission sets of each pack version (stored once per digest, for the same 13 months as the pack history). Immutable, so cached without expiry; 404 pack_unknown is cached for 60 seconds.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/packs/{pack_v}/grants (the `GetPackGrants` operationId).
+func (c *ClientWithResponses) GetPackGrantsWithResponse(ctx context.Context, deviceId Id, packV int, reqEditors ...RequestEditorFn) (*GetPackGrantsResponse, error) {
+	rsp, err := c.GetPackGrants(ctx, deviceId, packV, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetPackGrantsResponse(rsp)
+}
+
+// GetDeviceRecoveryWithResponse The key-loss recovery record of an old device
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 4). `device_id` is the old (lost) device. Never returns the recovery code. Found records are cached without expiry (single use); 404 is not cached.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /internal/v1/devices/{device_id}/recovery (the `GetDeviceRecovery` operationId).
+func (c *ClientWithResponses) GetDeviceRecoveryWithResponse(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*GetDeviceRecoveryResponse, error) {
+	rsp, err := c.GetDeviceRecovery(ctx, deviceId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetDeviceRecoveryResponse(rsp)
+}
+
+// GetMemberGrantsWithResponse A member's status and effective permissions at an outlet now
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 3; section 7 question 6, "then current grants"). Cached by the gateway for 60 seconds.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /internal/v1/members/{member_id}/grants (the `GetMemberGrants` operationId).
+func (c *ClientWithResponses) GetMemberGrantsWithResponse(ctx context.Context, memberId Id, params *GetMemberGrantsParams, reqEditors ...RequestEditorFn) (*GetMemberGrantsResponse, error) {
+	rsp, err := c.GetMemberGrants(ctx, memberId, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetMemberGrantsResponse(rsp)
 }
 
 // CheckPackHistoryWithBodyWithResponse Was a member or series code issued to the device in a pack?
@@ -1443,6 +2505,68 @@ func (c *ClientWithResponses) ListRevocationsWithResponse(ctx context.Context, p
 	return ParseListRevocationsResponse(rsp)
 }
 
+// GetSessionWithResponse The fixed facts of a strong session
+//
+// Sync gateway directory question (ADR-0005 A3.2 row 6; A3.1 item 5: a strong session carries no proof). The fields never change, so the gateway caches them without expiry; the end of the session arrives on listRevocations (`subject_type: session`).
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /internal/v1/sessions/{session_id} (the `GetSession` operationId).
+func (c *ClientWithResponses) GetSessionWithResponse(ctx context.Context, sessionId Id, reqEditors ...RequestEditorFn) (*GetSessionResponse, error) {
+	rsp, err := c.GetSession(ctx, sessionId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetSessionResponse(rsp)
+}
+
+// ParseGetDeviceCredentialResponse parses an HTTP response from a GetDeviceCredentialWithResponse call
+func ParseGetDeviceCredentialResponse(rsp *http.Response) (*GetDeviceCredentialResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetDeviceCredentialResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DeviceCredential
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseRecordDeviceDrainedResponse parses an HTTP response from a RecordDeviceDrainedWithResponse call
 func ParseRecordDeviceDrainedResponse(rsp *http.Response) (*RecordDeviceDrainedResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -1491,6 +2615,154 @@ func ParseRecordDeviceDrainedResponse(rsp *http.Response) (*RecordDeviceDrainedR
 			return nil, err
 		}
 		response.ApplicationproblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ValidationFailed
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetPackGrantsResponse parses an HTTP response from a GetPackGrantsWithResponse call
+func ParseGetPackGrantsResponse(rsp *http.Response) (*GetPackGrantsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetPackGrantsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest PackGrants
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetDeviceRecoveryResponse parses an HTTP response from a GetDeviceRecoveryWithResponse call
+func ParseGetDeviceRecoveryResponse(rsp *http.Response) (*GetDeviceRecoveryResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetDeviceRecoveryResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DeviceRecovery
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetMemberGrantsResponse parses an HTTP response from a GetMemberGrantsWithResponse call
+func ParseGetMemberGrantsResponse(rsp *http.Response) (*GetMemberGrantsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetMemberGrantsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MemberGrants
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
 
 	}
 
@@ -1625,6 +2897,53 @@ func ParseListRevocationsResponse(rsp *http.Response) (*ListRevocationsResponse,
 			return nil, err
 		}
 		response.ApplicationproblemJSON403 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetSessionResponse parses an HTTP response from a GetSessionWithResponse call
+func ParseGetSessionResponse(rsp *http.Response) (*GetSessionResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetSessionResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest SessionFacts
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
 
 	}
 

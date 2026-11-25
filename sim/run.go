@@ -349,18 +349,24 @@ func (r *runner) inject(ctx context.Context, step int) error {
 			Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1000)}}}}, true)
 		add(it, err, repository.StQuarantined, service.ReasonActorUnknown)
 	case 2: // an invalid session proof on a sale: flagged, never rejected
-		sid := r.sidOf(d, pCashier)
-		it, err := d.record(engine.Input{Stream: "outlet:" + r.w.Outlet, Intent: "stock.move", Actor: pCashier, SID: sid, Proof: "bogus-proof",
+		sid, serr := d.BadSession(pCashier)
+		if serr != nil {
+			return serr
+		}
+		it, err := d.record(engine.Input{Stream: "outlet:" + r.w.Outlet, Intent: "stock.move", Actor: pCashier, SID: sid,
 			Muts: []sp.Mut{{E: "stock_level", ID: "item-2", K: sp.KDelta, F: map[string]any{"qty_milli": int64(-1000)}}}}, true)
 		add(it, err, repository.StFlagged, "")
 	case 3: // an invalid proof on a configuration change: voided
 		if d.Kind != sp.KindPOS {
 			return nil // menu.price.set is allowed for pos devices only
 		}
-		sid := r.sidOf(d, pManager)
+		sid, serr := d.BadSession(pManager)
+		if serr != nil {
+			return serr
+		}
 		var prev string
 		d.Eng.WithState(func(s *engine.State) { prev = s.FieldStamp("menu_item", "menu-9", "price_paise") })
-		it, err := d.record(engine.Input{Stream: "brand:" + r.w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid, Proof: "bogus-proof",
+		it, err := d.record(engine.Input{Stream: "brand:" + r.w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid,
 			Muts: []sp.Mut{{E: "menu_item", ID: "menu-9", K: sp.KInsert, F: map[string]any{"name": "forged", "price_paise": int64(1)}, Prev: map[string]string{"price_paise": prev}}}}, true)
 		add(it, err, repository.StVoided, service.ReasonProofFailed)
 	case 4: // a member removed while the outlet was offline keeps selling: flagged, never rejected
@@ -450,10 +456,15 @@ func (r *runner) finish(ctx context.Context) *Result {
 	// Phase B: the manager reviews the held list (vendor confirmation and device.recover granted).
 	held, _ := w.GW.Quarantine(ctx, w.Tenant)
 	r.st.Held = len(held)
-	for _, q := range held {
-		if _, err := w.GW.Release(ctx, w.Tenant, q.Ref, service.ReleaseOpts{VendorConfirmed: true, DeviceRecover: true}); err != nil {
-			res.Problems = append(res.Problems, Problem{"release", fmt.Sprintf("%s: %v", q.Ref.Key(), err)})
+	// A configuration op released before the session.open it is judged from stays held (its session has no verdict yet):
+	// the manager releases the list again, as in the review screen, until nothing more moves.
+	for pass := 0; pass < 3 && len(held) > 0; pass++ {
+		for _, q := range held {
+			if _, err := w.GW.Release(ctx, w.Tenant, q.Ref, service.ReleaseOpts{VendorConfirmed: true, DeviceRecover: true}); err != nil {
+				res.Problems = append(res.Problems, Problem{"release", fmt.Sprintf("%s: %v", q.Ref.Key(), err)})
+			}
 		}
+		held, _ = w.GW.Quarantine(ctx, w.Tenant)
 	}
 	rep = w.Quiesce(ctx, 80)
 	r.st.QuiesceRds += rep.Rounds

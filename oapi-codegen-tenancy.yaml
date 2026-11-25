@@ -1,0 +1,12 @@
+# Client for the internal routes of the tenancy contract that the sync gateway calls (x-service-callers: sync).
+# Regenerate: <api-specs>/.tools/bin/oapi-codegen -config oapi-codegen-tenancy.yaml <api-specs>/build/tenancy.yaml (run `make bundle` in api-specs first).
+package: tenancy
+output: tenancyclient/gen/tenancy.gen.go
+generate:
+  models: true
+  client: true
+output-options:
+  include-operation-ids:
+    - listDeviceSeries
+    - getStreamOwner
+    - listOutletManualBookSeries

@@ -292,7 +292,7 @@ func TestKL5_OldKeyHolderIsRefusedAndItsDrainBecomesAForkNeitherSideReleasable(t
 	clone := engine.New(engine.Config{Role: engine.RoleDevice, Tenant: w.Tenant, Outlet: w.Outlet, Origin: old, Key: oldKey, Store: st, Trust: a.Cache,
 		Clock: sp.NewClock(w.Clock.Now), Series: seriesSrc{&Device{saleCode: "AAA"}}})
 	for i := 0; i < 4; i++ {
-		must(clone.Record(bg, engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pCashier, PackV: "v1",
+		must(clone.Record(bg, engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pCashier, PackV: 1,
 			Muts: []sp.Mut{{E: "stock_level", ID: "forked", K: sp.KDelta, F: map[string]any{"qty_milli": int64(i + 1)}}}}))
 	}
 	req := must(clone.Outbound(bg, sp.Vector{}, engine.OutboundOpts{}))
@@ -397,8 +397,8 @@ func TestKL9_UnsealedOpsKeepTheirAttributionAndTheUnsealedMark(t *testing.T) {
 	w, _ := newTestWorld(t, 38, WorldOptions{Pos: 2})
 	a := w.Devices[0]
 	old := a.ID
-	good := stockOp(t, a, w.Identity.MintProof(a.ID, pCashier))
-	bad := stockOp(t, a, "bogus-proof")
+	good := stockOp(t, a)
+	bad := stockOpBad(t, a)
 	a.LoseKey()
 	rc := must(w.RecoverDevice(a, true))
 	w.uploadAll(t, a, rc)
