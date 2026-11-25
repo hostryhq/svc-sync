@@ -93,7 +93,7 @@ func (a BearerAuth) Authenticate(r *http.Request, _ []byte, route Route) (Princi
 		return Principal{}, unauth()
 	}
 	revoked, _ := a.Dir.Revoked(cl.TenantID, cl.DeviceID)
-	c := engine.Caller{ID: cl.DeviceID, Kind: cred.Cred.Kind, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID}
+	c := engine.Caller{ID: cl.DeviceID, Kind: cred.Cred.Kind, Store: cred.Cred.Store, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID}
 	if cl.Type == auth.TypeDrain {
 		c.Drain = true
 		if strings.HasPrefix(cl.Subject, "recovers:") {

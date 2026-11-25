@@ -248,6 +248,8 @@ type Tx interface {
 type SQL struct {
 	db *sql.DB
 	pg bool
+	// crypt seals the value columns (the hub's encrypted store, crypt.go); nil leaves them in the clear.
+	crypt *colCipher
 }
 
 // Open opens a store. dsn "postgres://..." selects Postgres; anything else is a SQLite path or
@@ -267,7 +269,7 @@ func Open(dsn string) (*SQL, error) {
 		if path == "" || path == ":memory:" {
 			path = "file::memory:?cache=shared"
 		}
-		q := "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(OFF)"
+		q := "_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(OFF)&_pragma=secure_delete(on)"
 		if strings.Contains(path, "?") {
 			path += "&" + q
 		} else {
@@ -381,10 +383,17 @@ func (s *SQL) InTx(ctx context.Context, tenant string, fn func(Tx) error) error 
 		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if t.erased && !s.pg {
+		return s.Checkpoint(ctx)
+	}
+	return nil
 }
 
 type sqlTx struct {
+	erased bool // personal data was deleted: truncate the WAL after commit (A3.2 item 5)
 	s      *SQL
 	tx     *sql.Tx
 	ctx    context.Context
@@ -414,6 +423,10 @@ func (t *sqlTx) scanOps(rows *sql.Rows) ([]OpRec, error) {
 		if err := rows.Scan(&o.Stream, &o.Origin, &o.Seq, &o.H, &o.PH, &o.Body, &o.Status, &o.Reason, &o.Marks, &o.Intent, &o.HLC, &o.Arr); err != nil {
 			return nil, err
 		}
+		var err error
+		if o.Body, err = t.s.open("ops", pkOp(t.tenant, o.Stream, o.Origin, o.Seq), "body", o.Body); err != nil {
+			return nil, err
+		}
 		out = append(out, o)
 	}
 	return out, rows.Err()
@@ -439,13 +452,21 @@ func (t *sqlTx) PutOp(o OpRec) error {
 		}
 		o.Arr = a
 	}
+	body, err := t.s.seal("ops", pkOp(t.tenant, o.Stream, o.Origin, o.Seq), "body", o.Body)
+	if err != nil {
+		return err
+	}
 	return t.exec(`INSERT INTO ops (tenant_id, `+opCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		t.tenant, o.Stream, o.Origin, o.Seq, o.H, o.PH, o.Body, o.Status, o.Reason, o.Marks, o.Intent, o.HLC, o.Arr)
+		t.tenant, o.Stream, o.Origin, o.Seq, o.H, o.PH, body, o.Status, o.Reason, o.Marks, o.Intent, o.HLC, o.Arr)
 }
 
 func (t *sqlTx) UpdateOp(o OpRec) error {
+	body, err := t.s.seal("ops", pkOp(t.tenant, o.Stream, o.Origin, o.Seq), "body", o.Body)
+	if err != nil {
+		return err
+	}
 	return t.exec(`UPDATE ops SET body=?, status=?, reason=?, marks=?, intent=?, hlc=? WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`,
-		o.Body, o.Status, o.Reason, o.Marks, o.Intent, o.HLC, t.tenant, o.Stream, o.Origin, o.Seq)
+		body, o.Status, o.Reason, o.Marks, o.Intent, o.HLC, t.tenant, o.Stream, o.Origin, o.Seq)
 }
 
 func (t *sqlTx) Head(stream, origin string) (int64, string, error) {
@@ -576,10 +597,18 @@ func (t *sqlTx) GetMeta(k string) (string, bool, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
+	if err != nil {
+		return v, false, err
+	}
+	v, err = t.s.open("meta", t.tenant+"|"+k, "v", v)
 	return v, err == nil, err
 }
 
 func (t *sqlTx) SetMeta(k, v string) error {
+	v, err := t.s.seal("meta", t.tenant+"|"+k, "v", v)
+	if err != nil {
+		return err
+	}
 	return t.exec(`INSERT INTO meta (tenant_id, k, v) VALUES (?,?,?) ON CONFLICT (tenant_id, k) DO UPDATE SET v = excluded.v`, t.tenant, k, v)
 }
 
@@ -595,6 +624,9 @@ func (t *sqlTx) MetaPrefix(prefix string) (map[string]string, error) {
 		if err := rows.Scan(&k, &v); err != nil {
 			return nil, err
 		}
+		if v, err = t.s.open("meta", t.tenant+"|"+k, "v", v); err != nil {
+			return nil, err
+		}
 		out[k] = v
 	}
 	return out, rows.Err()
@@ -606,6 +638,10 @@ func (t *sqlTx) GetPII(stream, origin string, seq int64) (string, bool, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
+	if err != nil {
+		return v, false, err
+	}
+	v, err = t.s.open("op_pii", pkOp(t.tenant, stream, origin, seq), "data", v)
 	return v, err == nil, err
 }
 
@@ -642,10 +678,15 @@ func (t *sqlTx) PIIRefs() ([][3]string, error) {
 }
 
 func (t *sqlTx) PutPII(stream, origin string, seq int64, data string) error {
+	data, err := t.s.seal("op_pii", pkOp(t.tenant, stream, origin, seq), "data", data)
+	if err != nil {
+		return err
+	}
 	return t.exec(`INSERT INTO op_pii (tenant_id, stream, origin, seq, data) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, stream, origin, seq, data)
 }
 
 func (t *sqlTx) ErasePII(stream, origin string, seq int64) error {
+	t.erased = true
 	if err := t.exec(`DELETE FROM op_pii WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`, t.tenant, stream, origin, seq); err != nil {
 		return err
 	}
@@ -837,6 +878,10 @@ func (t *sqlTx) NumberHolder(number, docID, origin, stream string, seq int64) (R
 }
 
 func (t *sqlTx) PutFork(stream, origin string, seq int64, h, body, source string) error {
+	body, err := t.s.seal("forks", pkOp(t.tenant, stream, origin, seq)+"|"+h, "body", body)
+	if err != nil {
+		return err
+	}
 	return t.exec(`INSERT INTO forks (tenant_id, stream, origin, seq, h, body, source) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, stream, origin, seq, h, body, source)
 }
 

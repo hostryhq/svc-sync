@@ -23,7 +23,7 @@ func TestPA1_GatewayPullAndSnapshotCarryNoPIIToAKDS(t *testing.T) {
 		kind   string
 		served bool
 	}{{sp.KindPOS, true}, {sp.KindWaiter, true}, {sp.KindPersonal, true}, {sp.KindHub, true}, {sp.KindKDS, false}} {
-		c := engine.Caller{ID: "x-" + tc.kind, Kind: tc.kind, Outlet: w.Outlet, Brand: w.Brand}
+		c := engine.Caller{ID: "x-" + tc.kind, Kind: tc.kind, Store: sp.StoreProtected, Outlet: w.Outlet, Brand: w.Brand}
 		resp, err := w.GW.Pull(bg, w.Tenant, c, sp.PullRequest{Vector: sp.Vector{}, Limit: 500})
 		if err != nil {
 			t.Fatal(err)

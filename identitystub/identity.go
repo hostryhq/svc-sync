@@ -699,3 +699,16 @@ func (i *Identity) MembersOfOutlet(tenant, outlet string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// LANCredential issues the LAN credential of a registered device (ADR-0002 A3.4 item 1): the compact JWS that a pack carries,
+// signed by the identity key, with the claims of the device's credential.
+func (i *Identity) LANCredential(device string) (string, bool) {
+	i.mu.Lock()
+	d, ok := i.devices[device]
+	i.mu.Unlock()
+	if !ok {
+		return "", false
+	}
+	jws, err := sp.SignCredentialJWS(i.Key, d.Env.Cred)
+	return jws, err == nil
+}

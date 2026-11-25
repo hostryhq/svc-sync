@@ -6,9 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"strconv"
@@ -244,52 +242,3 @@ func VerifyCredential(identityPub *ecdsa.PublicKey, e CredentialEnvelope) bool {
 
 // PubKey returns the credential's public key.
 func (c Credential) PubKey() (*ecdsa.PublicKey, error) { return DecodePub(c.Pub) }
-
-// LAN request authentication (S10): a device presents its credential and signs the request
-// with its device key. HeaderAssertion carries it; HeaderHubProof carries the hub's answer.
-const (
-	HeaderAssertion = "Hostry-Device-Assertion"
-	HeaderHubProof  = "Hostry-Hub-Proof"
-)
-
-// Assertion is the per-request proof of possession on the LAN.
-type Assertion struct {
-	Cred CredentialEnvelope `json:"cred"`
-	TS   int64              `json:"ts"`
-	Sig  string             `json:"sig"`
-}
-
-// AssertionMessage is the signed text: method, path, timestamp and body hash.
-func AssertionMessage(method, path string, ts int64, body []byte) string {
-	return "hostry-lan-v1\n" + method + "\n" + path + "\n" + strconv.FormatInt(ts, 10) + "\n" + Hash(string(body))
-}
-
-// Encode serialises the assertion for the header.
-func (a Assertion) Encode() (string, error) {
-	raw, err := json.Marshal(a)
-	return b64.EncodeToString(raw), err
-}
-
-// DecodeAssertion parses the header value.
-func DecodeAssertion(s string) (Assertion, error) {
-	raw, err := b64.DecodeString(s)
-	if err != nil {
-		return Assertion{}, err
-	}
-	var a Assertion
-	if err := json.Unmarshal(raw, &a); err != nil {
-		return Assertion{}, fmt.Errorf("assertion: %w", err)
-	}
-	return a, nil
-}
-
-// HubProof is the hub's signed answer binding its identity to the request it served.
-type HubProof struct {
-	Cred CredentialEnvelope `json:"cred"`
-	Sig  string             `json:"sig"`
-}
-
-// HubProofMessage binds the request signature and the response body.
-func HubProofMessage(requestSig string, respBody []byte) string {
-	return "hostry-hub-v1\n" + requestSig + "\n" + Hash(string(respBody))
-}

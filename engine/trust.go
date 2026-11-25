@@ -22,12 +22,15 @@ type CredCache struct {
 	tenant      string
 	outlet      string
 	creds       map[string]sp.CredentialEnvelope
-	now         func() time.Time
+	// lan holds credentials a peer proved on the LAN (ADR-0002 A3.1): enough to verify that peer's seals and to judge its
+	// intents, but not an envelope a third device could verify, so a hub never relays them as `creds`.
+	lan map[string]sp.Credential
+	now func() time.Time
 }
 
 // NewCredCache builds a cache that accepts credentials of one tenant and outlet.
 func NewCredCache(identityPub *ecdsa.PublicKey, tenant, outlet string, now func() time.Time) *CredCache {
-	return &CredCache{identityPub: identityPub, tenant: tenant, outlet: outlet, creds: map[string]sp.CredentialEnvelope{}, cloudKeys: map[string]*ecdsa.PublicKey{}, now: now}
+	return &CredCache{identityPub: identityPub, tenant: tenant, outlet: outlet, creds: map[string]sp.CredentialEnvelope{}, lan: map[string]sp.Credential{}, cloudKeys: map[string]*ecdsa.PublicKey{}, now: now}
 }
 
 // AddCloudKey installs a gateway op-signing public key (delivered in every pack).
@@ -56,6 +59,25 @@ func (c *CredCache) Add(e sp.CredentialEnvelope) error {
 	return nil
 }
 
+// AddLAN keeps the claims of a LAN credential that already verified against the identity keys (hello), unless the cache holds
+// an identity envelope for the device.
+func (c *CredCache) AddLAN(cl sp.Credential) {
+	c.mu.Lock()
+	c.lan[cl.DeviceID] = cl
+	c.mu.Unlock()
+}
+
+// Claims returns the credential claims known for a device, from an envelope or from a LAN credential.
+func (c *CredCache) Claims(device string) (sp.Credential, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.creds[device]; ok {
+		return e.Cred, true
+	}
+	cl, ok := c.lan[device]
+	return cl, ok
+}
+
 // Get returns a stored credential.
 func (c *CredCache) Get(device string) (sp.CredentialEnvelope, bool) {
 	c.mu.Lock()
@@ -73,11 +95,14 @@ func (c *CredCache) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	if strings.HasPrefix(origin, CloudOriginPrefix) {
 		return nil, len(c.cloudKeys) > 0
 	}
-	e, ok := c.creds[origin]
+	cl, ok := c.creds[origin]
+	claims := cl.Cred
 	if !ok {
-		return nil, false
+		if claims, ok = c.lan[origin]; !ok {
+			return nil, false
+		}
 	}
-	pub, err := e.Cred.PubKey()
+	pub, err := claims.PubKey()
 	return pub, err == nil
 }
 

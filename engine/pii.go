@@ -86,6 +86,11 @@ func servedPII(tx repository.Tx, r repository.OpRec) (json.RawMessage, error) {
 // MetaPIINeed marks an op whose commitments have no value on this node yet (`pii_incomplete`, ADR-0014 A3.1 item 4).
 const MetaPIINeed = "pii-need:"
 
+// piiTo reports whether a pull by c may carry the pii of an op of origin (ADR-0002 A3.5 item 2).
+func (e *Engine) piiTo(c Caller, origin string) bool {
+	return sp.PIIPlacement(c.Kind, c.Store, c.ID, origin, e.cfg.PIIToUnprotected)
+}
+
 // wantsPII reports whether this node expects values for the commitments of the ops it stores.
 func (e *Engine) wantsPII() bool { return e.cfg.Role != RoleCloud && sp.ServesPII(e.cfg.Kind) }
 

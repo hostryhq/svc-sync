@@ -54,6 +54,8 @@ type Caller struct {
 	Brand  string
 	// Drain is set for a drain or recovery-drain token (quarantine-upload only).
 	Drain bool
+	// Store is the caller's credential store claim (protected or unprotected).
+	Store string
 	// Recovers is the old origin a recovery drain token is limited to.
 	Recovers string
 	RecID    string
@@ -155,6 +157,9 @@ type Config struct {
 	Series SeriesSource
 	// NoState skips the materialised state (the cloud keeps only the op log and verdicts).
 	NoState bool
+	// PIIToUnprotected lifts the placement rule of ADR-0002 A3.5 item 2 so an unprotected puller also receives another
+	// origin's pii. Only the dev, test and ci binaries may set it (the commands check HOSTRY_ENV).
+	PIIToUnprotected bool
 	// MaxAhead bounds the clock drift an observed stamp may drag the local clock by.
 	MaxAhead time.Duration
 }
@@ -1656,7 +1661,7 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H}
 				if r.Body != "" && (r.Status == repository.StAccepted || r.Status == repository.StFlagged) {
 					it.Body = r.Body
-					if sp.ServesPII(o.Caller.Kind) {
+					if e.piiTo(o.Caller, r.Origin) {
 						if it.PII, err = servedPII(tx, r); err != nil {
 							return err
 						}
@@ -1690,7 +1695,7 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 			}
 			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) && (e.cfg.Role == RoleCloud || !hasMarkS(rec.Marks, MarkUnbound)) {
 				rel := sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body}
-				if sp.ServesPII(o.Caller.Kind) {
+				if e.piiTo(o.Caller, rec.Origin) {
 					if rel.PII, err = servedPII(tx, rec); err != nil {
 						return err
 					}

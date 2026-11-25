@@ -61,7 +61,7 @@ func TestPA1_PIIIsServedToStaffDevicesAndHubAndNeverToAKDS(t *testing.T) {
 		kind   string
 		served bool
 	}{{sp.KindPOS, true}, {sp.KindWaiter, true}, {sp.KindPersonal, true}, {sp.KindHub, true}, {sp.KindKDS, false}} {
-		resp, err := hub.e.Serve(ctx, sp.PullRequest{Vector: sp.Vector{}}, ServeOpts{Caller: Caller{ID: "x", Kind: tc.kind}}, func(string) (sp.CredentialEnvelope, bool) { return sp.CredentialEnvelope{}, false })
+		resp, err := hub.e.Serve(ctx, sp.PullRequest{Vector: sp.Vector{}}, ServeOpts{Caller: Caller{ID: "x", Kind: tc.kind, Store: sp.StoreProtected}}, func(string) (sp.CredentialEnvelope, bool) { return sp.CredentialEnvelope{}, false })
 		if err != nil || len(resp.Items) != 1 {
 			t.Fatalf("%s pull: %v %+v", tc.kind, err, resp)
 		}

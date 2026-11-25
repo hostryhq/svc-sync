@@ -18,6 +18,16 @@ func ServesPII(kind string) bool {
 	return false
 }
 
+// PIIPlacement is the placement rule of ADR-0002 A3.5 item 2, on top of ServesPII: a node gives another origin's pii only to
+// a puller whose credential says store protected, and a kds never receives it. A puller's own pii is unaffected. lift is the
+// named dev, test and ci switch that lets an unprotected puller receive it so the soak's placement check still runs.
+func PIIPlacement(kind, store, puller, origin string, lift bool) bool {
+	if !ServesPII(kind) {
+		return false
+	}
+	return puller == origin || store == StoreProtected || lift
+}
+
 // PIIMissing counts the commitments of an op that have no verified value in stored (this node's wire pii).
 func PIIMissing(c PIICommit, stored json.RawMessage) int {
 	have := map[string]map[string]map[string]json.RawMessage{}

@@ -60,6 +60,7 @@ type World struct {
 	Hub         *hub.Hub
 	HubKey      *sp.KeyPair
 	HubCred     sp.CredentialEnvelope
+	HubJWS      string
 	HubDB       string
 	hubGen      int
 	HubUp       *engine.Client
@@ -206,6 +207,10 @@ func (w *World) newHub(first bool) error {
 		if w.HubCred, err = w.Identity.Activate(w.Tenant, w.Outlet, w.Brand, "hub-01", sp.KindHub, kp, ""); err != nil {
 			return err
 		}
+		var ok bool
+		if w.HubJWS, ok = w.Identity.LANCredential("hub-01"); !ok {
+			return fmt.Errorf("sim: no LAN credential for the hub")
+		}
 	}
 	w.hubGen++
 	w.HubDB = filepath.Join(w.Opt.Dir, fmt.Sprintf("hub-%d.db", w.hubGen))
@@ -219,7 +224,7 @@ func (w *World) newHub(first bool) error {
 
 func (w *World) openHub(st repository.Store) {
 	h, err := hub.New(w.Ctx, hub.Config{
-		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, Key: w.HubKey,
+		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, CredJWS: w.HubJWS, Key: w.HubKey,
 		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{w.Identity.CloudKey.Kid: &w.Identity.CloudKey.Priv.PublicKey},
 		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet),
 		Members: func(actor string) bool { return w.Identity.InAnyPackOf(w.Tenant, w.Outlet, actor) },

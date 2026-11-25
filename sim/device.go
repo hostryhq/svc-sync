@@ -128,11 +128,20 @@ func (d *Device) open() error {
 		return err
 	}
 	streams := []string{"outlet:" + w.Outlet, "brand:" + w.Brand, "tenant:" + w.Tenant}
-	lan := &hub.LANClient{Cred: d.Cred, Key: d.Key, IdentityPub: w.Identity.IdentityPub(), Outlet: w.Outlet, Now: func() time.Time { return w.Clock.Now().Add(d.Skew) }}
+	jws, ok := w.Identity.LANCredential(d.ID)
+	if !ok {
+		return fmt.Errorf("sim: no LAN credential for %s", d.ID)
+	}
 	hubH := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { w.HubH.ServeHTTP(rw, r) })
+	lan := &hub.LANClient{CredJWS: jws, Key: d.Key, DeviceID: d.ID, Tenant: w.Tenant, Outlet: w.Outlet,
+		Identity: func() []*ecdsaPub { return []*ecdsaPub{w.Identity.IdentityPub()} },
+		Revoked:  func(id string) bool { rev, _ := w.Identity.Revoked(w.Tenant, id); return rev },
+		Now:      func() time.Time { return w.Clock.Now().Add(d.Skew) },
+		Next:     w.Net.RoundTripper("dev-hub:"+d.ID, hubH),
+		// The in-memory network has no TLS: a device "sees" the certificate key of the hub it is wired to.
+		SPKISeen: func() string { return w.Hub.SPKI() }}
 	d.HubC = &engine.Client{E: d.Eng, Cache: d.Cache, Streams: streams, T: &engine.HTTPTransport{
-		Base: "http://hub", Client: &http.Client{Transport: w.Net.RoundTripper("dev-hub:"+d.ID, hubH)},
-		Authorize: lan.Authorize, VerifyResponse: lan.VerifyResponse}}
+		Base: "http://hub", Client: &http.Client{Transport: lan.RoundTripper()}}}
 	d.CloudC = &engine.Client{E: d.Eng, Cache: d.Cache, Streams: streams, UpstreamIsCloud: true, T: w.CloudTransport("dev-cloud:"+d.ID, d.ID)}
 	return nil
 }

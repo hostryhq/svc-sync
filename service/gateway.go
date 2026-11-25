@@ -39,6 +39,8 @@ type Config struct {
 	// ReconciledEvent publishes billing.series.reconciled from the gateway when a closed series is
 	// confirmed. Off by default: x-publisher is billing (see series.go).
 	ReconciledEvent bool
+	// PIIToUnprotected lifts the placement rule of ADR-0002 A3.5 item 2 (dev, test and ci only; the command checks HOSTRY_ENV).
+	PIIToUnprotected bool
 	// MinSupportedVersion is returned by hello (S13).
 	MinSupportedVersion string
 }
@@ -162,7 +164,7 @@ func (g *Gateway) engineFor(tenant string) *engine.Engine {
 	e := engine.New(engine.Config{
 		Role: engine.RoleCloud, Tenant: tenant, Origin: engine.CloudOriginPrefix + g.epoch, Key: g.cfg.OpKey,
 		Store: g.cfg.Store, Trust: tenantTrust{tenant: tenant, dir: g.cfg.Dir, g: g},
-		Clock: sp.NewClock(g.cfg.Now), NoState: true,
+		Clock: sp.NewClock(g.cfg.Now), NoState: true, PIIToUnprotected: g.cfg.PIIToUnprotected,
 		Hooks: engine.Hooks{
 			Authorize: g.authorize(tenant),
 			Verdict: func(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx) engine.Verdict {
@@ -456,7 +458,7 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 	})
 	snap.Rows = st.Snapshot()
 	if err == nil {
-		err = g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error { return engine.AttachSnapshotPII(tx, snap.Rows, c.Kind) })
+		err = g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error { return engine.AttachSnapshotPII(tx, snap.Rows, c, g.cfg.PIIToUnprotected) })
 	}
 	return snap, err
 }
