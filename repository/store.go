@@ -82,8 +82,10 @@ type HeadRow struct {
 // RegisterEntry is one row of the cloud series register.
 type RegisterEntry struct {
 	Tenant, Code, FY, Number, DocType, Origin, Stream string
-	Num, Seq                                          int64
-	State, Mark                                       string
+	// DocID is the id of the bill or credit note row that carries the number ("" for a row written before it was kept).
+	DocID       string
+	Num, Seq    int64
+	State, Mark string
 }
 
 // Recovery mirrors identity's record of a key-loss recovery.
@@ -221,6 +223,9 @@ type Tx interface {
 	PutRegister(e RegisterEntry) error
 	SetRegisterState(origin, stream string, seq int64, state, mark string) error
 	Register() ([]RegisterEntry, error)
+	// NumberHolder returns the register entry that keeps a legal number under a document id other than docID, written by an op
+	// other than the given one that was accepted or flagged and is not marked duplicate_document (the first op keeps the number; a held op does not).
+	NumberHolder(number, docID, origin, stream string, seq int64) (RegisterEntry, bool, error)
 	PutFork(stream, origin string, seq int64, h, body, source string) error
 	Forks() ([]string, error)
 	PutRecovery(r Recovery) error
@@ -782,9 +787,9 @@ func (t *sqlTx) SetDrainState(origin, hash, state string) error {
 }
 
 func (t *sqlTx) PutRegister(e RegisterEntry) error {
-	return t.exec(`INSERT INTO series_numbers (tenant_id, code, fy, num, number, doc_type, origin, stream, seq, state, mark) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+	return t.exec(`INSERT INTO series_numbers (tenant_id, code, fy, num, number, doc_type, origin, stream, seq, state, mark, doc_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (tenant_id, origin, stream, seq, number) DO UPDATE SET state = excluded.state, mark = excluded.mark`,
-		t.tenant, e.Code, e.FY, e.Num, e.Number, e.DocType, e.Origin, e.Stream, e.Seq, e.State, e.Mark)
+		t.tenant, e.Code, e.FY, e.Num, e.Number, e.DocType, e.Origin, e.Stream, e.Seq, e.State, e.Mark, e.DocID)
 }
 
 func (t *sqlTx) SetRegisterState(origin, stream string, seq int64, state, mark string) error {
@@ -792,7 +797,7 @@ func (t *sqlTx) SetRegisterState(origin, stream string, seq int64, state, mark s
 }
 
 func (t *sqlTx) Register() ([]RegisterEntry, error) {
-	rows, err := t.query(`SELECT code, fy, num, number, doc_type, origin, stream, seq, state, mark FROM series_numbers WHERE tenant_id=? ORDER BY code, fy, num, origin, seq`, t.tenant)
+	rows, err := t.query(`SELECT code, fy, num, number, doc_type, origin, stream, seq, state, mark, doc_id FROM series_numbers WHERE tenant_id=? ORDER BY code, fy, num, origin, seq`, t.tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -800,12 +805,24 @@ func (t *sqlTx) Register() ([]RegisterEntry, error) {
 	var out []RegisterEntry
 	for rows.Next() {
 		e := RegisterEntry{Tenant: t.tenant}
-		if err := rows.Scan(&e.Code, &e.FY, &e.Num, &e.Number, &e.DocType, &e.Origin, &e.Stream, &e.Seq, &e.State, &e.Mark); err != nil {
+		if err := rows.Scan(&e.Code, &e.FY, &e.Num, &e.Number, &e.DocType, &e.Origin, &e.Stream, &e.Seq, &e.State, &e.Mark, &e.DocID); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+func (t *sqlTx) NumberHolder(number, docID, origin, stream string, seq int64) (RegisterEntry, bool, error) {
+	e := RegisterEntry{Tenant: t.tenant}
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT code, fy, num, number, doc_type, origin, stream, seq, state, mark, doc_id FROM series_numbers
+		WHERE tenant_id=? AND number=? AND doc_id<>'' AND doc_id<>? AND state IN ('accepted','flagged') AND mark<>'duplicate_document' AND NOT (origin=? AND stream=? AND seq=?)
+		ORDER BY origin, seq LIMIT 1`), t.tenant, number, docID, origin, stream, seq).
+		Scan(&e.Code, &e.FY, &e.Num, &e.Number, &e.DocType, &e.Origin, &e.Stream, &e.Seq, &e.State, &e.Mark, &e.DocID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RegisterEntry{}, false, nil
+	}
+	return e, err == nil, err
 }
 
 func (t *sqlTx) PutFork(stream, origin string, seq int64, h, body, source string) error {

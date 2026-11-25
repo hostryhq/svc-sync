@@ -63,6 +63,8 @@ type Mut struct {
 type Doc struct {
 	Type   string `json:"type"`
 	Number string `json:"number"`
+	// ID is the id of the row that carries the number (the bill or credit note id); it is read from the mutation, never on the wire.
+	ID string `json:"-"`
 }
 
 // SeriesCode is the code part of the number.
@@ -441,9 +443,18 @@ func (b Body) Documents() []Doc {
 	var out []Doc
 	seen := map[string]bool{}
 	add := func(d Doc) {
-		if d.Number != "" && !seen[d.Number] {
+		if d.Number == "" {
+			return
+		}
+		if !seen[d.Number] {
 			seen[d.Number] = true
 			out = append(out, d)
+			return
+		}
+		for i := range out { // the row behind a number named in `doc` gives it its id
+			if out[i].Number == d.Number && out[i].ID == "" {
+				out[i].ID = d.ID
+			}
 		}
 	}
 	if b.Doc != nil {
@@ -459,7 +470,7 @@ func (b Body) Documents() []Doc {
 		if df.TypeField != "" {
 			t, _ = m.F[df.TypeField].(string)
 		}
-		add(Doc{Type: t, Number: n})
+		add(Doc{Type: t, Number: n, ID: m.ID})
 	}
 	return out
 }

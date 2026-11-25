@@ -30,6 +30,8 @@ const (
 	ReasonPermAbsent     = "permission_absent"
 	ReasonPermWithdrawn  = "permission_withdrawn"
 	ReasonDiscarded      = "discarded"
+	// ReasonDuplicateDocument holds an op whose legal number the register already keeps under another bill or credit note id.
+	ReasonDuplicateDocument = "duplicate_document"
 )
 
 // Marks recorded with a verdict (audit views, never sent to devices).
@@ -51,6 +53,7 @@ const (
 	MarkFork                  = "fork"
 	MarkReleased              = "released"
 	MarkPIIDropped            = "pii_dropped"
+	MarkDuplicate             = "duplicate_document"
 )
 
 // (approval marks: approval.go)
@@ -225,6 +228,20 @@ func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.Verdic
 				if si.DocType != doc.Type {
 					flag(MarkDocTypeMismatch)
 				}
+			}
+		}
+		// The same number under a different document id is refused; the first op keeps it (protocol-v1 "Manual-book entries",
+		// intents/billing.yaml bill.finalize). A series hold above is the more specific reason. A manager's release keeps the op,
+		// flagged.
+		for _, doc := range docs {
+			if doc.ID == "" {
+				continue
+			}
+			if _, dup, err := tx.NumberHolder(doc.Number, doc.ID, origin, p.Item.Stream, p.Item.Seq); err == nil && dup {
+				if rel == nil {
+					return quarantine(ReasonDuplicateDocument, MarkDuplicate)
+				}
+				flag(MarkDuplicate)
 			}
 		}
 	}
@@ -444,6 +461,11 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 			if err := g.alert(tx, "vendor", "high", "foreign_series", rec); err != nil {
 				return err
 			}
+		case ReasonDuplicateDocument:
+			sev = "high"
+			if err := g.alert(tx, "owner", "high", "duplicate_document", rec); err != nil {
+				return err
+			}
 		case ReasonChainBroken:
 			if err := g.alert(tx, "vendor", "high", "chain_broken", rec); err != nil {
 				return err
@@ -523,7 +545,7 @@ func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v 
 		state = repository.StQuarantined
 	}
 	mark := ""
-	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkUnsealed, MarkRecoveredSealed, MarkManualBook} {
+	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkDuplicate, MarkUnsealed, MarkRecoveredSealed, MarkManualBook} {
 		if hasMark(v.Marks, m) {
 			mark = m
 			break
@@ -538,7 +560,7 @@ func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v 
 			continue
 		}
 		if err := tx.PutRegister(repository.RegisterEntry{Code: code, FY: fy, Num: n, Number: doc.Number, DocType: doc.Type,
-			Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark}); err != nil {
+			Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark, DocID: doc.ID}); err != nil {
 			return err
 		}
 		if err := g.recheckSeries(tx, code, fy); err != nil {
