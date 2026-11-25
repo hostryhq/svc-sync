@@ -1036,13 +1036,10 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			if sp.Hash(it.Body) != rec.H {
 				continue
 			}
-			if maxSeal, err := tx.MaxSealSeq(g.stream, g.origin); err != nil {
-				return false, err
-			} else if rt, isRT := e.cfg.Trust.(RecoveryTrust); isRT && rec.Seq > maxSeal && len(rt.Recoverers(g.origin)) > 0 && !e.sealedLater(tx, g, req.Seals, rec.Seq) {
-				en, ok := g.ends[endKey(it.Origin, it.Stream, it.Seq)]
-				if !ok {
-					continue
-				}
+			// An endorsement that comes with the body must pass the rule of A2.1; a body without one
+			// is an ordinary released slot, taken by hash as before (the placeholder's hash came from
+			// the same authenticated upstream).
+			if en, has := g.ends[endKey(it.Origin, it.Stream, it.Seq)]; has {
 				att, ok := e.endorsedOK(tx, en, rec.H, req.Attestations, func(q int64) (string, bool) { return heldHash(tx, g, q) })
 				if !ok {
 					continue
@@ -1422,16 +1419,6 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 			}
 			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) {
 				resp.Items = append(resp.Items, sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body})
-				// The nearest origin seal at or above the slot: an ordinary released op lies under it.
-				if later, err := tx.SealSeqs(rec.Stream, rec.Origin, rec.Seq-1); err != nil {
-					return err
-				} else if len(later) > 0 {
-					if kid, sig, h, ok, err := tx.GetSeal(rec.Stream, rec.Origin, later[0]); err != nil {
-						return err
-					} else if ok {
-						resp.Seals = append(resp.Seals, sp.Seal{Origin: rec.Origin, Stream: rec.Stream, Seq: later[0], H: h, Kid: kid, Sig: sig})
-					}
-				}
 				if en, ok, err := tx.GetEndorsement(rec.Stream, rec.Origin, rec.Seq); err != nil {
 					return err
 				} else if ok {
@@ -1663,27 +1650,4 @@ func (e *Engine) sealOK(s sp.Seal, origin string, originPub *ecdsa.PublicKey) bo
 		}
 	}
 	return s.Verify(originPub)
-}
-
-// sealedLater reports whether a verified origin seal at or above seq, matching the hash this node
-// holds at the sealed slot, accompanies the batch: the released op then lies under the origin's own
-// signature (an ordinary released slot, not the unsealed tail). A seal that qualifies is stored.
-func (e *Engine) sealedLater(tx repository.Tx, g *group, seals []sp.Seal, seq int64) bool {
-	pub, ok := e.cfg.Trust.OriginKey(g.origin)
-	if !ok {
-		return false
-	}
-	for _, sl := range seals {
-		if sl.Origin != g.origin || sl.Stream != g.stream || sl.Seq < seq || !e.sealOK(sl, g.origin, pub) {
-			continue
-		}
-		if h, have := heldHash(tx, g, sl.Seq); !have || h != sl.H {
-			continue
-		}
-		if err := tx.PutSeal(sl.Stream, sl.Origin, sl.Seq, sl.H, sl.Kid, sl.Sig); err != nil {
-			return false
-		}
-		return true
-	}
-	return false
 }

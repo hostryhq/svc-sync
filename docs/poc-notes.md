@@ -64,8 +64,9 @@ inconsistent, the conservative choice is listed under "Choices".
 ## A2 follow-up (2026-11-25, provisional, ADR-0002 Amendment A2 Proposed)
 
 - **A2.1** endorsement object, `endorsements` / `attestations` on the wire, verifier rule in `engine` (`endorsedOK`), nodes store and
-  re-serve every endorsement with the tail; a released op over a placeholder needs an endorsement when the origin has a known
-  recoverer, or a verified origin seal at or above it (`sealedLater`, found by simulator seed 1 after the first cut). After a
+  re-serve every endorsement with the tail; a released op over a placeholder is checked by the rule when an endorsement comes with
+  it and taken by hash otherwise (requiring one, or a seal, broke relaying through a hub that had promoted the op: simulator seeds 1
+  and 257 after the first cut). After a
   cloud restore a node re-offers endorsed ops below the cloud's vector and the gateway takes quarantined `unsealed_tail`
   slots as released (`OnEndorsed`). `Gateway.RotateOpKey` re-signs cloud seals and endorsements; nodes refresh stale
   endorsements by listing them in `placeholders`.
@@ -75,8 +76,7 @@ inconsistent, the conservative choice is listed under "Choices".
 - **A2.4** the gateway uses `go-common/restore` (Reader once at start, `restore_state` table, `Guard` with a hook for the new
   cloud origin, `/readyz` through `Guard().Check`); `platform_meta` and `gateway_state` are no longer read. Development and
   the simulator stamp an epoch through `devepoch` (wraps `restoretest`).
-- Residuals and open items: a node that does not yet know the recovery credential of a key-lost origin takes a released
-  placeholder by hash alone (as before A2); hubs refresh stale endorsements only through `placeholders`, and stale cloud seals
+- Residuals and open items: a released placeholder that arrives without an endorsement is taken by hash alone (as before A2); hubs refresh stale endorsements only through `placeholders`, and stale cloud seals
   of a hub after a rotation are not refreshed (a node with only the new key reads from the cloud); `go.mod` still pins
   go-common by pseudo-version (`go.work` supplies the local copy) and must be bumped to the merged `restore` commit.
 - **Intent registry mapping (follow-up, not done in this pass):** the canonical registry is now

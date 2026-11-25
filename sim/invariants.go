@@ -337,18 +337,3 @@ func violDiff(node, cloud []engine.Violation) string {
 	sort.Strings(out)
 	return strings.Join(out, "; ")
 }
-
-// slotDetail lists the cloud's state for the first slots a node lacks, to explain a stalled pull.
-func slotDetail(cloud map[string]repository.OpRec, node, cvec sp.Vector) string {
-	var out []string
-	for k, c := range cvec {
-		o, st, _ := sp.SplitVKey(k)
-		for q := node[k] + 1; q <= c && q <= node[k]+3; q++ {
-			if r, ok := cloud[sp.Ref{Origin: o, Stream: st, Seq: q}.Key()]; ok {
-				out = append(out, fmt.Sprintf("%s#%d=%s/%s", o, q, r.Status, r.Reason))
-			}
-		}
-	}
-	sort.Strings(out)
-	return " {" + strings.Join(out, ", ") + "}"
-}

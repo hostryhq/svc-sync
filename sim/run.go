@@ -31,6 +31,8 @@ type Options struct {
 	Features Features
 	Dir      string
 	CloudDSN string
+	// Inspect is called with the finished world before it is closed (debugging and tests).
+	Inspect func(*World)
 	// Trace keeps a log of every action (the last 400 are returned).
 	Trace bool
 }
@@ -128,6 +130,9 @@ func Run(ctx context.Context, opt Options) (*Result, error) {
 		}
 	}
 	res := r.finish(ctx)
+	if opt.Inspect != nil {
+		opt.Inspect(w)
+	}
 	return res, nil
 }
 

@@ -38,9 +38,10 @@ svc-sync during the Phase 1 proof of concept; it should move to `api-specs` (`op
   **every endorsement in the range** (not only the last), the last origin seal in the range (so that the sealed part stays
   unmarked), the stored attestation(s), and in a pull the credential(s) of the adopting device. A node therefore must
   *store* what it verified (endorsements, attestations) and re-serve it with the ops. A released op answered for a
-  `placeholders` entry carries its endorsement, attestation and the credential the same way; a node holding only the
-  placeholder takes it only with that proof when the origin has a known recoverer (a node that does not know the recovery
-  credential yet cannot tell, a residual of A2.1).
+  `placeholders` entry carries its endorsement, attestation and the credential the same way. A node holding the
+  placeholder verifies an endorsement that arrives with the body by the rule above and marks the op `unsealed`; a body that
+  arrives with no endorsement is an ordinary released slot and is taken by hash, as before A2 (a residual: the same upstream
+  gave the placeholder's hash).
 - **After a cloud restore (A2.1 item 5).** While its re-offer is open a node's push also carries `items` + `endorsements`
   (+ `attestations`) for endorsed ops *at or below* the cloud's vector. The gateway takes a slot it holds as `quarantined`
   (`unsealed_tail`) as released, marked `unsealed`, with no owner action, if endorsement, credential and attestation
