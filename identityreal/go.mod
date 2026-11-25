@@ -6,6 +6,7 @@ module github.com/hostryhq/svc-sync/identityreal
 go 1.27
 
 require (
+	github.com/hostryhq/go-auth v0.0.0-20261125030157-94f1970efd79
 	github.com/hostryhq/go-common v0.0.0-20261125032613-92884d6c83f8
 	github.com/hostryhq/svc-identity v0.0.0-20261125054144-2ba5adc0cd21
 	github.com/hostryhq/svc-sync v0.0.0
@@ -15,7 +16,6 @@ require (
 require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hostryhq/go-auth v0.0.0-20261125030157-94f1970efd79 // indirect
 	github.com/hostryhq/svc-tenancy v0.0.0-20261125053351-3792f07b6054 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

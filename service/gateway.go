@@ -458,7 +458,9 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 	})
 	snap.Rows = st.Snapshot()
 	if err == nil {
-		err = g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error { return engine.AttachSnapshotPII(tx, snap.Rows, c, g.cfg.PIIToUnprotected) })
+		err = g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
+			return engine.AttachSnapshotPII(tx, snap.Rows, c, g.cfg.PIIToUnprotected)
+		})
 	}
 	return snap, err
 }

@@ -71,11 +71,16 @@ func (s seriesSrc) Code(docType string) (string, bool) {
 
 // AddDevice registers and starts a device.
 func (w *World) AddDevice(id, kind string) (*Device, error) {
+	return w.AddDeviceStore(id, kind, sp.StoreProtected)
+}
+
+// AddDeviceStore is AddDevice with the device's declared store claim (ADR-0002 A3.5 item 1).
+func (w *World) AddDeviceStore(id, kind, store string) (*Device, error) {
 	kp, err := sp.NewKeyPair("k-"+id, nil)
 	if err != nil {
 		return nil, err
 	}
-	cred, err := w.Identity.Activate(w.Tenant, w.Outlet, w.Brand, id, kind, kp, "")
+	cred, err := w.Identity.ActivateStore(w.Tenant, w.Outlet, w.Brand, id, kind, kp.Kid, kp.PublicB64(), "", store)
 	if err != nil {
 		return nil, err
 	}

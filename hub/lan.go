@@ -39,7 +39,7 @@ type session struct {
 }
 
 func (h *Hub) identityKeys() []*ecdsa.PublicKey {
-	return []*ecdsa.PublicKey{h.cfg.IdentityPub, h.cfg.IdentityNext}
+	return *h.idKeys.Load()
 }
 
 func lanRefused() error {
@@ -119,7 +119,7 @@ func (h *Hub) handleHello(w http.ResponseWriter, r *http.Request) {
 	}
 	h.pending[nonceH] = pendingHS{nonceD: req.NonceD, cred: c, spki: spki, exp: now.Add(pendingTTL)}
 	h.mu.Unlock()
-	writeJSON(w, sp.LanHelloResponse{Credential: h.cfg.CredJWS, NonceH: nonceH, HubProof: proof})
+	writeJSON(w, sp.LanHelloResponse{Credential: *h.credJWS.Load(), NonceH: nonceH, HubProof: proof})
 }
 
 // handleSession is openLanSession: step 2.

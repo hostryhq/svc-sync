@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hostryhq/svc-sync/api"
@@ -58,14 +59,21 @@ type Hub struct {
 	cache *engine.CredCache
 	cl    *engine.Client
 
-	keys     *tlsKeys
-	mu       sync.Mutex
-	pending  map[string]pendingHS
-	sessions map[string]session
-	revoked  map[string]bool
-	poke     int64
-	pokeCh   chan struct{}
-	held     []sp.HeldSlot // what the cloud last told about the origins relayed here (A1.2)
+	keys *tlsKeys
+	// The parts of the pack a refresh replaces while the hub runs.
+	credJWS atomic.Pointer[string]
+	idKeys  atomic.Pointer[[]*ecdsa.PublicKey]
+	members atomic.Pointer[map[string][]string]
+	// refresh is the pack refresher run at cloud contacts (SetPackRefresh).
+	refresh   func(ctx context.Context) error
+	refreshed time.Time
+	mu        sync.Mutex
+	pending   map[string]pendingHS
+	sessions  map[string]session
+	revoked   map[string]bool
+	poke      int64
+	pokeCh    chan struct{}
+	held      []sp.HeldSlot // what the cloud last told about the origins relayed here (A1.2)
 }
 
 // New builds a hub and opens its store.
@@ -78,6 +86,8 @@ func New(ctx context.Context, cfg Config) (*Hub, error) {
 		return nil, err
 	}
 	h := &Hub{cfg: cfg, keys: keys, pending: map[string]pendingHS{}, sessions: map[string]session{}, revoked: map[string]bool{}, pokeCh: make(chan struct{})}
+	h.credJWS.Store(&cfg.CredJWS)
+	h.idKeys.Store(&[]*ecdsa.PublicKey{cfg.IdentityPub, cfg.IdentityNext})
 	h.cache = engine.NewCredCache(cfg.IdentityPub, cfg.Tenant, cfg.Outlet, cfg.Now)
 	for kid, k := range cfg.CloudKeys {
 		h.cache.AddCloudKey(kid, k)
@@ -172,7 +182,11 @@ func (h *Hub) structural(_ repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	if !known || !have || !in.Allows(cred.Kind) {
 		return held
 	}
-	if h.cfg.Members != nil && (b.Actor == "" || !h.cfg.Members(b.Actor)) {
+	if m := h.members.Load(); m != nil {
+		if _, active := (*m)[b.Actor]; b.Actor == "" || !active {
+			return held
+		}
+	} else if h.cfg.Members != nil && (b.Actor == "" || !h.cfg.Members(b.Actor)) {
 		return held
 	}
 	if h.cfg.SeriesOwner != nil {
@@ -353,6 +367,7 @@ func (h *Hub) RunUpstream(ctx context.Context, every time.Duration) {
 			delay = min(delay*2, 60*time.Second)
 		} else {
 			delay = every
+			h.refreshPack(ctx)
 		}
 		jitter := time.Duration(rand.Int64N(int64(delay)/4 + 1))
 		select {

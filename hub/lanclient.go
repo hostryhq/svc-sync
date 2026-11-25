@@ -108,6 +108,9 @@ func (t lanRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp, err := c.Next.RoundTrip(r2)
 		if err != nil {
 			c.Forget() // a connection that failed may be a different hub next time: prove again
+			if attempt == 0 && errors.Is(err, ErrHubProof) && tok != "" {
+				continue // the hub's key changed (a restart): the handshake runs again, hello first
+			}
 			return nil, err
 		}
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 && isSessionExpired(resp) {

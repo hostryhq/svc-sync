@@ -1,100 +1,50 @@
-// Command hub is the restaurant LAN hub (ADR-0002 S8) as a plain binary. Running it as a Windows
-// service is the installer's job (Phase 2). Configuration is environment only:
+// Command hub is the restaurant LAN hub (ADR-0002 S8, A3) as a plain binary. Running it as a Windows service is the installer's
+// job. Two commands:
 //
-//	SYNC_HUB_PACK        path to the pack file (credential, keys, peers, staff, series grants)
-//	SYNC_HUB_DB          SQLite path of the hub's op store (default ./hub.db)
-//	SYNC_HUB_ADDR        listen address (default :8082)
-//	SYNC_HUB_CLOUD_TOKEN_FILE  file holding the current cloud access token (refreshed by the installer
-//	                     agent from identity); the hub syncs only on the LAN if it is unset
-//	SYNC_HUB_MDNS        "0" to disable the mDNS advertisement
+//	hub activate   register this hub with identity once (internet needed): makes the device key through the key provider,
+//	               activates with the 8-character code, stores the signed hub pack. The installer calls it.
+//	hub            run the hub: TLS 1.3 listener, encrypted store, pack refresh and cloud sync.
+//
+// Configuration is environment only (12-factor):
+//
+//	SYNC_HUB_STATE_DIR         directory for hub.db, device.key and hub-device.json (default ./hub-state)
+//	SYNC_HUB_IDENTITY_URL      identity base URL (https; plain http only in dev, test, ci)
+//	SYNC_HUB_ACTIVATION_CODE   (activate) the 8-character code
+//	SYNC_HUB_NAME              (activate) display name (default "Hub")
+//	SYNC_HUB_CLOUD_URL         the cloud gateway base URL; the hub works on the LAN only if unset
+//	SYNC_HUB_ADDR              listen address (default :8082)
+//	SYNC_HUB_MDNS              "0" to disable the mDNS advertisement
+//	SYNC_HUB_KEY_PROVIDER      dpapi (default on Windows) or dev (Linux CI and the soak; NOT protection; HOSTRY_ENV dev, test, ci only)
+//	SYNC_HUB_DEV_KEY_FILE      (dev) key file, created when absent; or SYNC_HUB_DEV_KEY holds the key text
+//	SYNC_HUB_DEV_PII_LIFT      "1" lifts the pii placement rule for the soak (HOSTRY_ENV dev, test, ci only)
+//
+// A binary built with the tag `devlan` also reads SYNC_HUB_PACK (a pack file) and SYNC_HUB_PLAIN=1 (a plain HTTP listener) and
+// refuses to start outside HOSTRY_ENV dev, test and ci.
 package main
 
 import (
-	"context"
-	"errors"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"time"
-
-	"github.com/hostryhq/svc-sync/engine"
-	"github.com/hostryhq/svc-sync/hub"
-	"github.com/hostryhq/svc-sync/repository"
 )
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(log); err != nil {
+	cmd := ""
+	if len(os.Args) > 1 {
+		cmd = os.Args[1]
+	}
+	var err error
+	switch cmd {
+	case "activate":
+		err = activate(log, os.Getenv)
+	case "", "run":
+		err = run(log, os.Getenv)
+	default:
+		log.Error("unknown command; use activate or run", "command", cmd)
+		os.Exit(2)
+	}
+	if err != nil {
 		log.Error("hub stopped", "err", err.Error())
 		os.Exit(1)
 	}
-}
-
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func run(log *slog.Logger) error {
-	packPath := os.Getenv("SYNC_HUB_PACK")
-	if packPath == "" {
-		return errors.New("SYNC_HUB_PACK is required")
-	}
-	cfg, pack, err := hub.LoadPack(packPath)
-	if err != nil {
-		return err
-	}
-	st, err := repository.Open(env("SYNC_HUB_DB", "hub.db"))
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	cfg.Store, cfg.Now, cfg.Log = st, time.Now, log
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	h, err := hub.New(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	if tf := os.Getenv("SYNC_HUB_CLOUD_TOKEN_FILE"); tf != "" && pack.CloudURL != "" {
-		h.SetUpstream(&engine.HTTPTransport{Base: pack.CloudURL, Authorize: func(r *http.Request, _ []byte) error {
-			b, err := os.ReadFile(tf)
-			if err != nil {
-				return err
-			}
-			r.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(b)))
-			return nil
-		}})
-		go h.RunUpstream(ctx, 2*time.Second)
-	}
-	addr := env("SYNC_HUB_ADDR", ":8082")
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-	if env("SYNC_HUB_MDNS", "1") != "0" {
-		_, port, _ := net.SplitHostPort(ln.Addr().String())
-		p, _ := strconv.Atoi(port)
-		if err := hub.Advertise(ctx, hub.Advertisement{HubID: cfg.Cred.Cred.DeviceID, Outlet: cfg.Outlet, Port: p, Version: 1}); err != nil {
-			log.Warn("mDNS advertisement unavailable; devices fall back to QR or manual address", "err", err.Error())
-		}
-	}
-	srv := &http.Server{Handler: h.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		<-ctx.Done()
-		sc, c := context.WithTimeout(context.Background(), 5*time.Second)
-		defer c()
-		_ = srv.Shutdown(sc)
-	}()
-	log.Info("hub listening", "addr", ln.Addr().String())
-	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return nil
 }

@@ -37,6 +37,8 @@ type WorldOptions struct {
 	Outbox bool
 	// NoHub builds a world with no LAN hub.
 	NoHub bool
+	// PIILift lifts the placement rule of ADR-0002 A3.5 item 2 on the gateway and the hub (the dev, test and ci switch).
+	PIILift bool
 }
 
 // World is one outlet with its devices, hub and cloud.
@@ -155,7 +157,7 @@ func (w *World) startGateway() error {
 	if err != nil {
 		return err
 	}
-	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Epoch: ep, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox})
+	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Epoch: ep, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox, PIIToUnprotected: w.Opt.PIILift})
 	if err != nil {
 		return err
 	}
@@ -226,7 +228,7 @@ func (w *World) openHub(st repository.Store) {
 	h, err := hub.New(w.Ctx, hub.Config{
 		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, CredJWS: w.HubJWS, Key: w.HubKey,
 		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{w.Identity.CloudKey.Kid: &w.Identity.CloudKey.Priv.PublicKey},
-		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet),
+		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet), PIIToUnprotected: w.Opt.PIILift,
 		Members: func(actor string) bool { return w.Identity.InAnyPackOf(w.Tenant, w.Outlet, actor) },
 		SeriesOwner: func(code string) (string, bool) {
 			s, ok := w.Identity.Series(w.Tenant, code)
