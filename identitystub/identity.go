@@ -108,13 +108,18 @@ func (i *Identity) SetDown(d bool) { i.mu.Lock(); i.down = d; i.mu.Unlock() }
 
 // Activate registers a device and returns its credential. The caller keeps the private key.
 func (i *Identity) Activate(tenant, outlet, brand, id, kind string, kp *sp.KeyPair, recovers string) (sp.CredentialEnvelope, error) {
+	return i.ActivatePub(tenant, outlet, brand, id, kind, kp.Kid, kp.PublicB64(), recovers)
+}
+
+// ActivatePub registers a device by its public key (base64url) alone: the private key never reaches identity.
+func (i *Identity) ActivatePub(tenant, outlet, brand, id, kind, kid, pub, recovers string) (sp.CredentialEnvelope, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if _, ok := i.devices[id]; ok {
 		return sp.CredentialEnvelope{}, errors.New("identitystub: device exists")
 	}
 	env, err := sp.SignCredential(i.Key, sp.Credential{DeviceID: id, TenantID: tenant, OutletID: outlet, BrandID: brand, Kind: kind,
-		Kid: kp.Kid, Pub: kp.PublicB64(), Recovers: recovers, NotAfter: i.now().Add(24 * 365 * time.Hour).Unix()})
+		Kid: kid, Pub: pub, Recovers: recovers, NotAfter: i.now().Add(24 * 365 * time.Hour).Unix()})
 	if err != nil {
 		return env, err
 	}
@@ -205,9 +210,50 @@ func (i *Identity) IssueSeries(tenant, device, docType, state string) string {
 // IssueManualBook registers a paper bill book as an entry-only series (kind manual_book) for the outlets
 // given (none means every outlet), under the code the owner chose. It has no device and no document type.
 func (i *Identity) IssueManualBook(tenant, code string, outlets ...string) {
+	_ = i.RegisterManualBook(tenant, code, SeriesActive, outlets...)
+}
+
+// RegisterManualBook is IssueManualBook with a state (active or closed; empty means active) and the refusal
+// tenancy gives: a code is unique across the device series and the books of a tenant.
+func (i *Identity) RegisterManualBook(tenant, code, state string, outlets ...string) error {
+	if state == "" {
+		state = SeriesActive
+	}
+	if state != SeriesActive && state != SeriesClosed {
+		return fmt.Errorf("identitystub: a manual book is active or closed, not %q", state)
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.series[tenant+"|"+code] = &SeriesInfo{Tenant: tenant, Code: code, State: SeriesActive, Kind: directory.SeriesKindManualBook, Outlets: outlets}
+	if _, ok := i.series[tenant+"|"+code]; ok {
+		return fmt.Errorf("identitystub: series code %s is in use", code)
+	}
+	i.series[tenant+"|"+code] = &SeriesInfo{Tenant: tenant, Code: code, State: state, Kind: directory.SeriesKindManualBook, Outlets: outlets}
+	return nil
+}
+
+// RegisterSeries issues a series under a code the caller chose (the code tenancy issued) to a device.
+func (i *Identity) RegisterSeries(tenant, code, device, docType, state string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if _, ok := i.series[tenant+"|"+code]; ok {
+		return fmt.Errorf("identitystub: series code %s is in use", code)
+	}
+	i.series[tenant+"|"+code] = &SeriesInfo{Tenant: tenant, Code: code, Device: device, DocType: docType, State: state}
+	return nil
+}
+
+// DevicesOf lists the ids of the tenant's devices.
+func (i *Identity) DevicesOf(tenant string) []string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var out []string
+	for id, d := range i.devices {
+		if d.Env.Cred.TenantID == tenant {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SetSeriesState changes a series state (activation, closing).

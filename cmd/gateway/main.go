@@ -3,6 +3,8 @@
 //	SYNC_DB_DSN    postgres:// DSN (or a SQLite path for local runs)
 //	SYNC_ADDR      listen address (default :8081)
 //	SYNC_DEV_STUB  "1" runs with the identity stub and a test token issuer (local development only)
+//	HOSTRY_ENV, SYNC_DEV_REGISTER=1  mount /dev/v1 device registration and token routes (dev, test or ci only; see internal/devreg)
+//	SYNC_NATS_URL, SYNC_NATS_SEED_FILE, SYNC_RELAY_DSN  relay the outbox to NATS with go-common's outbox.Relay (config.go)
 //	SYNC_DIRECTORY "stub" (default; needs SYNC_DEV_STUB=1) or "identity" (SYNC_IDENTITY_URL, SYNC_SERVICE_SIGNING_KEY_FILE)
 //
 // The production directory comes from generated clients of svc-identity and svc-tenancy. The identity client
@@ -31,6 +33,7 @@ import (
 	"github.com/hostryhq/svc-sync/devepoch"
 	"github.com/hostryhq/svc-sync/identityclient"
 	"github.com/hostryhq/svc-sync/identitystub"
+	"github.com/hostryhq/svc-sync/internal/devreg"
 	"github.com/hostryhq/svc-sync/repository"
 	"github.com/hostryhq/svc-sync/service"
 )
@@ -57,6 +60,10 @@ func run(log *slog.Logger) error {
 	}
 	if os.Getenv("SYNC_DEV_STUB") != "1" {
 		return errors.New("set SYNC_DIRECTORY=identity (not runnable yet) or SYNC_DEV_STUB=1 for local development")
+	}
+	x, err := loadExtras(os.Getenv, dsn)
+	if err != nil {
+		return err
 	}
 	addr := os.Getenv("SYNC_ADDR")
 	if addr == "" {
@@ -94,6 +101,15 @@ func run(log *slog.Logger) error {
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})
 	services := authtest.NewServiceRegistry(clock.Func(time.Now), "admin", "sync", "catalog", "billing", "orders")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: issuer.Verifier(), Services: services.Verifier("sync"), Audit: &repository.AccessSink{S: st}, Clock: clock.Func(time.Now)})
+	if x.DevRoutes {
+		(&devreg.Registry{ID: id, Issuer: issuer, Now: time.Now}).Mount(mux)
+		log.Warn("development only: device registration and token routes are mounted under /dev/v1")
+	}
+	if x.NatsURL != "" {
+		if err := startRelay(ctx, x, st, dsn, log); err != nil {
+			return err
+		}
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.DB().PingContext(r.Context()); err != nil || gw.Guard().Check(r.Context()) != nil {
