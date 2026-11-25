@@ -1,11 +1,13 @@
 package integration
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/hostryhq/go-common/events"
 	gsync "github.com/hostryhq/go-common/sync"
+	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/repository"
 	"github.com/hostryhq/svc-sync/service"
 	"github.com/hostryhq/svc-sync/sim"
@@ -134,4 +136,85 @@ func TestEmitDedupAndRegisterAreTenantIsolated(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// A held slot, a flagged op and an erasure are published id-only through the outbox in the storing transaction
+// (api-specs events/sync): quarantine.recorded names the series code, number and document type, never content;
+// op.flagged carries a coarse code; pii.erased carries ids.
+func TestHoldFlagAndEraseEventsOnPostgres(t *testing.T) {
+	d := dsn(t)
+	adm, err := repository.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adm.Close()
+	clean(t, adm)
+	w, err := sim.NewWorld(bg, sim.NewRand(21), sim.WorldOptions{Dir: t.TempDir(), Pos: 2, CloudDSN: appDSN(t, d), Outbox: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	rng := sim.NewRand(22)
+	a, b := w.Devices[0], w.Devices[1]
+	for _, dv := range []*sim.Device{a, b} {
+		if _, err := dv.OrderOp(rng); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.SetBadSeries(b.SaleCode()) // a bills in b's series: held as foreign_series
+	foreign, err := a.BillOp(rng)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetBadSeries("")
+	w.Identity.SetSeriesState(w.Tenant, b.SaleCode(), directory.SeriesClosed)
+	if _, err := b.BillOp(rng); err != nil { // b bills in its own closed series: kept, flagged
+		t.Fatal(err)
+	}
+	if rep := w.Quiesce(bg, 20); !rep.Converged {
+		t.Fatal("no quiescence")
+	}
+	if _, err := w.GW.ErasePII(bg, w.Tenant, sp.Ref{Origin: foreign.Origin, Stream: foreign.Stream, Seq: foreign.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	type ev struct {
+		Type, Key string
+		KeySeq    int64
+		Data      map[string]any
+	}
+	read := func(typ string) []ev {
+		var out []ev
+		for _, raw := range outboxPayloads(t, adm, typ) {
+			env, err := events.Unmarshal(raw)
+			if err != nil {
+				t.Fatalf("%s: %v", typ, err)
+			}
+			var e ev
+			e.Type, e.Key, e.KeySeq = env.Type, env.Key, env.KeySeq
+			if err := json.Unmarshal(env.Data, &e.Data); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, e)
+		}
+		return out
+	}
+	q := read("sync.quarantine.recorded")
+	if len(q) != 1 || q[0].Data["reason"] != service.ReasonForeignSeries || q[0].Data["series_code"] != b.SaleCode() ||
+		q[0].Data["document_type"] == "" || q[0].Data["number"] == "" || q[0].KeySeq != foreign.Seq {
+		t.Fatalf("quarantine.recorded: %+v", q)
+	}
+	for k := range q[0].Data {
+		switch k {
+		case "origin", "stream", "seq", "reason", "series_code", "number", "document_type":
+		default:
+			t.Fatalf("quarantine.recorded is id-only; it carries %q", k)
+		}
+	}
+	f := read("sync.op.flagged")
+	if len(f) != 1 || f[0].Data["code"] != service.MarkSeriesClosed || len(f[0].Data) != 4 {
+		t.Fatalf("op.flagged: %+v", f)
+	}
+	if e := read("sync.pii.erased"); len(e) != 1 || e[0].Data["origin"] != foreign.Origin || len(e[0].Data) != 3 {
+		t.Fatalf("pii.erased: %+v", e)
+	}
 }

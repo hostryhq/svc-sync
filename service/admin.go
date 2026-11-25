@@ -10,6 +10,7 @@ import (
 	"github.com/hostryhq/go-common/apperr"
 	"github.com/hostryhq/go-common/logx"
 	"github.com/hostryhq/go-common/tenancy"
+	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -44,11 +45,8 @@ var (
 	ErrConfirmHash = errors.New("service: the confirmation must carry the hash of the held op")
 )
 
-// guardedEntities are the entities of money, tax and bill numbers: a hold on an op that touches one
-// of them (or carries a legal number) is a money or bill-number hold.
-var guardedEntities = map[string]bool{"bill": true, "bill_line": true, "bill_tax_line": true, "payment": true, "refund": true,
-	"credit_note": true, "credit_note_line": true, "credit_note_tax_line": true, "cash_event": true, "shift_close": true, "day_close": true}
-
+// A hold on an op that touches a guarded entity of the registry (money, tax, bill numbers) or carries a legal
+// number is a money or bill-number hold.
 func moneyHold(rec repository.OpRec) bool {
 	b, err := sp.DecodeBody(rec.Body)
 	if err != nil {
@@ -58,7 +56,7 @@ func moneyHold(rec repository.OpRec) bool {
 		return true
 	}
 	for _, m := range b.Muts {
-		if guardedEntities[m.E] {
+		if engine.Entities[m.E].Guarded {
 			return true
 		}
 	}

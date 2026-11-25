@@ -10,43 +10,135 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
-// Policies of S6.
+// Policies of S6. A registry entity declares a policy per field (the FP constants); PolAppend,
+// PolLWW, PolDelta, PolRank and PolMixed are the entity-level defaults of api-specs entities/ and
+// of the simulator's demo entities.
 const (
 	PolAppend = "append"
 	PolLWW    = "lww"
 	PolDelta  = "delta"
 	PolRank   = "rank"
+	PolMixed  = "mixed"
 )
 
-// EntityDef declares the conflict policy next to the entity (offline-first invariant 5).
-// The demo entities exercise every policy; the real registry is api-specs/sync/entities.
-type EntityDef struct {
+// Field policies of the registry (ADR-0002 S6).
+const (
+	FPImmutable = "immutable"
+	FPLWW       = "lww"
+	FPLWWReview = "lww_review"
+	FPDelta     = "delta"
+	FPRank      = "rank"
+)
+
+// FieldDef is the conflict policy of one field of a registry entity.
+type FieldDef struct {
 	Policy string
-	// Review lists lww fields whose concurrent edits need a manager (S6 "lww + review").
+	// Group: fields of one group win together (lww, lww_review).
+	Group string
+	// Order is the forward-only order of a rank field, lowest first.
+	Order []string
+}
+
+// EntityDef declares the conflict policy next to the entity (offline-first invariant 5). Entities
+// is generated from the api-specs entity registry (entities_gen.go); the simulator and unit tests
+// add demo entities with RegisterDemoEntities, which the gateway and hub binaries never call.
+type EntityDef struct {
+	// Policy is the entity default (append, lww, rank, mixed) or, for a demo entity, delta.
+	Policy    string
+	Tombstone bool
+	Guarded   bool
+	// Fields holds the per-field policies of a registry entity. A demo entity has none and uses
+	// Policy, Review and Rank.
+	Fields map[string]FieldDef
+	// Review lists lww fields whose concurrent edits need a manager (demo entities only).
 	Review map[string]bool
-	// Rank gives, per field, the forward-only order of values (policy rank).
+	// Rank gives, per field, the forward-only order of values (demo entities only).
 	Rank map[string][]string
 }
 
-// Entities is the demo schema registry.
-var Entities = map[string]EntityDef{
-	"order":       {Policy: PolAppend},
-	"order_line":  {Policy: PolAppend},
-	"kot":         {Policy: PolAppend},
-	"bill":        {Policy: PolAppend},
-	"credit_note": {Policy: PolAppend},
-	"payment":     {Policy: PolAppend},
-	"audit":       {Policy: PolAppend},
-	"session":     {Policy: PolAppend},
-	"approval":    {Policy: PolAppend},
-	"sync_void":   {Policy: PolAppend},
-	"stock_level": {Policy: PolDelta},
-	"kds_item":    {Policy: PolRank, Rank: map[string][]string{"status": {"new", "preparing", "ready", "served"}}},
-	"menu_item":   {Policy: PolLWW, Review: map[string]bool{"price_paise": true}},
+// field returns the policy of a field. A field a registry entity does not list (a newer client's)
+// is kept as lww, so that no node loses it.
+func (d EntityDef) field(name string) FieldDef {
+	if f, ok := d.Fields[name]; ok {
+		return f
+	}
+	if len(d.Fields) > 0 {
+		return FieldDef{Policy: FPLWW}
+	}
+	switch d.Policy {
+	case PolAppend:
+		return FieldDef{Policy: FPImmutable}
+	case PolDelta:
+		return FieldDef{Policy: FPDelta}
+	}
+	if o, ok := d.Rank[name]; ok {
+		return FieldDef{Policy: FPRank, Order: o}
+	}
+	if d.Review[name] {
+		return FieldDef{Policy: FPLWWReview}
+	}
+	return FieldDef{Policy: FPLWW}
+}
+
+// HasLWW reports whether any field of the entity is resolved last-writer-wins.
+func (d EntityDef) HasLWW() bool {
+	if len(d.Fields) == 0 {
+		return d.Policy == PolLWW
+	}
+	for _, f := range d.Fields {
+		if f.Policy == FPLWW || f.Policy == FPLWWReview {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewFields lists the lww_review fields of an entity, sorted.
+func (d EntityDef) reviewFields() []string {
+	var out []string
+	for n, f := range d.Fields {
+		if f.Policy == FPLWWReview {
+			out = append(out, n)
+		}
+	}
+	for n := range d.Review {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// groupKey is the resolution group of an lww or lww_review field (as go-common/sync).
+func (f FieldDef) groupKey(name string) string {
+	if f.Group != "" {
+		return "g:" + f.Group
+	}
+	return "f:" + name
+}
+
+// Entities is the entity registry the apply state follows: the generated registry of api-specs
+// entities/ (entities_gen.go), plus the demo entities in a simulator or test process.
+var Entities = registryEntities()
+
+var demoOnce sync.Once
+
+// RegisterDemoEntities adds the entities that exist only in the simulator and the unit tests: the
+// registry has no stock level or KDS item yet, and the simulator exercises every policy. The
+// gateway and hub binaries never call it; ops of an unknown entity are ignored.
+func RegisterDemoEntities() {
+	demoOnce.Do(func() {
+		for _, n := range []string{"audit", "session", "approval", "sync_void"} {
+			Entities[n] = EntityDef{Policy: PolAppend}
+		}
+		Entities["stock_level"] = EntityDef{Policy: PolDelta}
+		Entities["kds_item"] = EntityDef{Policy: PolRank, Tombstone: true, Rank: map[string][]string{"status": {"new", "preparing", "ready", "served"}}}
+		Entities["menu_item"] = EntityDef{Policy: PolLWW, Tombstone: true, Review: map[string]bool{"price_paise": true}}
+	})
 }
 
 type stamp struct {
@@ -163,6 +255,7 @@ type derived struct {
 
 func (s *State) derive(rw *row) derived {
 	def := Entities[rw.entity]
+	registry := len(def.Fields) > 0
 	var ins, tomb []effect
 	for _, e := range rw.fx {
 		switch e.kind {
@@ -174,77 +267,122 @@ func (s *State) derive(rw *row) derived {
 		}
 	}
 	d := derived{fields: map[string]any{}}
-	switch def.Policy {
-	case PolDelta:
+	if def.Policy == PolDelta && !registry { // a pure counter exists as soon as it has an effect
 		if len(rw.fx) == 0 {
 			return d
 		}
 		d.exists = true
-		for _, e := range rw.fx {
-			if e.kind == sp.KInsert || e.kind == sp.KDelta {
-				for f, v := range e.f {
+	} else {
+		if len(ins) == 0 {
+			return d
+		}
+		d.exists = true
+	}
+	// Per field, by the policy of its registry entry (ADR-0002 S6). A kind only reaches a field
+	// whose policy it may touch (go-common/sync kindAllows).
+	first := map[string]effect{}     // immutable: the earliest insert that carries the field
+	best := map[string]effect{}      // rank: the highest rank, then the highest stamp
+	groupBest := map[string]effect{} // lww, lww_review: the highest stamp among the candidates of a group
+	for _, e := range rw.fx {
+		for f, v := range e.f {
+			fd := def.field(f)
+			if registry {
+				if _, known := def.Fields[f]; !known || !kindAllows(e.kind, fd.Policy) {
+					continue
+				}
+			} else if e.kind != sp.KInsert && e.kind != sp.KSet && e.kind != sp.KRank && !(e.kind == sp.KDelta && fd.Policy == FPDelta) {
+				continue
+			}
+			switch fd.Policy {
+			case FPImmutable:
+				if e.kind != sp.KInsert {
+					continue
+				}
+				if cur, ok := first[f]; !ok || e.st.less(cur.st) {
+					first[f] = e
+				}
+			case FPDelta:
+				if e.kind == sp.KInsert || e.kind == sp.KDelta {
 					n, _ := v.(int64)
 					cur, _ := d.fields[f].(int64)
 					d.fields[f] = cur + n
 				}
+			case FPRank:
+				if e.kind == sp.KDel || e.kind == sp.KUndel {
+					continue
+				}
+				if cur, ok := best[f]; !ok || beats(fd.Order, f, e, cur) {
+					best[f] = e
+				}
+			default: // lww, lww_review
+				g := fd.groupKey(f)
+				if cur, ok := groupBest[g]; !ok || cur.st.less(e.st) {
+					groupBest[g] = e
+				}
 			}
 		}
-		return d
-	case PolAppend:
-		if len(ins) == 0 {
-			return d
-		}
-		first := ins[0]
-		for _, e := range ins[1:] {
-			if e.st.less(first.st) {
-				first = e
-			}
-		}
-		d.exists = true
-		for f, v := range first.f {
-			d.fields[f] = v
-		}
-		return d
 	}
-	// lww and rank
-	if len(ins) == 0 {
-		return d
-	}
-	best := map[string]effect{}
-	for _, e := range rw.fx {
-		if e.kind != sp.KInsert && e.kind != sp.KSet {
-			continue
-		}
-		for f, v := range e.f {
-			cur, ok := best[f]
-			if !ok || s.beats(def, f, e, v, cur) {
-				best[f] = e
-			}
-		}
+	for f, e := range first {
+		d.fields[f] = e.f[f]
 	}
 	for f, e := range best {
 		d.fields[f] = e.f[f]
 	}
-	d.exists = true
-	top := tomb[0]
-	for _, e := range tomb[1:] {
-		if top.st.less(e.st) {
-			top = e
+	for f := range fieldsOf(rw, def) {
+		fd := def.field(f)
+		if fd.Policy != FPLWW && fd.Policy != FPLWWReview {
+			continue
+		}
+		if e, ok := groupBest[fd.groupKey(f)]; ok {
+			if v, has := e.f[f]; has {
+				d.fields[f] = v
+			}
 		}
 	}
-	if top.kind == sp.KDel {
-		d.exists, d.gone = false, true
+	if def.Tombstone || (!registry && def.Policy != PolAppend && def.Policy != PolDelta) {
+		top := tomb[0]
+		for _, e := range tomb[1:] {
+			if top.st.less(e.st) {
+				top = e
+			}
+		}
+		if top.kind == sp.KDel {
+			d.exists, d.gone = false, true
+		}
 	}
 	return d
 }
 
-// beats reports whether candidate e (value v) beats the current best for field f.
-func (s *State) beats(def EntityDef, f string, e effect, v any, cur effect) bool {
-	if order, ok := def.Rank[f]; ok {
-		re, rc := rankOf(order, v), rankOf(order, cur.f[f])
-		if re != rc {
-			return re > rc
+// fieldsOf lists the fields any effect of the row carries.
+func fieldsOf(rw *row, _ EntityDef) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, e := range rw.fx {
+		for f := range e.f {
+			out[f] = struct{}{}
 		}
+	}
+	return out
+}
+
+func kindAllows(kind, policy string) bool {
+	switch kind {
+	case sp.KInsert:
+		return true
+	case sp.KSet:
+		return policy == FPLWW || policy == FPLWWReview
+	case sp.KDelta:
+		return policy == FPDelta
+	case sp.KRank:
+		return policy == FPRank
+	}
+	return false
+}
+
+// beats reports whether candidate e beats the current best for rank field f.
+func beats(order []string, f string, e, cur effect) bool {
+	re, rc := rankOf(order, e.f[f]), rankOf(order, cur.f[f])
+	if re != rc {
+		return re > rc
 	}
 	return cur.st.less(e.st)
 }
@@ -337,14 +475,20 @@ func (s *State) Detect() []Violation {
 		case "bill":
 			t, _ := d.fields["total_paise"].(int64)
 			billTotal[rw.id] = t
-			if o, _ := d.fields["order_id"].(string); o != "" {
+			// "two bills from one check" (registry: check_id; the simulator's demo bills: order_id)
+			o, _ := d.fields["check_id"].(string)
+			if o == "" {
+				o, _ = d.fields["order_id"].(string)
+			}
+			if o != "" {
 				billsByOrder[o] = append(billsByOrder[o], rw.id)
 			}
 		case "payment":
 			b, _ := d.fields["bill_id"].(string)
 			a, _ := d.fields["amount_paise"].(int64)
 			paid[b] += a
-		case "menu_item":
+		}
+		if len(Entities[rw.entity].reviewFields()) > 0 {
 			out = append(out, s.reviewConflicts(rw)...)
 		}
 	}
@@ -376,7 +520,7 @@ func (s *State) Detect() []Violation {
 func (s *State) reviewConflicts(rw *row) []Violation {
 	def := Entities[rw.entity]
 	var out []Violation
-	for f := range def.Review {
+	for _, f := range def.reviewFields() {
 		var cands []effect
 		for _, e := range rw.fx {
 			if e.kind == sp.KSet || e.kind == sp.KInsert {

@@ -18,6 +18,8 @@ import (
 const (
 	TypeOpPrefix         = "sync.op."
 	TypePIIErased        = "sync.pii.erased"
+	TypeOpFlagged        = "sync.op.flagged"
+	TypeQuarantine       = "sync.quarantine.recorded"
 	TypeSeriesReconciled = "billing.series.reconciled"
 )
 
@@ -90,13 +92,66 @@ func (g *Gateway) publish(tx repository.Tx, rec repository.OpRec) error {
 	if raw, ok, err := tx.GetPII(rec.Stream, rec.Origin, rec.Seq); err != nil {
 		return err
 	} else if ok {
-		if pii, err = sp.StripSalts(json.RawMessage(raw)); err != nil {
-			return err
-		}
+		// Stored pii is the verified wire form: values with their ~s:<field> salts. The event carries both
+		// (api-specs sync/protocol-v1.md, O2-12), so an owning service can verify the commitments itself.
+		pii = json.RawMessage(raw)
 	}
 	env, err := opEnvelope(g.cfg.IDs.New(), tx.Tenant(), g.cfg.Now(), g.Epoch(), rec, pii)
 	if err != nil {
 		return err
+	}
+	return g.putOutbox(tx, env)
+}
+
+// flagCode is the coarse code of why an op was flagged: the first mark that names a flag. The text and
+// the attribution stay behind the exceptions endpoint (api-specs events/sync/op.flagged.v1).
+func flagCode(marks []string) string {
+	for _, m := range marks {
+		switch m {
+		case MarkReleased, MarkPIIDropped, MarkVendorConfirmed, MarkFork, MarkRecoveredSealed, MarkProofPending, MarkConfigShared:
+			continue
+		}
+		return m
+	}
+	return "flagged"
+}
+
+// publishFlagged writes sync.op.flagged for an op flagged at acceptance or at release (id and code only).
+func (g *Gateway) publishFlagged(tx repository.Tx, rec repository.OpRec, marks []string) error {
+	if !g.outboxOn() {
+		return nil
+	}
+	return g.putIDEvent(tx, TypeOpFlagged, rec, map[string]any{"origin": rec.Origin, "stream": rec.Stream, "seq": rec.Seq, "code": flagCode(marks)})
+}
+
+// publishQuarantined writes sync.quarantine.recorded for a slot held in quarantine: coarse reason and, when the
+// op carries a legal number, its series code, number and document type; never the content (id-only, A2.1 item 4).
+// An op with several numbers (bill.rebill) names the first; billing reads the register for the rest.
+func (g *Gateway) publishQuarantined(tx repository.Tx, rec repository.OpRec, reason string, b *sp.Body) error {
+	if !g.outboxOn() {
+		return nil
+	}
+	d := map[string]any{"origin": rec.Origin, "stream": rec.Stream, "seq": rec.Seq, "reason": reason}
+	if b != nil {
+		for _, doc := range b.Documents() {
+			if code, _, _, ok := doc.ParseNumber(); ok {
+				d["series_code"], d["number"], d["document_type"] = code, doc.Number, doc.Type
+				break
+			}
+		}
+	}
+	return g.putIDEvent(tx, TypeQuarantine, rec, d)
+}
+
+func (g *Gateway) putIDEvent(tx repository.Tx, typ string, rec repository.OpRec, d map[string]any) error {
+	data, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	env := events.Envelope{ID: g.cfg.IDs.New(), Type: typ, V: 1, Source: "sync", TenantID: ids.ID(tx.Tenant()),
+		Key: rec.Stream + "|" + rec.Origin, KeySeq: rec.Seq, OccurredAt: g.cfg.Now(), Epoch: g.Epoch(), Data: data}
+	if kind, sid, ok := strings.Cut(rec.Stream, ":"); ok && kind == "outlet" {
+		env.OutletID = ids.ID(sid)
 	}
 	return g.putOutbox(tx, env)
 }

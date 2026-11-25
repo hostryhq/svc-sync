@@ -60,9 +60,7 @@ func TestPublishedOpEventsParseWithTheSharedParser(t *testing.T) {
 		}
 		var pii json.RawMessage
 		if raw, ok := gwPII(t, w, rec); ok {
-			if pii, err = sp.StripSalts(json.RawMessage(raw)); err != nil {
-				t.Fatal(err)
-			}
+			pii = json.RawMessage(raw)
 		}
 		env, err := service.BuildOpEvent(ids.New(), w.Tenant, time.Now(), "epoch-1", rec, pii)
 		if err != nil {
@@ -90,8 +88,9 @@ func TestPublishedOpEventsParseWithTheSharedParser(t *testing.T) {
 		n++
 		if op.PII["check"]["c1"]["customer_phone"] == "+910000000000" {
 			sawPII = true
-			if strings.Contains(string(env.Data), "~s:") {
-				t.Fatal("a salt reached the bus")
+			// O2-12: the gateway publishes the verified values with their salts, and the parser verified them.
+			if !strings.Contains(string(env.Data), "~s:customer_phone") || op.PIISalts["check"]["c1"]["customer_phone"] == "" {
+				t.Fatal("the salt must travel with the value on the bus")
 			}
 		}
 		sawVoid = sawVoid || len(op.Voids) == 1

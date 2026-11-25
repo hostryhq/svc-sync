@@ -77,7 +77,10 @@ const (
 	pLeaver  = "m3"
 )
 
-func init() { sp.RegisterDemoIntents() } // stock.move exists only in the simulator
+func init() { // stock.move and the demo entities exist only in the simulator and tests
+	sp.RegisterDemoIntents()
+	engine.RegisterDemoEntities()
+}
 
 var cashierPerms = []string{"order.create", "order.edit", "payment.record", "bill.finalize", "bill.credit_note.create", "demo.stock.move", "kds.bump", "session.open"}
 var managerPerms = append(append([]string{}, cashierPerms...), "menu.manage", "menu.price.edit", "series.activate", "approval.grant")

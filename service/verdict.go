@@ -254,7 +254,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 
 func touchesLWW(muts []sp.Mut) bool {
 	for _, m := range muts {
-		if d, ok := engine.Entities[m.E]; ok && d.Policy == engine.PolLWW {
+		if d, ok := engine.Entities[m.E]; ok && d.HasLWW() {
 			return true
 		}
 	}
@@ -292,6 +292,13 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 		if err := tx.AddAlert(aud, sev, "quarantined:"+v.Reason, fmt.Sprintf("%s/%s/%d", rec.Origin, rec.Stream, rec.Seq)); err != nil {
 			return err
 		}
+		var body *sp.Body
+		if !p.Opaque {
+			body = &p.Body
+		}
+		if err := g.publishQuarantined(tx, rec, v.Reason, body); err != nil {
+			return err
+		}
 	case repository.StFlagged, repository.StAccepted:
 		if hasMark(marks, MarkAttributionUnverified) {
 			if err := g.alert(tx, "owner", "medium", "attribution_unverified", rec); err != nil {
@@ -314,6 +321,11 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 		}
 		if err := g.publish(tx, rec); err != nil {
 			return err
+		}
+		if v.Status == repository.StFlagged {
+			if err := g.publishFlagged(tx, rec, marks); err != nil {
+				return err
+			}
 		}
 	}
 	if v.Void && !p.Opaque {

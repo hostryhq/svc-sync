@@ -1,7 +1,7 @@
 package syncproto
 
-// Personal data beside an op: salted per-field commitments (PROVISIONAL, security ruling of the
-// Phase 1 re-review; the exact wire shape is still to be settled with security-reviewer).
+// Personal data beside an op: salted per-field commitments (security ruling of the Phase 1
+// re-review; wire shape in api-specs sync/protocol-v1.md, Personal data).
 //
 // An op's pii travels outside the hash (ADR-0002 S4) so that erasure never touches the chain. A plain
 // hash of it in the sealed body would let a phone number be guessed back, so the sealed body
@@ -12,8 +12,8 @@ package syncproto
 // salt is 16 random bytes kept with the value, never in the body. JCS is RFC 8785 canonical JSON
 // (strings, booleans and integers only, as everywhere in an op). On the wire the salt of a field
 // travels in the same pii object under the key "~s:<field>" (base64url), so the pii keeps the
-// entity -> row id -> field -> value shape the shared parser reads; the gateway strips salts before
-// it publishes the event. A cloud-signed erasure op (intent sync.pii.erase) removes values and
+// entity -> row id -> field -> value shape the shared parser reads; the gateway keeps them and publishes
+// them in the op event (O2-12), so an owning service can verify the commitments again. A cloud-signed erasure op (intent sync.pii.erase) removes values and
 // salts; the commitments stay in the sealed body, and cannot be reversed or re-opened without them.
 //
 // This file is the ONLY place that knows the construction: CommitPII (recording node) and OpenPII
@@ -107,7 +107,7 @@ type Opened struct {
 	// Verified is the wire pii reduced to the fields that match their commitment (values and
 	// salts), in canonical JSON; empty when nothing verified. This is what a node stores.
 	Verified json.RawMessage
-	// Values are the verified values without salts: what the event publishes.
+	// Values are the verified values without salts, for the owner's use of the data.
 	Values PII
 	// Dropped counts fields that arrived without a matching commitment or with a wrong salt.
 	// Their values are discarded, never stored or published.
@@ -175,27 +175,6 @@ func OpenPII(wire json.RawMessage, c PIICommit) (Opened, error) {
 		o.Values = nil
 	}
 	return o, nil
-}
-
-// StripSalts removes the salts from stored wire pii, for the event (values only).
-func StripSalts(wire json.RawMessage) (json.RawMessage, error) {
-	if len(wire) == 0 {
-		return nil, nil
-	}
-	var in map[string]map[string]map[string]any
-	if err := json.Unmarshal(wire, &in); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrPII, err)
-	}
-	for _, rows := range in {
-		for _, fields := range rows {
-			for name := range fields {
-				if strings.HasPrefix(name, piiSaltPrefix) {
-					delete(fields, name)
-				}
-			}
-		}
-	}
-	return CanonicalJSON(in)
 }
 
 func decodePIIValue(raw json.RawMessage) (any, error) {

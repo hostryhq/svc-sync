@@ -49,11 +49,3 @@ func TestPIICommitmentIsSaltedAndHidesTheValue(t *testing.T) {
 		t.Fatal("the sealed body carries the value")
 	}
 }
-
-func TestStripSaltsLeavesValuesOnly(t *testing.T) {
-	wire, _, _ := CommitPII(PII{"check": {"c1": {"customer_name": "Asha"}}}, nil)
-	out, err := StripSalts(wire)
-	if err != nil || string(out) != `{"check":{"c1":{"customer_name":"Asha"}}}` {
-		t.Fatalf("%s %v", out, err)
-	}
-}

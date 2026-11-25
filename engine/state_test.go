@@ -60,10 +60,10 @@ func TestConflictPolicyPerEntityIsOrderIndependent(t *testing.T) {
 		check func(t *testing.T, s *State)
 	}{
 		{"append: duplicate insert of one id is one row, the lower stamp wins", []op{
-			mk("a", 1, 10, ins("order", "o1", map[string]any{"table": int64(1)})),
-			mk("b", 1, 20, ins("order", "o1", map[string]any{"table": int64(2)}))},
+			mk("a", 1, 10, ins("order", "o1", map[string]any{"token_no": int64(1)})),
+			mk("b", 1, 20, ins("order", "o1", map[string]any{"token_no": int64(2)}))},
 			func(t *testing.T, s *State) {
-				if r, _ := s.Row("order", "o1"); r["table"] != int64(1) {
+				if r, _ := s.Row("order", "o1"); r["token_no"] != int64(1) {
 					t.Fatalf("got %v", r)
 				}
 			}},
