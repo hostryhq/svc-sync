@@ -4,8 +4,8 @@ go 1.27
 
 require (
 	github.com/enbility/zeroconf/v2 v2.0.0-20240920094356-be1cae74fda6
-	github.com/hostryhq/go-auth v0.0.0-20261124222707-cf136d8f9167
-	github.com/hostryhq/go-common v0.0.0-20261124215603-ad5f1e546d2e
+	github.com/hostryhq/go-auth v0.0.0-20261125000521-b19b5407e3f2
+	github.com/hostryhq/go-common v0.0.0-20261125020101-732c3b1fd21a
 	github.com/jackc/pgx/v5 v5.13.0
 	modernc.org/sqlite v1.63.0
 )
