@@ -50,6 +50,35 @@ type Found struct {
 	Outlet string // outlet hash
 }
 
+// maxTextValue bounds a TXT value read from the LAN: the input is untrusted (review L6).
+const maxTextValue = 64
+
+// parseText reads the hub id and outlet hash from the TXT records of an announcement. The records
+// come from any host on the LAN, so values are bounded and restricted to printable ASCII; a value
+// that does not fit is dropped. Discovery finds an address only; trust never rests on these values.
+func parseText(txt []string) (hubID, outlet string) {
+	val := func(t, prefix string) (string, bool) {
+		if len(t) <= len(prefix) || t[:len(prefix)] != prefix || len(t)-len(prefix) > maxTextValue {
+			return "", false
+		}
+		v := t[len(prefix):]
+		for i := 0; i < len(v); i++ {
+			if v[i] < 0x21 || v[i] > 0x7e {
+				return "", false
+			}
+		}
+		return v, true
+	}
+	for _, t := range txt {
+		if v, ok := val(t, "hub="); ok {
+			hubID = v
+		} else if v, ok := val(t, "outlet="); ok {
+			outlet = v
+		}
+	}
+	return hubID, outlet
+}
+
 // Browse looks for hubs for up to timeout and returns those found (the native shell does this on
 // devices; this is the Go side for tests and the hub-to-hub standby case).
 func Browse(ctx context.Context, timeout time.Duration) ([]Found, error) {
@@ -68,14 +97,7 @@ func Browse(ctx context.Context, timeout time.Duration) ([]Found, error) {
 			for _, a := range e.AddrIPv4 {
 				f.Addrs = append(f.Addrs, a.String())
 			}
-			for _, t := range e.Text {
-				switch {
-				case len(t) > 4 && t[:4] == "hub=":
-					f.HubID = t[4:]
-				case len(t) > 7 && t[:7] == "outlet=":
-					f.Outlet = t[7:]
-				}
-			}
+			f.HubID, f.Outlet = parseText(e.Text)
 			out = append(out, f)
 		}
 	}()
