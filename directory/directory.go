@@ -5,6 +5,7 @@
 package directory
 
 import (
+	"context"
 	"time"
 
 	sp "github.com/hostryhq/svc-sync/syncproto"
@@ -62,4 +63,12 @@ type Directory interface {
 	CheckProof(tenant, device, actor, sid, proof string, configClass bool) ProofResult
 	RecoveryFor(tenant, old string) (RecoveryRec, bool)
 	Now() time.Time
+}
+
+// DrainRecorder is implemented by a directory that tells identity a revoked device is drained: every op it
+// held is stored, so identity may start the wipe delay (identity's recordDeviceDrained). through is the
+// highest stored sequence per stream of the device's own ops. A directory that does not implement it is
+// simply not told; the gateway never depends on the answer to store ops.
+type DrainRecorder interface {
+	RecordDrained(ctx context.Context, tenant, device string, through map[string]int64) error
 }

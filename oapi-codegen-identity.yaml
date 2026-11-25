@@ -1,0 +1,13 @@
+# Client for the internal routes of the identity contract that the sync gateway calls (x-service-callers: sync).
+# Regenerate: make gen-identity (needs api-specs bundled: run `make bundle` in api-specs first).
+package: identity
+output: identityclient/gen/identity.gen.go
+generate:
+  models: true
+  client: true
+output-options:
+  include-operation-ids:
+    - listRevocations
+    - recordDeviceDrained
+    - verifyProof
+    - checkPackHistory

@@ -1,7 +1,7 @@
 # Phase 2 notes (svc-sync on feat/phase2-sync)
 
-Contract: api-specs `feat/phase2-specs` @ 1462fb8; go-common `feat/phase2-libs` @ c6c0fc7; go-auth @ 7551373 (local `go.work`).
-Everything marked PROVISIONAL waits for a ruling and is isolated as stated.
+Contract: api-specs `feat/phase2-specs` @ b153c62; go-common `feat/phase2-libs` @ 92884d6 and go-auth `feat/phase2-auth` @ 94f1970 (pinned by pseudo-version in `go.mod`;
+`GOWORK=off go build ./...` works); svc-identity `feat/phase2-identity` @ ebebd4c (`identityreal/go.mod`).
 
 ## Built
 1. **Contract from api-specs.** `contract/specs` reads the checkout; no copy of the OpenAPI or the vectors is kept. Admin answers have the
@@ -18,33 +18,43 @@ Everything marked PROVISIONAL waits for a ruling and is isolated as stated.
    reads `doc` plus the `doc_number` field of every inserted `bill` / `credit_note` row; an op never takes a series twice (held as malformed).
    `series.close` is stored and the tail confirmed when the register holds every number up to the stated one; a missing number raises one owner
    alert. `rank` and `set` follow the entity policy in the engine's state; see the open item on the per-field engine.
-5. **Personal data (PROVISIONAL).** Salted per-field commitments in the sealed body (`pii_c`), verified on ingest by every node; unverifiable fields
+5. **Personal data (settled in api-specs, O2-12).** Salted per-field commitments in the sealed body (`pii_c`), verified on ingest by every node; unverifiable fields
    are dropped and the op is marked `pii_dropped`. Cloud-signed erasure op `sync.pii.erase`; values and salts removed at the gateway, devices and hubs;
-   acknowledgement in the next direct cloud hello (`pii_erased`). All of it behind `syncproto/piic.go` (`CommitPII`, `OpenPII`, `StripSalts`).
+   acknowledgement in the next direct cloud hello (`pii_erased`). The op event carries the verified values WITH their `~s:<field>` salts (the owner verifies again). All of it behind `syncproto/piic.go` (`CommitPII`, `OpenPII`).
 6. **Security conditions.** Vendor confirmation is bound to the hash of the held op, tells the owner (alert) and is in the tenant-visible audit
    log; release and discard: no self-decision, approval needed for a money or bill-number hold from a binding under caution, owner alert on every
    decision. The identity stub answers `locked` for every op kind like real identity (a sale on a locked pair is kept and its actor is flagged
    unverified; invalid proofs still count until the lock; the counter stays capped). One contract test (`directory/dirtest`) is to run against the
    stub (done) and the real identity client (not wired yet).
 
+7. **Entity registry in the engine.** `engine/entities_gen.go` is generated from api-specs `entities/` (`cmd/genintents`, checked by
+   `TestEntityTableIsGenerated`): per-field policies (immutable, lww with groups that win together, lww_review, delta, rank), tombstone and
+   guarded flags. Unknown fields of a registry entity are ignored, and a kind only touches the fields its policy allows (as `go-common/sync`).
+   The demo entities (stock_level, kds_item, menu_item, audit, session, approval, sync_void) exist only in a simulator or test process
+   (`engine.RegisterDemoEntities`). `service/admin.go` reads `Guarded` from the registry.
+8. **Events.** `sync.quarantine.recorded` (reason, and series code / number / document type of the first number the op carries),
+   `sync.op.flagged` (coarse code from the verdict's marks) and `sync.pii.erased` go through the outbox in the storing transaction.
+   `TestHoldFlagAndEraseEventsOnPostgres`. `billing.series.reconciled` is billing's (O2-10), not published here.
+9. **Identity client.** `identityclient` (generated from the identity contract, `oapi-codegen-identity.yaml`) with service tokens that name the tenant,
+   a timeout per attempt and one retry on the same Idempotency-Key. `identityclient.Directory` implements `directory.Directory`: proof check,
+   revocation feed, pack history, drain. `identityreal/` (own module) runs `directory/dirtest` against the real identity service layers, in memory
+   and over Postgres: real and stub answer `locked` alike for every op kind.
+
 ## Open items
-1. **Emit token tenant.** The contract text says a service token carries no tenant; the security condition needs one. The gateway refuses a token
-   without a tenant. `go-common/emit` `TokenSource` takes no tenant, so callers must mint a per-tenant token. Needs the contract text and the client changed.
-2. **ADR needed: publisher of `billing.series.reconciled`.** The event's `x-publisher` is billing and bus permissions are generated from it, so a relay
-   from this service would be refused. The gateway can publish it (`Config.ReconciledEvent`, off by default); billing reconciles from
-   `identity.device.drained` itself. Decide who publishes.
-3. **PII shape.** `client-core` sends `pii` with no commitment, so the gateway drops it until the TypeScript engine implements `CommitPII`. The salt key
-   `~s:<field>` and the `pii_erased` hello field, the `sync.pii.erase` intent and the `pii_erase` / `series_close` records need entries in api-specs
-   and in `go-common/sync` (the parser reads `series_close` and `pii_erase` as unknown entities and ignores them).
-4. **Contract deviations kept on purpose.** `listQuarantine` is read with `sync.quarantine.read` (support-viewable) where the contract says
-   `sync.quarantine.manage`; `POST /sync/v1/quarantine/confirm` is not in the contract; decisions require a `reason` (the contract's body is a Ref);
-   lists carry no `received_at` / `detected_at` (not stored). New catalogue keys to list in permissions.yaml: `sync.quarantine.read`
-   (`support_viewable`), `sync.quarantine.confirm` (`support_actable`).
-5. **Stream ownership.** The directory has no "outlet/brand belongs to tenant" call; the stub implements `StreamInTenant`, and without it only tenant
+1. **ADR needed: how the gateway asks identity about a proof.** `verifyProof` needs `pin_v`, an integer `pack_v` and `opened_at`; the op body has `sid`,
+   a text `pack_v` and `proof` only. The op wire (and client-core) must carry the missing fields, or identity must derive them.
+2. **ADR needed: directory questions identity cannot answer.** No internal route gives sync a device's credential (public key, kind, outlet, brand),
+   the permissions a pack granted (`PackFor`, `StillHolds`), key-loss recovery records, the revocation reason (`key_lost`), or series ownership
+   (tenancy). `identityclient.Directory.Gaps()` lists them; they answer "not found", and `cmd/gateway` with `SYNC_DIRECTORY=identity` validates the
+   client and refuses to start. Needs new internal routes in identity/tenancy, or a decision that the gateway holds device credentials itself.
+3. **Drain criterion.** `Gateway.ReportDrained` sends identity the stored sequences of a revoked device, but nothing calls it: an early report wipes
+   a device that still holds ops, and an ordinary drain has no attestation. Decide who declares a revoked device drained.
+4. **Stream ownership.** The directory has no "outlet/brand belongs to tenant" call; the stub implements `StreamInTenant`, and without it only tenant
    streams are accepted by emit. Tenancy's client must provide it.
-6. **Entity policies in the engine.** The engine's apply state still uses the demo entity table (append, lww, delta, rank); the per-field policies of
-   the real entity registry (`mixed`) are applied by `go-common/sync` in the services. Moving the engine to the registry is not done.
-7. **Not published:** `sync.quarantine.recorded`, `sync.op.flagged`, `sync.pii.erased` is published on erasure only. Row ids of an emit are not
-   checked for UUIDv5 derivation. Erasure acknowledgements from a device behind a hub arrive at its next direct cloud hello (no relay).
-8. **go.mod** still pins go-common and go-auth by older pseudo-versions; the build uses `go.work` (c6c0fc7, 7551373). Pin them when the branches merge.
-9. Simulator: `menu.price.set` is a `pos` (and `personal`) intent in the registry, so waiters no longer record it.
+5. **Op flags afterwards.** `sync.op.flagged` is published at acceptance and at release; no flag is added to a stored op later today.
+   `sync.quarantine.recorded` names only the first number of a multi-number op (bill.rebill); the contract has one `number` field.
+6. **Not done.** Row ids of an emit are not checked for UUIDv5 derivation. Erasure acknowledgements from a device behind a hub arrive at its next direct
+   cloud hello (no relay). The device-token verifier (JWKS), op-signing key and platform epoch of `cmd/gateway` are dev-only.
+7. **A2.8 wire fields** (`unbound`, `chain_conflicts`, `unbound_h`, `stale_seals`, `seal_refresh`, refusal `chain_conflict`) are listed in
+   `contract/README.md` for the spec owner.
+8. Simulator: `menu.price.set` is a `pos` (and `personal`) intent in the registry, so waiters no longer record it.

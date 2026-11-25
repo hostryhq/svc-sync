@@ -3,26 +3,33 @@
 //	SYNC_DB_DSN    postgres:// DSN (or a SQLite path for local runs)
 //	SYNC_ADDR      listen address (default :8081)
 //	SYNC_DEV_STUB  "1" runs with the identity stub and a test token issuer (local development only)
+//	SYNC_DIRECTORY "stub" (default; needs SYNC_DEV_STUB=1) or "identity" (SYNC_IDENTITY_URL, SYNC_SERVICE_SIGNING_KEY_FILE)
 //
-// The production directory (device credentials, series registry, packs, proof check) comes from
-// generated clients of svc-identity and svc-tenancy, which Phase 1b delivers; until they are wired
-// the gateway refuses to start without SYNC_DEV_STUB so that no stub can run by accident.
+// The production directory comes from generated clients of svc-identity and svc-tenancy. The identity client
+// (identityclient) answers the proof check, revocation, pack history and drain; it does not yet answer device
+// credentials, packs, recovery records or series, because identity's contract has no internal route for them
+// (identityclient.Directory.Gaps). "identity" therefore builds and validates the client, reports the gaps and
+// refuses to start: a gateway that cannot look up a device credential would refuse every device. The stub only
+// runs with SYNC_DEV_STUB so that it can never run by accident.
 // There is no deployment in Phase 1 (ADR-0001 AM12); cmd/devstack is the runnable stack for tests.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/hostryhq/go-auth/authtest"
 	"github.com/hostryhq/go-common/clock"
 	"github.com/hostryhq/svc-sync/api"
 	"github.com/hostryhq/svc-sync/devepoch"
+	"github.com/hostryhq/svc-sync/identityclient"
 	"github.com/hostryhq/svc-sync/identitystub"
 	"github.com/hostryhq/svc-sync/repository"
 	"github.com/hostryhq/svc-sync/service"
@@ -41,8 +48,15 @@ func run(log *slog.Logger) error {
 	if dsn == "" {
 		return errors.New("SYNC_DB_DSN is required")
 	}
+	if os.Getenv("SYNC_DIRECTORY") == "identity" {
+		d, err := identityclient.FromEnv(os.Getenv)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("identity directory configured, but the gateway cannot run on it yet: identity has no internal route for %s (open question in docs/phase2-notes.md); the device-token verifier, op-signing key and platform epoch are not wired either", strings.Join(d.Gaps(), ", "))
+	}
 	if os.Getenv("SYNC_DEV_STUB") != "1" {
-		return errors.New("the identity and tenancy directory clients are not wired yet (Phase 1b); set SYNC_DEV_STUB=1 for local development")
+		return errors.New("set SYNC_DIRECTORY=identity (not runnable yet) or SYNC_DEV_STUB=1 for local development")
 	}
 	addr := os.Getenv("SYNC_ADDR")
 	if addr == "" {

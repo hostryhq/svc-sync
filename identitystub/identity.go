@@ -6,6 +6,7 @@
 package identitystub
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -79,6 +80,7 @@ type Identity struct {
 	fail     map[pairKey]*failures
 	recs     map[string]*RecoveryRec
 	down     bool
+	drained  map[string]map[string]int64
 	seq      int
 }
 
@@ -152,6 +154,29 @@ func (i *Identity) Revoke(device, reason string) {
 	if d, ok := i.devices[device]; ok {
 		d.Revoked, d.Reason = true, reason
 	}
+}
+
+// RecordDrained implements directory.DrainRecorder: the stub remembers the last report per device.
+func (i *Identity) RecordDrained(_ context.Context, tenant, device string, through map[string]int64) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	d, ok := i.devices[device]
+	if !ok || d.Env.Cred.TenantID != tenant || !d.Revoked {
+		return errors.New("identitystub: only a revoked device of the tenant can be drained")
+	}
+	if i.drained == nil {
+		i.drained = map[string]map[string]int64{}
+	}
+	i.drained[device] = through
+	return nil
+}
+
+// Drained returns what RecordDrained last stored for a device.
+func (i *Identity) Drained(device string) (map[string]int64, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	m, ok := i.drained[device]
+	return m, ok
 }
 
 // Revoked reports revocation and its reason.
