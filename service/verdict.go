@@ -446,6 +446,12 @@ func touchesLWW(muts []sp.Mut) bool {
 // activation record and the void a refused configuration op needs.
 func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRec, p *engine.Parsed, v engine.Verdict) error {
 	marks := v.Marks
+	if hasMark(marks, MarkPIIDropped) {
+		// A value that does not match its commitment was stripped or altered in transit (P2-L2): told per origin, to the vendor.
+		if err := g.alert(tx, "vendor", "medium", "pii_commitment_mismatch", rec); err != nil {
+			return err
+		}
+	}
 	if !p.Opaque && len(p.Body.Documents()) > 0 {
 		if err := g.register(tx, rec, p.Body, v); err != nil {
 			return err
@@ -579,7 +585,8 @@ func (g *Gateway) onFork(tx repository.Tx, c engine.Caller, rec repository.OpRec
 	}
 	if rec.Status == repository.StQuarantined && rec.Reason != ReasonFork {
 		rec.Reason = ReasonFork
-		rec.Marks = strings.Trim(rec.Marks+","+MarkFork, ",")
+		// A support confirmation was of the earlier cause and of that content (P2-L1): the fork needs its own.
+		rec.Marks = strings.Trim(strings.Join(dropMarks(splitMarks(rec.Marks), MarkVendorConfirmed), ",")+","+MarkFork, ",")
 		if err := tx.UpdateOp(rec); err != nil {
 			return err
 		}

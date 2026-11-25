@@ -117,8 +117,11 @@ func (g *Gateway) openPin(tx repository.Tx, p *engine.Parsed) directory.ProofRes
 		res = g.cfg.Dir.VerifyProof(tx.Tenant(), directory.ProofQuestion{Kind: directory.ProofKindSession, Device: origin, Member: b.Actor,
 			SID: b.SID, PackV: b.PackV, PinV: b.PinV, OpenedAt: at, Proof: b.Proof, Key: proofKey(origin, p.Item.Stream, p.Item.Seq)})
 	}
-	_ = tx.PutSessionRow(repository.SessionRow{Origin: origin, SID: b.SID, Type: sp.SessionPin, Actor: b.Actor, PackV: b.PackV, PinV: b.PinV,
-		OpenedAt: b.At, Verdict: verdictOf(res)})
+	// A verdict that cannot be stored is not trusted (P2-L7): the op is pending and identity is asked again.
+	if err := tx.PutSessionRow(repository.SessionRow{Origin: origin, SID: b.SID, Type: sp.SessionPin, Actor: b.Actor, PackV: b.PackV, PinV: b.PinV,
+		OpenedAt: b.At, Verdict: verdictOf(res)}); err != nil {
+		return directory.ProofUnavailable
+	}
 	return res
 }
 
@@ -135,8 +138,10 @@ func (g *Gateway) openStrong(tx repository.Tx, p *engine.Parsed) directory.Proof
 	case lk == directory.Found, lk == directory.NotFound:
 		res = directory.ProofInvalid
 	}
-	_ = tx.PutSessionRow(repository.SessionRow{Origin: origin, SID: b.SID, Type: sp.SessionStrong, Actor: b.Actor, PackV: b.PackV,
-		OpenedAt: b.At, Verdict: verdictOf(res)})
+	if err := tx.PutSessionRow(repository.SessionRow{Origin: origin, SID: b.SID, Type: sp.SessionStrong, Actor: b.Actor, PackV: b.PackV,
+		OpenedAt: b.At, Verdict: verdictOf(res)}); err != nil {
+		return directory.ProofUnavailable
+	}
 	return res
 }
 
@@ -172,9 +177,13 @@ func (g *Gateway) approvalProof(tx repository.Tx, p *engine.Parsed) directory.Pr
 			ApprovalID: rec.ID, Permission: str("permission"), Target: str("target"), Requester: str("requester"), Reason: str("reason"),
 			ActionHash: str("action_hash"), ApprovedAt: at})
 	}
-	_ = tx.PutApprovalVerdict(origin, rec.ID, verdictOf(res))
-	_ = tx.PutApprovalRecord(repository.ApprovalRow{Origin: origin, ID: rec.ID, Kind: b.Intent, SID: b.SID, Intent: str("intent"), Permission: str("permission"),
-		Target: str("target"), ActionHash: str("action_hash"), Requester: str("requester"), Approver: approver, Reason: str("reason"), ApprovedAt: b.At})
+	if err := tx.PutApprovalVerdict(origin, rec.ID, verdictOf(res)); err != nil {
+		return directory.ProofUnavailable
+	}
+	if err := tx.PutApprovalRecord(repository.ApprovalRow{Origin: origin, ID: rec.ID, Kind: b.Intent, SID: b.SID, Intent: str("intent"), Permission: str("permission"),
+		Target: str("target"), ActionHash: str("action_hash"), Requester: str("requester"), Approver: approver, Reason: str("reason"), ApprovedAt: b.At}); err != nil {
+		return directory.ProofUnavailable
+	}
 	return res
 }
 
