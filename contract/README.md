@@ -11,7 +11,7 @@ svc-sync keeps no copy of the contract. It reads the **api-specs** repository (A
 | Entity registry (owners, policies, `doc_number`, `replicated_to`) | `entities/` |
 | Bus events | `events/sync/*` |
 
-Pinned version: branch `feat/phase2-specs` at `14c76fd` (round 5: ADR-0014 A3; before it `6e63014`, round 4b, ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
+Pinned version: branch `feat/phase2-specs` at `1c94c67` (round 5: ADR-0014 A3, `14c76fd` plus the fix that intent binds name only fields the citing op records; before it `6e63014`, round 4b, ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
 `feat/phase2-libs` @ `92884d6`, go-auth `feat/phase2-auth` @ `94f1970`); svc-identity `feat/phase2-identity` @ `2ba5adc` and svc-tenancy
 `feat/phase2-tenancy` @ `3792f07` in `identityreal/go.mod`. The checkout is found through `API_SPECS_DIR`, or as a sibling directory
 `../api-specs-p2`, then `../api-specs` (`contract/specs`). Tests fail, not skip, without it.
@@ -70,7 +70,7 @@ Implemented here and in `client-core-sync`; `protocol-v1.md` still says "no sett
   name them yet.
 - `cmd/gateway` series events: `tenancy.series.issued` and `.closed` do not list `sync` as subscriber, so a series is seen within the 60-second cache time.
 
-## ADR-0014 A3 on this side (round 5, `14c76fd`)
+## ADR-0014 A3 on this side (round 5, `1c94c67`)
 - **Vectors.** `syncproto/a3_vectors_test.go` runs `pii_placement` (`ServesPII`), `digest_row` (`RowText`), `action_hash` (`ActionHash`,
   including the OV2 mismatch case) and `approval_proof` (`SessionProofMessage`, `ApprovalProofMessage`, `ProofMAC`) from the checkout.
 - **A3.1 placement.** `engine.Serve` and `Gateway.Snapshot`/`Hub.Snapshot` give `pii` (values with their salts) to a puller of kind `pos`,
@@ -85,5 +85,5 @@ Implemented here and in `client-core-sync`; `protocol-v1.md` still says "no sett
   contract: intent `approval.self_confirm`; `Exception.reason` (`approval_flag`). Marks: `approval_flag` + `approval_reason:<reason>`,
   `approval_pending`, `approved_by:<member>`. An approval cited from another origin is not found and stays `pending` (it is keyed by origin).
 - **Device sessions.** `deviceSessionExpired`: 26 hours, no PIN-session limit; the opening time is kept by `PutSession`.
-- **A3.4.** A credential answer without `brand_id` is a fault (`identityclient`, `realdir`); stream binding uses the credential only.
+- **A3.4.** Stream binding uses the credential's `brand_id` only (no tenancy lookup per op; a device with none is bound to no brand stream); identity answers 503 until it has one.
   Dev routes: `brand_id` is required at registration and answered with `kid` (also in `device`), the hub pack carries `kid`.

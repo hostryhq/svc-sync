@@ -60,11 +60,9 @@ func (c *Client) GetDeviceCredential(ctx context.Context, tenant, device string)
 		return DeviceCredential{}, orUnavailable(err)
 	}
 	d := out.JSON200
-	cr := DeviceCredential{DeviceID: d.DeviceId, TenantID: d.TenantId, OutletID: d.OutletId, Kind: string(d.Kind), Kid: d.Kid, Pub: d.Pub}
-	cr.BrandID = string(d.BrandId)
-	if cr.BrandID == "" {
-		return DeviceCredential{}, ErrUnavailable // a credential without brand_id is never usable: a device's stream binding rests on it (ADR-0014 A3.4)
-	}
+	// Identity signs brand_id at activation and never answers without it (503 until filled, ADR-0014 A3.4); an older identity may
+	// still answer none, and a device with no brand is then bound to no brand stream (streamAllowed), never to a guessed one.
+	cr := DeviceCredential{DeviceID: d.DeviceId, TenantID: d.TenantId, OutletID: d.OutletId, BrandID: string(d.BrandId), Kind: string(d.Kind), Kid: d.Kid, Pub: d.Pub}
 	if d.Recovers != nil {
 		cr.Recovers = *d.Recovers
 	}

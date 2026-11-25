@@ -1,6 +1,6 @@
 # Phase 2 notes (svc-sync on feat/phase2-sync)
 
-Contract: api-specs `feat/phase2-specs` @ 14c76fd (was b153c62); go-common `feat/phase2-libs` @ 92884d6 and go-auth `feat/phase2-auth` @ 94f1970 (pinned by pseudo-version in `go.mod`;
+Contract: api-specs `feat/phase2-specs` @ 1c94c67 (was b153c62); go-common `feat/phase2-libs` @ 92884d6 and go-auth `feat/phase2-auth` @ 94f1970 (pinned by pseudo-version in `go.mod`;
 `GOWORK=off go build ./...` works); svc-identity `feat/phase2-identity` @ ebebd4c (`identityreal/go.mod`).
 
 ## Built
@@ -75,7 +75,7 @@ Contract api-specs `6e63014`, svc-identity `2ba5adc`, svc-tenancy `3792f07`. Ite
    `contract/README.md` for the spec owner.
 8. Simulator: `menu.price.set` is a `pos` (and `personal`) intent in the registry, so waiters no longer record it.
 
-## ADR-0014 Amendment A3 (feat/phase2-sync, contract api-specs `14c76fd`)
+## ADR-0014 Amendment A3 (feat/phase2-sync, contract api-specs `1c94c67`, which is `14c76fd` plus a binds fix in orders.yaml)
 Built: A3.1/A3.2 (pii by credential kind, commitments in every hash, refetch of `pii_incomplete`, erasure unchanged), A3.3 (approval citation with
 `approval_flag` reasons, `pending`, single citer, `approval.self_confirm`), device-session lifetime (26 hours), A3.4 (credential without `brand_id`
 is a fault; dev routes and hub pack carry `kid` and `brand_id`). Tests: vectors (`syncproto/a3_vectors_test.go`), PA1 to PA5
