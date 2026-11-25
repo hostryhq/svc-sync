@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs to save Actions minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    uses: hostryhq/.github/.github/workflows/go-ci.yml@main
+
+  # Deterministic simulator (ADR-0002 S15) over a short fixed seed range; a failure is reproducible
+  # by its seed. Longer soaks belong in the nightly run, not on pull requests.
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Simulator, seeds 1..20 (SQLite gateway store)
+        run: go run ./cmd/simulate -from 1 -runs 20
+
+  # Postgres store and row-level-security tests (integration/pg_test.go skips without SYNC_PG_DSN).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          # Throwaway credential for a container that exists only for this job; not a secret.
+          POSTGRES_PASSWORD: ci-throwaway
+          POSTGRES_USER: hostry
+          POSTGRES_DB: hostry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hostry -d hostry"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      SYNC_PG_DSN: postgres://hostry:ci-throwaway@127.0.0.1:5432/hostry?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Postgres integration tests (fail if they were skipped)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./integration/... | tee "$RUNNER_TEMP/it.log"
+          if grep -q -e '--- SKIP' "$RUNNER_TEMP/it.log"; then echo "integration tests were skipped" >&2; exit 1; fi
+
+  secrets-scan:
+    uses: hostryhq/.github/.github/workflows/gitleaks.yml@main
+
+  # Single status check for the ruleset: "ci / required".
+  required:
+    if: always()
+    needs: [go, simulate, integration, secrets-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: All required jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done

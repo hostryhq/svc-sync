@@ -1,0 +1,396 @@
+openapi: 3.1.0
+info:
+  title: Hostry Sync Protocol v1 (gateway and hub)
+  version: 1.0.0-poc
+  description: |
+    Wire format of ADR-0002 Sync Protocol v1 with Amendment A1 applied provisionally (Proposed).
+    One API, spoken by the cloud sync gateway and by the LAN hub; the hub does not offer
+    /quarantine-upload (it answers 404). Owned by svc-sync during the Phase 1 proof of concept;
+    it should move to api-specs/openapi/sync together with api-specs/sync/{entities,intents,conformance}.
+    Paths sit under /sync/v1, an exception to the /v1 rule (ADR-0002 S10). Rules that JSON Schema
+    cannot express are in contract/README.md and are normative.
+servers:
+  - url: https://sync.example.invalid
+    description: placeholder; no deployment exists (ADR-0001 AM12)
+security:
+  - deviceBearer: []
+paths:
+  /sync/v1/hello:
+    post:
+      operationId: helloSync
+      x-permission: sync.push
+      tags: [sync]
+      summary: Handshake; returns upstream time, epoch and the upstream's vector.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/HelloRequest'}}}}
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/HelloResponse'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+  /sync/v1/push:
+    post:
+      operationId: pushOps
+      x-permission: sync.push
+      tags: [sync]
+      summary: Deliver ops in per-origin sequence order, each (origin, stream) group ending at a sealed op.
+      description: |
+        Idempotent: a replay returns the same vector and holds. Idempotency-Key is accepted and
+        ignored because the vector makes every request safe to repeat. Content-Encoding gzip is allowed.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PushRequest'}}}}
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/PushResponse'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+  /sync/v1/pull:
+    post:
+      operationId: pullOps
+      x-permission: sync.push
+      tags: [sync]
+      summary: Slots above the caller's vector, up to a seal boundary; held slots as placeholders.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PullRequest'}}}}
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/PullResponse'}}}}
+        '401': {$ref: '#/components/responses/Problem'}
+  /sync/v1/snapshot:
+    get:
+      operationId: getSnapshot
+      x-permission: sync.push
+      tags: [sync]
+      summary: Materialised rows, void set and vector, for bootstrap (simplest form; see README).
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/Snapshot'}}}}
+  /sync/v1/poke:
+    get:
+      operationId: pokeWait
+      x-permission: sync.push
+      tags: [sync]
+      summary: Long poll that carries no data; returns a counter that moves when the node has new ops.
+      description: PoC uses a long poll instead of a WebSocket (no dependency); the device then pulls.
+      parameters:
+        - {name: after, in: query, schema: {type: integer, format: int64}, description: Last counter seen.}
+        - {name: wait, in: query, schema: {type: integer, minimum: 0, maximum: 59}, description: Seconds to wait (default 25).}
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {type: object, required: [n], properties: {n: {type: integer, format: int64, description: Counter.}}}}}}
+  /sync/v1/quarantine-upload:
+    post:
+      operationId: uploadQuarantine
+      x-permission: sync.drain
+      tags: [sync]
+      summary: Cloud only. The single endpoint a drain token may call (ADR-0005 4, A1.3).
+      description: |
+        Drain token of a revoked device: its own-origin ops only. Recovery drain token (subject
+        `recovers:<old device id>`, held by the new device): the old origin's unconfirmed ops with stored
+        seals and one attestation per stream. Everything uploaded is stored in quarantine without judging
+        its content. Any other token, endpoint or origin: 401/403, nothing stored.
+      security: [{drainBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/PushRequest'}}}}
+      responses:
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/PushResponse'}}}}
+        '403': {$ref: '#/components/responses/Problem'}
+  /sync/v1/quarantine:
+    get:
+      operationId: listSyncQuarantine
+      x-permission: sync.quarantine.read
+      tags: [admin]
+      summary: Cloud only, member token. The held list with reasons (never sent to devices).
+      security: [{memberBearer: []}]
+      responses: {'200': {description: ok}}
+  /sync/v1/quarantine/release:
+    post:
+      operationId: releaseSyncQuarantine
+      x-permission: sync.quarantine.manage
+      tags: [admin]
+      summary: Release a held slot into normal processing; chain-broken, foreign-series and fork need the vendor confirmation first; an unsealed tail needs device.recover. Outlet-scoped, audited.
+      security: [{memberBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
+      responses: {'200': {description: ok}, '409': {$ref: '#/components/responses/Problem'}}
+  /sync/v1/quarantine/discard:
+    post:
+      operationId: discardSyncQuarantine
+      x-permission: sync.quarantine.manage
+      tags: [admin]
+      summary: Discard a held slot that carries no legal number (carried out as a void). Outlet-scoped, audited.
+      security: [{memberBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
+      responses: {'200': {description: ok}, '409': {$ref: '#/components/responses/Problem'}}
+  /sync/v1/quarantine/confirm:
+    post:
+      operationId: confirmSyncQuarantine
+      x-permission: sync.quarantine.confirm
+      tags: [admin]
+      summary: Hostry support confirms the cause of a chain-broken, foreign-series or fork hold (support token in act mode with the admin service token). Releases nothing; the owner's manager releases afterwards.
+      security: [{memberBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
+      responses: {'200': {description: ok}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}
+  /sync/v1/exceptions:
+    get:
+      operationId: listSyncExceptions
+      x-permission: sync.exceptions.read
+      tags: [admin]
+      summary: Flagged ops with their marks. The only place flags and attribution labels are readable; never reachable with a device token (A1.2 item 2).
+      security: [{memberBearer: []}]
+      responses: {'200': {description: ok}}
+  /sync/v1/series-register:
+    get:
+      operationId: getSyncSeriesRegister
+      x-permission: sync.register.read
+      tags: [admin]
+      summary: Every legal number seen, with gaps, foreign claims and unknown series.
+      security: [{memberBearer: []}]
+      responses: {'200': {description: ok}}
+  /sync/v1/alerts:
+    get:
+      operationId: listSyncAlerts
+      x-permission: sync.exceptions.read
+      tags: [admin]
+      summary: Owner and vendor alerts raised by verdicts.
+      security: [{memberBearer: []}]
+      responses: {'200': {description: ok}}
+components:
+  securitySchemes:
+    deviceBearer: {type: http, scheme: bearer, description: "Cloud: go-auth device token (typ device). LAN: no bearer; the Hostry-Device-Assertion header (see README)."}
+    drainBearer: {type: http, scheme: bearer, description: go-auth drain token}
+    memberBearer: {type: http, scheme: bearer, description: go-auth user or support token}
+  responses:
+    Problem:
+      description: RFC 9457 problem
+      content: {application/problem+json: {schema: {type: object, required: [type, title, status, code], properties: {type: {type: string, description: Problem type URI.}, title: {type: string, description: Title.}, status: {type: integer, description: HTTP status.}, code: {type: string, description: Stable machine code.}, detail: {type: string, description: Safe detail.}}}}}
+  schemas:
+    Vector:
+      type: object
+      description: Highest contiguous seq per `origin/stream` key (origin id, a slash, the stream id).
+      additionalProperties: {type: integer, format: int64}
+      examples: [{"dev-a/outlet:o1": 12, "cloud-genesis/brand:b1": 3}]
+    Ref:
+      type: object
+      required: [origin, stream, seq]
+      properties:
+        origin: {type: string, description: Origin node id (device id or cloud-<epoch>).}
+        stream: {type: string, description: "Stream id: outlet:<id>, brand:<id> or tenant:<id>."}
+        seq: {type: integer, format: int64, description: Gapless per origin per stream, from 1.}
+    Item:
+      type: object
+      description: One op, or one placeholder when `body` is absent.
+      required: [origin, stream, seq, h]
+      properties:
+        origin: {type: string, description: Origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence number.}
+        h: {type: string, description: Lowercase hex SHA-256 of the UTF-8 bytes of `body`.}
+        body: {type: string, description: "Canonical JSON text (RFC 8785, integers only) of the op body, as a JSON string. Forwarded byte for byte; hashed as received. Absent on a placeholder."}
+        pii: {type: object, description: Personal data beside the op, outside the hash and erasable at the cloud, additionalProperties: true}
+    OpBody:
+      type: object
+      description: The parsed form of Item.body (S4). Unknown fields are ignored.
+      required: [v, origin, stream, seq, ph, hlc, clk, tenant_id, intent, intent_v, at, muts]
+      properties:
+        v: {type: integer, description: Envelope version, 1.}
+        origin: {type: string, description: Origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, description: Sequence.}
+        ph: {type: string, description: "Hex hash of this origin's previous op in this stream; the first op chains to sha256(\"hostry-genesis-v1\\n\" + origin + \"\\n\" + stream)."}
+        hlc: {type: string, description: 16 lowercase hex characters, 48-bit ms and 16-bit counter.}
+        clk: {type: string, enum: [sync, manual], description: Clock source.}
+        tenant_id: {type: string, description: Echo of the tenant from the credential.}
+        actor: {type: string, description: Member id.}
+        sid: {type: string, description: Session id.}
+        pack_v: {type: string, description: Offline pack version.}
+        approval: {type: string, description: Approval id.}
+        proof: {type: string, description: Opaque PIN-derived proof; only the cloud checks it.}
+        intent: {type: string, description: Intent name from the registry.}
+        intent_v: {type: integer, description: Intent version.}
+        at: {type: string, description: "RFC 3339 UTC with milliseconds, e.g. 2026-11-24T13:05:11.120Z."}
+        doc:
+          type: object
+          description: Legal document number allocated by this op (S7).
+          required: [type, number]
+          properties:
+            type: {type: string, enum: [tax_invoice, bill_of_supply, plain_bill, credit_note], description: Document type.}
+            number: {type: string, maxLength: 16, description: "<code>/<FY>/<running>, e.g. AAA/2627/000123."}
+        muts:
+          type: array
+          description: Atomic generic mutations.
+          items: {$ref: '#/components/schemas/Mut'}
+    Mut:
+      type: object
+      required: [e, id, k]
+      properties:
+        e: {type: string, description: Entity name.}
+        id: {type: string, description: Row id.}
+        k: {type: string, enum: [insert, set, delta, rank, del, undel], description: Mutation kind.}
+        f: {type: object, description: "Field values: strings, booleans or integers within +-(2^53-1). No fractions or exponents.", additionalProperties: true}
+        prev: {type: object, description: Stamp (hlc hex) of the winning candidate the writer saw per review field, additionalProperties: {type: string}}
+      examples:
+        - {e: sync_void, id: "outlet:o1|dev-a|7", k: insert, f: {origin: dev-a, stream: "outlet:o1", seq: 7, reason: refused}}
+    Seal:
+      type: object
+      description: Signature over the hash of an op at `seq`; covers the whole chain up to it. Made by the origin (a device key) or, for a `cloud-<epoch>` origin only, by the gateway op-signing key. An op-signing key never seals a device origin; the released tail of a key-lost origin is covered by an Endorsement.
+      required: [origin, stream, seq, h, kid, sig]
+      properties:
+        origin: {type: string, description: Origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence.}
+        h: {type: string, description: Hash of the op at seq.}
+        kid: {type: string, description: Key id.}
+        sig: {type: string, description: "ES256 raw r||s, base64url, over sha256(\"hostry-seal-v1\\n\" + origin + \"\\n\" + stream + \"\\n\" + seq + \"\\n\" + h)."}
+    Endorsement:
+      type: object
+      description: The gateway's statement that a holder of device.recover released an op of a key-lost origin (ADR-0002 A2.1). Valid only together with the identity-signed credential of the adopting device (carrying `recovers` = origin) and that device's Attestation with the same `rec`; the op's seq must be at or below the attested seq, and the op held at the attested seq must have the attested h.
+      required: [origin, stream, seq, h, rec, kid, sig]
+      properties:
+        origin: {type: string, description: Key-lost origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence of the released op.}
+        h: {type: string, description: Hash of the op at seq.}
+        rec: {type: string, description: Recovery id.}
+        kid: {type: string, description: Key id of the gateway op-signing key (a current key of the pack).}
+        sig: {type: string, description: "ES256 raw r||s, base64url, over sha256(\"hostry-endorse-v1\\n\" + origin + \"\\n\" + stream + \"\\n\" + seq + \"\\n\" + h + \"\\n\" + rec)."}
+    Attestation:
+      type: object
+      description: Fixes the tail of a key-lost origin (A1.3), signed with the adopting device's new key.
+      required: [origin, stream, seq, h, by, rec, kid, sig]
+      properties:
+        origin: {type: string, description: Old origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Last op of the tail.}
+        h: {type: string, description: Hash of that op.}
+        by: {type: string, description: Adopting device id.}
+        rec: {type: string, description: Recovery record id.}
+        kid: {type: string, description: Adopting device key id.}
+        sig: {type: string, description: "ES256 over sha256(\"hostry-attest-v1\\n\" + origin + \"\\n\" + stream + \"\\n\" + seq + \"\\n\" + h + \"\\n\" + by + \"\\n\" + rec)."}
+    Credential:
+      type: object
+      description: Identity-signed device credential (a part of the offline pack).
+      required: [device_id, tenant_id, outlet_id, kind, kid, pub, not_after]
+      properties:
+        device_id: {type: string, description: Device id.}
+        tenant_id: {type: string, description: Organisation.}
+        outlet_id: {type: string, description: Outlet.}
+        brand_id: {type: string, description: Brand.}
+        kind: {type: string, enum: [pos, waiter, kds, hub], description: Device kind.}
+        kid: {type: string, description: Key id.}
+        pub: {type: string, description: Uncompressed X9.62 P-256 point, base64url.}
+        recovers: {type: string, description: Old device this one adopted (A1.3).}
+        not_after: {type: integer, format: int64, description: Unix seconds.}
+    CredentialEnvelope:
+      type: object
+      description: A credential with identity's signature over its RFC 8785 JSON.
+      required: [cred, sig]
+      properties:
+        cred: {$ref: '#/components/schemas/Credential'}
+        sig: {type: string, description: "ES256 over sha256(\"hostry-cred-v1\\n\" + canonical JSON of cred)."}
+    HeldSlot:
+      type: object
+      description: One of the device's own held slots, with one of three coarse codes (A1.2). Never a flag or a proof verdict.
+      required: [origin, stream, seq, code]
+      properties:
+        origin: {type: string, description: Origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence.}
+        code: {type: string, enum: [pending, held_manager, held_support], description: Whom to call.}
+    Refusal:
+      type: object
+      description: An op the node did not store (not a verdict).
+      required: [origin, stream, seq, reason]
+      properties:
+        origin: {type: string, description: Origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence.}
+        reason: {type: string, enum: [gap, seal_invalid, chain_invalid, origin_not_in_outlet, stream_outside_binding, revoked, unsealed, framing, recovery_not_authorised, relay_not_allowed, fork_evidence_kept], description: Why.}
+    HelloRequest:
+      type: object
+      required: [protocol]
+      properties:
+        protocol: {type: integer, description: Protocol major, 1.}
+        app_version: {type: string, description: App version.}
+        schema_version: {type: integer, description: Schema version.}
+        vector: {$ref: '#/components/schemas/Vector'}
+        epoch: {type: string, description: Cloud epoch this node last synced under.}
+        cloud_vector: {$ref: '#/components/schemas/Vector'}
+        unbound: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: "Direct cloud hello only: slots taken by hash with no binding yet (A2.8 item 1.3). The cloud answers `unbound_h`."}
+        chain_conflicts: {type: array, items: {$ref: '#/components/schemas/Conflict'}, description: "Direct cloud hello only: chain conflicts recorded and not yet reported (A2.8 item 1.4). The gateway raises one vendor alert per slot."}
+    Conflict:
+      type: object
+      required: [origin, stream, seq, held]
+      properties:
+        origin: {type: string, description: Origin of the slot.}
+        stream: {type: string, description: Stream of the slot.}
+        seq: {type: integer, format: int64, description: Sequence of the slot.}
+        held: {type: string, description: The hash the node holds at the slot.}
+        seen: {type: string, description: The contradicting hash the upstream or the cloud presented.}
+    SlotHash:
+      type: object
+      required: [origin, stream, seq, h]
+      properties:
+        origin: {type: string, description: Origin of the slot.}
+        stream: {type: string, description: Stream of the slot.}
+        seq: {type: integer, format: int64, description: Sequence of the slot.}
+        h: {type: string, description: The cloud's own hash for the slot.}
+    Decision:
+      type: object
+      required: [origin, stream, seq, reason]
+      properties:
+        origin: {type: string, description: Origin of the held slot.}
+        stream: {type: string, description: Stream of the held slot.}
+        seq: {type: integer, format: int64, description: Sequence of the held slot.}
+        reason: {type: string, minLength: 1, maxLength: 200, description: Why; kept in the tenant-visible audit record.}
+    HelloResponse:
+      type: object
+      required: [protocol, role, node_id, time, vector, min_supported_version, snapshot_required, streams]
+      properties:
+        protocol: {type: integer, description: Protocol major.}
+        role: {type: string, enum: [hub, cloud], description: Role.}
+        node_id: {type: string, description: Node id.}
+        time: {type: string, description: Upstream time, RFC 3339.}
+        epoch: {type: string, description: Cloud epoch (hub passes on the last one it saw).}
+        vector: {$ref: '#/components/schemas/Vector'}
+        cloud_vector: {$ref: '#/components/schemas/Vector'}
+        min_supported_version: {type: string, description: Gates pulling (S13).}
+        snapshot_required: {type: boolean, description: Always false in the PoC; the snapshot client is not built.}
+        streams: {type: array, items: {type: string}, description: Streams the caller is bound to.}
+        unbound_h: {type: array, items: {$ref: '#/components/schemas/SlotHash'}, description: "The cloud's own hash for each listed `unbound` slot it holds; equal clears the mark, different is a chain_conflict."}
+    PushRequest:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Item'}, description: Ops, no placeholders.}
+        seals: {type: array, items: {$ref: '#/components/schemas/Seal'}}
+        attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}, description: "Quarantine upload: the tail attestation. Push: the attestations that go with `endorsements`."}
+        endorsements: {type: array, items: {$ref: '#/components/schemas/Endorsement'}, description: "Re-offer of released unsealed-tail ops (A2.1 item 5), independent of `items`: the cloud takes a quarantined slot as released when the endorsement, the recovery credential and the attestation verify."}
+    PushResponse:
+      type: object
+      required: [vector]
+      properties:
+        epoch: {type: string, description: Cloud epoch.}
+        vector: {$ref: '#/components/schemas/Vector'}
+        held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}}
+        refused: {type: array, items: {$ref: '#/components/schemas/Refusal'}}
+        drained: {type: boolean, description: 'Quarantine upload only; the attested tail is all held.'}
+    PullRequest:
+      type: object
+      required: [vector]
+      properties:
+        vector: {$ref: '#/components/schemas/Vector'}
+        streams: {type: array, items: {type: string}, description: Restrict to streams.}
+        placeholders: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: Slots held only as placeholders, to receive them once released.}
+        stale_seals: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: "Stored cloud-origin seals under a dropped op-signing key, at most 200 (A2.8 item 2). The answer is `seal_refresh`."}
+        limit: {type: integer, description: Soft cap, at most 500; a batch always ends at a seal.}
+    PullResponse:
+      type: object
+      required: [items, more, own_held]
+      properties:
+        epoch: {type: string, description: Cloud epoch.}
+        items: {type: array, items: {$ref: '#/components/schemas/Item'}}
+        seals: {type: array, items: {$ref: '#/components/schemas/Seal'}}
+        creds: {type: array, items: {$ref: '#/components/schemas/CredentialEnvelope'}, description: Credentials of the origins in items, and of the adopting devices (`recovers`) when endorsements are present.}
+        endorsements: {type: array, items: {$ref: '#/components/schemas/Endorsement'}, description: Every endorsement of the ops in this batch, and of released ops answered for `placeholders`. A hub re-serves what it stored.}
+        attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}, description: The attestations that go with the endorsements.}
+        seal_refresh: {type: array, items: {$ref: '#/components/schemas/Seal'}, description: "The seals for `stale_seals` as the upstream holds them now."}
+        more: {type: boolean, description: More slots are available.}
+        own_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: Complete current list of the caller's own held slots; replace the local list.}
+        relay_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: For role hub only.}
+    Snapshot:
+      type: object
+      required: [vector, rows, voids]
+      properties:
+        epoch: {type: string, description: Cloud epoch.}
+        vector: {$ref: '#/components/schemas/Vector'}
+        rows: {type: array, items: {type: object, description: "Row: e, id, f, gone.", additionalProperties: true}}
+        voids: {type: array, items: {$ref: '#/components/schemas/Ref'}}
