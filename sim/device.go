@@ -121,7 +121,7 @@ func (d *Device) open() error {
 		_ = d.Cache.Add(d.Cred)
 	}
 	d.Eng = engine.New(engine.Config{
-		Role: engine.RoleDevice, Tenant: w.Tenant, Outlet: w.Outlet, Origin: d.ID, Key: d.Key, Store: st, Trust: d.Cache,
+		Role: engine.RoleDevice, Kind: d.Kind, Tenant: w.Tenant, Outlet: w.Outlet, Origin: d.ID, Key: d.Key, Store: st, Trust: d.Cache,
 		Clock: sp.NewClock(func() time.Time { return w.Clock.Now().Add(d.Skew) }), Series: seriesSrc{d},
 	})
 	if err := d.Eng.Open(w.Ctx); err != nil {

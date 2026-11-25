@@ -188,6 +188,8 @@ const (
 	KindWaiter = "waiter"
 	KindKDS    = "kds"
 	KindHub    = "hub"
+	// KindPersonal is a member's own device (credential kind personal, ADR-0005 A3.2).
+	KindPersonal = "personal"
 )
 
 // Credential is an identity-signed device credential (the part of the offline pack that peers

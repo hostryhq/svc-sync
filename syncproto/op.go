@@ -406,6 +406,12 @@ type SnapshotRow struct {
 	ID     string         `json:"id"`
 	Fields map[string]any `json:"f"`
 	Gone   bool           `json:"gone,omitempty"`
+	// PIIC is the commitment of every pii field the row holds; PII the values with their `~s:<field>` salts, only
+	// for a caller whose credential kind receives them (ADR-0014 A3.1). Neither is part of Fields.
+	PIIC map[string]string `json:"pii_c,omitempty"`
+	PII  map[string]any    `json:"pii,omitempty"`
+	// PIISrc names, per pii field, the op that holds its value; it is never on the wire.
+	PIISrc map[string]Ref `json:"-"`
 }
 
 // VoidID is the row id of the sync_void record that names a refused op: "<stream>|<origin>|<seq>".

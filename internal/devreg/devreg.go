@@ -168,7 +168,7 @@ func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
 	if !decode(w, req, &in) {
 		return
 	}
-	kind, ok := map[string]string{"pos": sp.KindPOS, "waiter": sp.KindWaiter, "kds": sp.KindKDS, "hub": sp.KindHub}[in.Kind]
+	kind, ok := map[string]string{"pos": sp.KindPOS, "waiter": sp.KindWaiter, "kds": sp.KindKDS, "hub": sp.KindHub, "personal": sp.KindPersonal}[in.Kind]
 	if in.TenantID == "" || in.OutletID == "" || in.DeviceID == "" || !ok {
 		problem(w, http.StatusBadRequest, "tenant_id, outlet_id, device_id and a kind of pos, waiter, kds or hub are required")
 		return

@@ -74,7 +74,7 @@ func New(ctx context.Context, cfg Config) (*Hub, error) {
 		_ = h.cache.Add(p)
 	}
 	h.eng = engine.New(engine.Config{
-		Role: engine.RoleHub, Tenant: cfg.Tenant, Outlet: cfg.Outlet, Store: cfg.Store, Trust: h.cache,
+		Role: engine.RoleHub, Kind: sp.KindHub, Tenant: cfg.Tenant, Outlet: cfg.Outlet, Store: cfg.Store, Trust: h.cache,
 		Clock: sp.NewClock(cfg.Now),
 		Hooks: engine.Hooks{Authorize: h.authorize, Verdict: h.structural},
 	})
@@ -249,6 +249,9 @@ func (h *Hub) Snapshot(ctx context.Context, p api.Principal) (sp.Snapshot, error
 			snap.Voids = append(snap.Voids, sp.Ref{Origin: k})
 		}
 	})
+	if err := h.eng.SnapshotPII(ctx, snap.Rows, p.Caller.Kind); err != nil {
+		return sp.Snapshot{}, err
+	}
 	return snap, nil
 }
 

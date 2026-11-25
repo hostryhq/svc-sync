@@ -34,6 +34,12 @@ type Intent struct {
 	// Records are protocol records that are not synced entities (session, approval, sync_void, ...).
 	Records   []string
 	PIIFields []string
+	// Override: an op of this intent whose actor lacks the permission may cite an approval (ADR-0014 A3.3).
+	Override bool
+	// ProofKind is "session" or "action"; Binds names the overridden fields whose recorded values form `values`
+	// in the action hash (sync/protocol-v1.md, Proof messages).
+	ProofKind string
+	Binds     []string
 	// MaxV is the highest intent_v the gateway has an upcaster for (S13).
 	MaxV int
 }

@@ -32,6 +32,11 @@ type file struct {
 		Entities     map[string][]string `yaml:"entities"`
 		Records      []string            `yaml:"records"`
 		PIIFields    []string            `yaml:"pii_fields"`
+		Override     bool                `yaml:"override"`
+		Proof        struct {
+			Kind  string   `yaml:"kind"`
+			Binds []string `yaml:"binds"`
+		} `yaml:"proof"`
 	} `yaml:"intents"`
 }
 
@@ -88,8 +93,8 @@ func Generate(dir string) ([]byte, error) {
 				entMap = "map[string][]string{" + strings.Join(ents, ", ") + "}"
 			}
 			names = append(names, in.Intent)
-			bodies[in.Intent] = fmt.Sprintf("%q: {Name: %q, Class: %q, Owner: %q, Permission: %q, AuthorisedBy: %s, Kinds: %s, Sessions: %s, Streams: %s, Numbering: %q, Documents: %s, Entities: %s, Records: %s, PIIFields: %s, MaxV: %d},\n",
-				in.Intent, in.Intent, in.Class, in.Owner, perm, q(in.AuthorisedBy), q(in.DeviceKinds), q(in.Sessions), q(in.Streams), in.Numbering, q(in.Documents), entMap, q(in.Records), q(in.PIIFields), in.IntentV)
+			bodies[in.Intent] = fmt.Sprintf("%q: {Name: %q, Class: %q, Owner: %q, Permission: %q, AuthorisedBy: %s, Kinds: %s, Sessions: %s, Streams: %s, Numbering: %q, Documents: %s, Entities: %s, Records: %s, PIIFields: %s, Override: %t, ProofKind: %q, Binds: %s, MaxV: %d},\n",
+				in.Intent, in.Intent, in.Class, in.Owner, perm, q(in.AuthorisedBy), q(in.DeviceKinds), q(in.Sessions), q(in.Streams), in.Numbering, q(in.Documents), entMap, q(in.Records), q(in.PIIFields), in.Override, in.Proof.Kind, q(in.Proof.Binds), in.IntentV)
 		}
 	}
 	sort.Strings(names)

@@ -138,7 +138,10 @@ type Config struct {
 	// Entropy is the source of pii salts (default crypto/rand); the simulator injects a seeded one.
 	Entropy io.Reader
 	Role    Role
-	Tenant  string
+	// Kind is this node's credential kind (pos, waiter, personal, kds, hub); empty for the cloud. It decides whether the
+	// node expects the pii values of ops that carry commitments (ADR-0014 A3.1 item 4).
+	Kind   string
+	Tenant string
 	Outlet  string
 	// Origin is this node's own origin id: the device id, or cloud-<epoch>. Empty for a hub that
 	// never records ops of its own.
@@ -263,7 +266,7 @@ func (e *Engine) applyBody(b sp.Body) {
 		return
 	}
 	h, _ := sp.ParseHLC(b.HLC)
-	e.st.Apply(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts)
+	e.st.ApplyPII(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts, b.PIIC)
 	if b.Intent == sp.IntentVoid {
 		e.applyVoid(b)
 	}
@@ -1077,6 +1080,11 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		if !ok {
 			continue
 		}
+		if rec.H == it.H && !it.IsPlaceholder() && len(it.PII) > 0 && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) {
+			if err := e.refillPII(tx, it); err != nil {
+				return false, err
+			}
+		}
 		switch {
 		case rec.H == it.H && !it.IsPlaceholder() && rec.Status == repository.StQuarantined && e.cfg.Hooks.OnEndorsed != nil:
 			// A node re-offers a released unsealed-tail op the cloud holds as quarantined (A2.1 item 5).
@@ -1431,6 +1439,9 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 				return false, err
 			}
 		}
+		if err := e.notePIINeed(tx, it, p); err != nil {
+			return false, err
+		}
 		v := Verdict{Status: repository.StAccepted}
 		if e.cfg.Hooks.Verdict != nil {
 			v = e.cfg.Hooks.Verdict(tx, p, VerdictCtx{Caller: req.Caller, Own: own, Recovery: req.Recovery,
@@ -1588,6 +1599,11 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H}
 				if r.Body != "" && (r.Status == repository.StAccepted || r.Status == repository.StFlagged) {
 					it.Body = r.Body
+					if sp.ServesPII(o.Caller.Kind) {
+						if it.PII, err = servedPII(tx, r); err != nil {
+							return err
+						}
+					}
 				}
 				resp.Items = append(resp.Items, it)
 				budget--
@@ -1616,7 +1632,13 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				return err
 			}
 			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) && (e.cfg.Role == RoleCloud || !hasMarkS(rec.Marks, MarkUnbound)) {
-				resp.Items = append(resp.Items, sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body})
+				rel := sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body}
+				if sp.ServesPII(o.Caller.Kind) {
+					if rel.PII, err = servedPII(tx, rec); err != nil {
+						return err
+					}
+				}
+				resp.Items = append(resp.Items, rel)
 				if en, ok, err := tx.GetEndorsement(rec.Stream, rec.Origin, rec.Seq); err != nil {
 					return err
 				} else if ok {

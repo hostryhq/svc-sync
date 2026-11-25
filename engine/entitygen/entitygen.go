@@ -25,6 +25,7 @@ type doc struct {
 		Policy string   `yaml:"policy"`
 		Group  string   `yaml:"group"`
 		Order  []string `yaml:"order"`
+		PII    bool     `yaml:"pii"`
 	} `yaml:"fields"`
 }
 
@@ -72,7 +73,11 @@ func Generate(dir string) ([]byte, error) {
 				}
 				order = "[]string{" + strings.Join(parts, ", ") + "}"
 			}
-			fmt.Fprintf(&b, "\t\t\t%q: {Policy: %q, Group: %q, Order: %s},\n", n, f.Policy, f.Group, order)
+			pii := ""
+			if f.PII {
+				pii = ", PII: true"
+			}
+			fmt.Fprintf(&b, "\t\t\t%q: {Policy: %q, Group: %q, Order: %s%s},\n", n, f.Policy, f.Group, order, pii)
 		}
 		b.WriteString("\t\t}},\n")
 	}

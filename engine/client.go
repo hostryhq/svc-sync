@@ -269,6 +269,12 @@ func (c *Client) placeholders(ctx context.Context) ([]sp.Ref, error) {
 				break
 			}
 		}
+		// Ops whose pii values this node lacks (pii_incomplete, ADR-0014 A3.1 item 4): any upstream may complete them.
+		more, err := c.E.IncompletePII(tx, 200-len(out))
+		if err != nil {
+			return err
+		}
+		out = append(out, more...)
 		// Endorsements signed by a key this node no longer accepts (rotation, A2.1 item 6): ask
 		// for the op again, the answer carries the re-issued endorsement.
 		if c.Cache != nil {

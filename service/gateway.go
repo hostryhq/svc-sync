@@ -438,7 +438,7 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 					continue
 				}
 				h, _ := sp.ParseHLC(b.HLC)
-				st.Apply(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts)
+				st.ApplyPII(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts, b.PIIC)
 				if b.Intent == sp.IntentVoid {
 					for _, m := range b.Muts {
 						if m.E == "sync_void" {
@@ -454,6 +454,9 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 		}
 	})
 	snap.Rows = st.Snapshot()
+	if err == nil {
+		err = g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error { return engine.AttachSnapshotPII(tx, snap.Rows, c.Kind) })
+	}
 	return snap, err
 }
 

@@ -42,6 +42,9 @@ type FieldDef struct {
 	Group string
 	// Order is the forward-only order of a rank field, lowest first.
 	Order []string
+	// PII marks a personal-data field: its value travels beside the op, only its commitment is in the body and
+	// in every convergence hash (ADR-0014 A3.1, A3.2).
+	PII bool
 }
 
 // EntityDef declares the conflict policy next to the entity (offline-first invariant 5). Entities
@@ -163,7 +166,11 @@ func (a stamp) less(b stamp) bool {
 
 func (a stamp) String() string { return fmt.Sprintf("%s.%s.%d.%d", a.hlc, a.origin, a.seq, a.idx) }
 
+// piiCommitPrefix names the member of a row text that holds the commitment of a pii field (ADR-0014 A3.2).
+const piiCommitPrefix = "~c:"
+
 type effect struct {
+	ref  sp.Ref
 	op   string
 	st   stamp
 	kind string
@@ -201,7 +208,12 @@ func (s *State) Applied(r sp.Ref) bool { return s.applied[r.Key()] }
 func (s *State) IsVoided(r sp.Ref) bool { return s.voids[r.Key()] }
 
 // Apply applies an op's mutations once. A voided op is marked applied and does nothing.
-func (s *State) Apply(r sp.Ref, hlc sp.HLC, muts []sp.Mut) {
+func (s *State) Apply(r sp.Ref, hlc sp.HLC, muts []sp.Mut) { s.ApplyPII(r, hlc, muts, nil) }
+
+// ApplyPII is Apply for an op that carries pii commitments (body.pii_c). A commitment of a field the entity declares
+// `pii` becomes a candidate named "~c:<field>" that follows the field's own merge rule, so the state hash covers it
+// and two nodes holding different winners for the field differ (ADR-0014 A3.2 item 1). A value is never an input.
+func (s *State) ApplyPII(r sp.Ref, hlc sp.HLC, muts []sp.Mut, commits sp.PIICommit) {
 	k := r.Key()
 	if s.applied[k] {
 		return
@@ -220,7 +232,19 @@ func (s *State) Apply(r sp.Ref, hlc sp.HLC, muts []sp.Mut) {
 			rw = &row{entity: m.E, id: m.ID}
 			s.rows[rk] = rw
 		}
-		rw.fx = append(rw.fx, effect{op: k, st: stamp{hlc, r.Origin, r.Seq, i}, kind: m.K, f: m.F, prev: m.Prev})
+		f := m.F
+		if c := commits[m.E][m.ID]; len(c) > 0 {
+			f = make(map[string]any, len(m.F)+len(c))
+			for n, v := range m.F {
+				f[n] = v
+			}
+			for n, h := range c {
+				if fd, ok := Entities[m.E].Fields[n]; ok && fd.PII {
+					f[piiCommitPrefix+n] = h
+				}
+			}
+		}
+		rw.fx = append(rw.fx, effect{ref: r, op: k, st: stamp{hlc, r.Origin, r.Seq, i}, kind: m.K, f: f, prev: m.Prev})
 		s.byOp[k] = append(s.byOp[k], rk)
 	}
 }
@@ -251,6 +275,8 @@ type derived struct {
 	exists bool
 	gone   bool
 	fields map[string]any
+	// piiSrc is, per pii field, the op whose commitment won it (the op that holds the value).
+	piiSrc map[string]sp.Ref
 }
 
 func (s *State) derive(rw *row) derived {
@@ -285,9 +311,10 @@ func (s *State) derive(rw *row) derived {
 	groupBest := map[string]effect{} // lww, lww_review: the highest stamp among the candidates of a group
 	for _, e := range rw.fx {
 		for f, v := range e.f {
-			fd := def.field(f)
+			base := strings.TrimPrefix(f, piiCommitPrefix)
+			fd := def.field(base)
 			if registry {
-				if _, known := def.Fields[f]; !known || !kindAllows(e.kind, fd.Policy) {
+				if _, known := def.Fields[base]; !known || !kindAllows(e.kind, fd.Policy) {
 					continue
 				}
 			} else if e.kind != sp.KInsert && e.kind != sp.KSet && e.kind != sp.KRank && !(e.kind == sp.KDelta && fd.Policy == FPDelta) {
@@ -315,7 +342,7 @@ func (s *State) derive(rw *row) derived {
 					best[f] = e
 				}
 			default: // lww, lww_review
-				g := fd.groupKey(f)
+				g := fd.groupKey(base)
 				if cur, ok := groupBest[g]; !ok || cur.st.less(e.st) {
 					groupBest[g] = e
 				}
@@ -324,18 +351,22 @@ func (s *State) derive(rw *row) derived {
 	}
 	for f, e := range first {
 		d.fields[f] = e.f[f]
+		d.noteSrc(f, e)
 	}
 	for f, e := range best {
 		d.fields[f] = e.f[f]
+		d.noteSrc(f, e)
 	}
 	for f := range fieldsOf(rw, def) {
-		fd := def.field(f)
+		base := strings.TrimPrefix(f, piiCommitPrefix)
+		fd := def.field(base)
 		if fd.Policy != FPLWW && fd.Policy != FPLWWReview {
 			continue
 		}
-		if e, ok := groupBest[fd.groupKey(f)]; ok {
+		if e, ok := groupBest[fd.groupKey(base)]; ok {
 			if v, has := e.f[f]; has {
 				d.fields[f] = v
+				d.noteSrc(f, e)
 			}
 		}
 	}
@@ -351,6 +382,16 @@ func (s *State) derive(rw *row) derived {
 		}
 	}
 	return d
+}
+
+func (d *derived) noteSrc(f string, e effect) {
+	if !strings.HasPrefix(f, piiCommitPrefix) {
+		return
+	}
+	if d.piiSrc == nil {
+		d.piiSrc = map[string]sp.Ref{}
+	}
+	d.piiSrc[strings.TrimPrefix(f, piiCommitPrefix)] = e.ref
 }
 
 // fieldsOf lists the fields any effect of the row carries.
@@ -552,7 +593,18 @@ func (s *State) Snapshot() []sp.SnapshotRow {
 	for _, rw := range s.sortedRows() {
 		d := s.derive(rw)
 		if d.exists || d.gone {
-			out = append(out, sp.SnapshotRow{Entity: rw.entity, ID: rw.id, Fields: d.fields, Gone: d.gone})
+			row := sp.SnapshotRow{Entity: rw.entity, ID: rw.id, Fields: map[string]any{}, Gone: d.gone, PIISrc: d.piiSrc}
+			for n, v := range d.fields {
+				if strings.HasPrefix(n, piiCommitPrefix) {
+					if row.PIIC == nil {
+						row.PIIC = map[string]string{}
+					}
+					row.PIIC[strings.TrimPrefix(n, piiCommitPrefix)], _ = v.(string)
+					continue
+				}
+				row.Fields[n] = v
+			}
+			out = append(out, row)
 		}
 	}
 	return out
