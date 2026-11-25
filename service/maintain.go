@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"sort"
+
+	"github.com/hostryhq/svc-sync/repository"
 )
 
 // KnownTenants lists the tenants this gateway process has served since it started.
@@ -25,6 +27,12 @@ func (g *Gateway) MaintainOnce(ctx context.Context) error {
 	var first error
 	for _, t := range g.KnownTenants() {
 		if _, err := g.ResolveSessions(ctx, t); err != nil && first == nil {
+			first = err
+		}
+		if err := g.cfg.Store.InTx(ctx, t, func(tx repository.Tx) error {
+			_, err := g.expireApprovalWaits(tx)
+			return err
+		}); err != nil && first == nil {
 			first = err
 		}
 		if _, err := g.ReportPendingDrains(ctx, t); err != nil && first == nil && err != ErrNoDrainRecorder {

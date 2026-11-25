@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,10 +34,18 @@ const (
 	ApprovalExpired      = "expired"
 	ApprovalNotPermitted = "approver_not_permitted"
 	ApprovalSelf         = "self"
+	// ApprovalMissing: the cited approval never arrived. The citing op waited the A3.3 window plus ApprovalMissingGrace
+	// (api-specs Exception.reason must list it).
+	ApprovalMissing = "missing"
 )
 
-// approvalMaxAge is how long after the approval the citing op may be recorded.
-const approvalMaxAge = 120 * time.Second
+// ApprovalMaxAge is how long after the approval the citing op may be recorded.
+const ApprovalMaxAge = 120 * time.Second
+
+// ApprovalMissingGrace is how long, beyond ApprovalMaxAge, the gateway waits for an approval.grant it does not hold before it
+// flags the citing op `missing` (P2-H1). A grant is recorded by the same origin on the same stream, before the op that cites it, so
+// it reaches the gateway in the push that carries the op; the grace only covers a slow re-offer.
+const ApprovalMissingGrace = 10 * time.Minute
 
 const approvalWaitPrefix = "approval-wait:"
 
@@ -73,19 +82,16 @@ func (g *Gateway) checkApproval(tx repository.Tx, b sp.Body, in sp.Intent, strea
 		return fail(ApprovalProofInvalid)
 	}
 	// Single citer: the lowest hlc keeps it. A citer that was displaced is flagged `reused` after the fact.
+	// The claim is written only after every other check passes (CR-L5): an op that fails another check must not displace a valid citer.
 	me := opRefKey(stream, origin, b.Seq)
+	displaces := false
 	if row.Citer != "" && row.Citer != me {
 		mine, e1 := sp.ParseHLC(b.HLC)
 		held, e2 := sp.ParseHLC(row.CiterHLC)
 		if e1 != nil || e2 != nil || !(mine < held) {
 			return fail(ApprovalReused)
 		}
-		if err := g.flagReused(tx, row.Citer); err != nil {
-			return fail(ApprovalReused)
-		}
-	}
-	if row.Citer != me {
-		_ = tx.ClaimApproval(origin, b.Approval, me, b.HLC)
+		displaces = true
 	}
 	// requester = approver is allowed only in an approval.self_confirm, and that never makes an actor without the
 	// permission pass (this path is only taken for such an actor).
@@ -104,15 +110,105 @@ func (g *Gateway) checkApproval(tx repository.Tx, b sp.Body, in sp.Intent, strea
 	}
 	at, e1 := time.Parse(sp.TimeLayout, b.At)
 	given, e2 := time.Parse(sp.TimeLayout, row.ApprovedAt)
-	if d := at.Sub(given); e1 != nil || e2 != nil || d < 0 || d > approvalMaxAge {
+	if d := at.Sub(given); e1 != nil || e2 != nil || d < 0 || d > ApprovalMaxAge {
 		return fail(ApprovalExpired)
+	}
+	if displaces {
+		if err := g.flagReused(tx, row.Citer); err != nil {
+			return fail(ApprovalReused)
+		}
+	}
+	if row.Citer != me {
+		if err := tx.ClaimApproval(origin, b.Approval, me, b.HLC); err != nil {
+			return approvalOutcome{State: approvalPending} // the claim is not stored: judged again, never accepted unclaimed
+		}
 	}
 	return approvalOutcome{State: approvalOK, Approver: row.Approver}
 }
 
 // waitApproval records that an accepted op waits for the approval it cites.
-func waitApproval(tx repository.Tx, stream, origin string, seq int64, approvalID string) error {
-	return tx.SetMeta(approvalWaitPrefix+origin+"|"+approvalID+"|"+opRefKey(stream, origin, seq), "1")
+func (g *Gateway) waitApproval(tx repository.Tx, stream, origin string, seq int64, approvalID string) error {
+	return tx.SetMeta(approvalWaitPrefix+origin+"|"+approvalID+"|"+opRefKey(stream, origin, seq), g.cfg.Now().UTC().Format(time.RFC3339))
+}
+
+// expireApprovalWaits makes "not yet known" final once absence is provable (P2-H1): an op that cites an approval the gateway
+// does not hold, ApprovalMaxAge plus ApprovalMissingGrace after the gateway stored it, becomes an approval_flag `missing`, with an
+// owner alert. A citation whose approval is held but whose proof identity could not answer stays pending (identity's answer
+// decides it), and shows on the exceptions list meanwhile.
+func (g *Gateway) expireApprovalWaits(tx repository.Tx) (int, error) {
+	waits, err := tx.MetaPrefix(approvalWaitPrefix)
+	if err != nil {
+		return 0, err
+	}
+	now := g.cfg.Now().UTC()
+	n := 0
+	for k, started := range waits {
+		parts := strings.Split(strings.TrimPrefix(k, approvalWaitPrefix), "|")
+		if len(parts) != 5 { // origin | approval id | stream | origin | seq
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, started)
+		if err != nil { // a wait written before the time was kept: its clock starts now
+			if err := tx.SetMeta(k, now.Format(time.RFC3339)); err != nil {
+				return n, err
+			}
+			continue
+		}
+		if now.Sub(at) < ApprovalMaxAge+ApprovalMissingGrace {
+			continue
+		}
+		if row, ok, err := tx.GetApproval(parts[0], parts[1]); err != nil {
+			return n, err
+		} else if ok && row.Kind != "" {
+			continue // held: the proof verdict decides
+		}
+		seq, _ := strconv.ParseInt(parts[4], 10, 64)
+		rec, ok, err := tx.GetOp(parts[2], parts[3], seq)
+		if err != nil {
+			return n, err
+		}
+		if err := tx.DeleteMeta(k); err != nil {
+			return n, err
+		}
+		if !ok {
+			continue
+		}
+		if err := g.markApprovalFailed(tx, rec, ApprovalMissing); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+// pendingApprovalOps lists the accepted ops that still wait for the approval they cite.
+func pendingApprovalOps(tx repository.Tx) ([]repository.OpRec, error) {
+	waits, err := tx.MetaPrefix(approvalWaitPrefix)
+	if err != nil {
+		return nil, err
+	}
+	var out []repository.OpRec
+	for k := range waits {
+		parts := strings.Split(strings.TrimPrefix(k, approvalWaitPrefix), "|")
+		if len(parts) != 5 {
+			continue
+		}
+		seq, _ := strconv.ParseInt(parts[4], 10, 64)
+		rec, ok, err := tx.GetOp(parts[2], parts[3], seq)
+		if err != nil {
+			return nil, err
+		}
+		if ok && rec.Status == repository.StAccepted && hasMark(splitMarks(rec.Marks), MarkApprovalPending) {
+			out = append(out, rec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].Seq < out[j].Seq
+	})
+	return out, nil
 }
 
 // flagReused marks the op that cited an approval first (by arrival) but not first by clock: another op with a lower hlc

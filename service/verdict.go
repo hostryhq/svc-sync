@@ -322,7 +322,7 @@ func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.Verdic
 					return quarantine(ReasonConfigPending)
 				}
 				marks = append(marks, MarkApprovalPending)
-				if err := waitApproval(tx, p.Item.Stream, origin, b.Seq, b.Approval); err != nil {
+				if err := g.waitApproval(tx, p.Item.Stream, origin, b.Seq, b.Approval); err != nil {
 					return quarantine(ReasonConfigPending)
 				}
 			default:

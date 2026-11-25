@@ -80,6 +80,11 @@ func (g *Gateway) Exceptions(ctx context.Context, tenant string) ([]QuarantineIt
 		if err != nil {
 			return err
 		}
+		pend, err := pendingApprovalOps(tx)
+		if err != nil {
+			return err
+		}
+		recs = append(recs, pend...)
 		for _, r := range recs {
 			out = append(out, QuarantineItem{Ref: sp.Ref{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq}, Marks: splitMarks(r.Marks), Intent: r.Intent, Number: docNumber(r.Body)})
 		}

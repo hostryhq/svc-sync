@@ -130,6 +130,13 @@ func (g *Gateway) list(ctx context.Context, perm, status string, withReason bool
 		if err != nil {
 			return err
 		}
+		if status == repository.StFlagged { // an op that waits for its approval is an exception until it is final (P2-H1)
+			pend, err := pendingApprovalOps(tx)
+			if err != nil {
+				return err
+			}
+			recs = append(recs, pend...)
+		}
 		for _, r := range recs {
 			if !inScope(scope, r.Stream) {
 				continue
