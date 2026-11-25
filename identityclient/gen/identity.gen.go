@@ -198,6 +198,24 @@ func (e RevocationSubjectType) Valid() bool {
 	}
 }
 
+// Defines values for StoreProtection.
+const (
+	Protected   StoreProtection = "protected"
+	Unprotected StoreProtection = "unprotected"
+)
+
+// Valid indicates whether the value is a known member of the StoreProtection enum.
+func (e StoreProtection) Valid() bool {
+	switch e {
+	case Protected:
+		return true
+	case Unprotected:
+		return true
+	default:
+		return false
+	}
+}
+
 // BillingCapability Whether the device may finalise legal documents: active series, dormant series (waiter), or none.
 //
 // Example: active
@@ -215,7 +233,7 @@ type Device struct {
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	Id Id `json:"id"`
 
-	// KeyProtection Protection tier of the device key, reported by the device at registration. Information, not proof, and no permission depends on it (ADR-0005 A1).
+	// KeyProtection Protection tier of the device key, reported by the device at registration. Information, not proof, and no permission depends on it (ADR-0005 A1). The hub's `dev` key file (CI and the soak, ADR-0002 A3.2 item 3) reports os-software here and `store` unprotected in its credential.
 	//
 	// Example: hardware
 	KeyProtection KeyProtection `json:"key_protection"`
@@ -249,9 +267,14 @@ type Device struct {
 	//
 	// Example: active
 	State DeviceState `json:"state"`
+
+	// Store Whether the device's local store is protected: `protected` is an encrypted store (SQLCipher with a keystore-held key on a device; the hub's column encryption with a tier other than `dev`), `unprotected` anything else (the browser build, a hub with a `dev` key file). Declared by the build at activation, signed into the credential, fixed for the life of the device id (ADR-0002 A3.5 item 1). It is the build's own statement: it guards against a wrong build, not a modified one. Identity refuses `unprotected` outside HOSTRY_ENV dev, test and ci (422 store.unprotected_refused). Another origin's personal data goes only to `protected` devices.
+	//
+	// Example: protected
+	Store *StoreProtection `json:"store,omitempty"`
 }
 
-// DeviceCredential The identity-signed credential of a device as the offline pack carries it (ADR-0005 A3.2 row 1). `not_after` is not part of this answer; the gateway ignores it. `brand_id` is always present (ADR-0014 A3.4).
+// DeviceCredential The identity-signed credential of a device as the offline pack carries it (ADR-0005 A3.2 row 1). `not_after` is not part of this answer; the gateway ignores it. `brand_id` and `store` are always present (ADR-0014 A3.4, ADR-0002 A3.5 item 1); the gateway's cache has no expiry because both are fixed for the life of the device id.
 type DeviceCredential struct {
 	// BrandId Brand of the outlet, read from tenancy when the device was activated, stored on the device row and signed into the credential; never re-read (ADR-0014 A3.4). The gateway caches the credential with no expiry and judges a device's stream binding from it, not from a tenancy call.
 	//
@@ -285,6 +308,11 @@ type DeviceCredential struct {
 	//
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	Recovers *Id `json:"recovers,omitempty"`
+
+	// Store Whether the device's local store is protected: `protected` is an encrypted store (SQLCipher with a keystore-held key on a device; the hub's column encryption with a tier other than `dev`), `unprotected` anything else (the browser build, a hub with a `dev` key file). Declared by the build at activation, signed into the credential, fixed for the life of the device id (ADR-0002 A3.5 item 1). It is the build's own statement: it guards against a wrong build, not a modified one. Identity refuses `unprotected` outside HOSTRY_ENV dev, test and ci (422 store.unprotected_refused). Another origin's personal data goes only to `protected` devices.
+	//
+	// Example: protected
+	Store StoreProtection `json:"store"`
 
 	// TenantId Organisation.
 	//
@@ -411,7 +439,7 @@ type DrainStatement struct {
 // Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 type Id = string
 
-// KeyProtection Protection tier of the device key, reported by the device at registration. Information, not proof, and no permission depends on it (ADR-0005 A1).
+// KeyProtection Protection tier of the device key, reported by the device at registration. Information, not proof, and no permission depends on it (ADR-0005 A1). The hub's `dev` key file (CI and the soak, ADR-0002 A3.2 item 3) reports os-software here and `store` unprotected in its credential.
 //
 // Example: hardware
 type KeyProtection string
@@ -680,7 +708,7 @@ type ProofVerificationKind string
 
 // RecordDrain Drain report from the sync gateway.
 type RecordDrain struct {
-	// DrainedThrough Sequence stored per device stream.
+	// DrainedThrough Head per device stream, copied from the statement's `streams` (the same streams, the same `seq`).
 	DrainedThrough []StreamSequence `json:"drained_through"`
 
 	// Series The last number per series, copied from the device-signed statement (ADR-0005 A3.3 item 5). Must be exactly the series identity issued to the device (422 drain.series_mismatch, vendor alert, nothing recorded). Empty only for a device that never held a series (kds, hub).
@@ -774,6 +802,11 @@ type SessionFacts struct {
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
 	SessionId Id `json:"session_id"`
 }
+
+// StoreProtection Whether the device's local store is protected: `protected` is an encrypted store (SQLCipher with a keystore-held key on a device; the hub's column encryption with a tier other than `dev`), `unprotected` anything else (the browser build, a hub with a `dev` key file). Declared by the build at activation, signed into the credential, fixed for the life of the device id (ADR-0002 A3.5 item 1). It is the build's own statement: it guards against a wrong build, not a modified one. Identity refuses `unprotected` outside HOSTRY_ENV dev, test and ci (422 store.unprotected_refused). Another origin's personal data goes only to `protected` devices.
+//
+// Example: protected
+type StoreProtection string
 
 // StreamSequence Highest sequence of one device stream.
 type StreamSequence struct {
@@ -945,12 +978,16 @@ type ClientInterface interface {
 
 	// RecordDeviceDrainedWithBody Record that a device is drained
 	//
+	// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
+	//
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
 	RecordDeviceDrainedWithBody(ctx context.Context, deviceId Id, params *RecordDeviceDrainedParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RecordDeviceDrained Record that a device is drained
+	//
+	// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
 	//
 	// Takes a body of the `application/json` content type.
 	//
@@ -1038,6 +1075,8 @@ func (c *Client) GetDeviceCredential(ctx context.Context, deviceId Id, reqEditor
 
 // RecordDeviceDrainedWithBody Record that a device is drained
 //
+// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
+//
 // Takes any type of body and a specified content type.
 //
 // Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
@@ -1054,6 +1093,8 @@ func (c *Client) RecordDeviceDrainedWithBody(ctx context.Context, deviceId Id, p
 }
 
 // RecordDeviceDrained Record that a device is drained
+//
+// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
 //
 // Takes a body of the `application/json` content type.
 //
@@ -1708,12 +1749,16 @@ type ClientWithResponsesInterface interface {
 
 	// RecordDeviceDrainedWithBodyWithResponse Record that a device is drained
 	//
+	// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
+	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
 	RecordDeviceDrainedWithBodyWithResponse(ctx context.Context, deviceId Id, params *RecordDeviceDrainedParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RecordDeviceDrainedResponse, error)
 
 	// RecordDeviceDrainedWithResponse Record that a device is drained
+	//
+	// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
@@ -2388,6 +2433,8 @@ func (c *ClientWithResponses) GetDeviceCredentialWithResponse(ctx context.Contex
 
 // RecordDeviceDrainedWithBodyWithResponse Record that a device is drained
 //
+// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
+//
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with PUT /internal/v1/devices/{device_id}/drain (the `RecordDeviceDrained` operationId).
@@ -2400,6 +2447,8 @@ func (c *ClientWithResponses) RecordDeviceDrainedWithBodyWithResponse(ctx contex
 }
 
 // RecordDeviceDrainedWithResponse Record that a device is drained
+//
+// The request example is verifiable: `statement.sig` verifies under the example key published in sync/conformance/v1.json (`drain_statement`, the case "recordDeviceDrained example"), and `drained_through` is exactly the statement's `streams` (stream and seq). The signature is over "hostry-drain-v1\n" + the RFC 8785 JSON of the statement without `sig` (sync/protocol-v1.md).
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //

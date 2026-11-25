@@ -243,7 +243,7 @@ func (d *Directory) Credential(tenant, device string) (sp.CredentialEnvelope, bo
 	if c.TenantID != tenant {
 		return sp.CredentialEnvelope{}, false
 	}
-	env := sp.CredentialEnvelope{Cred: sp.Credential{DeviceID: c.DeviceID, TenantID: c.TenantID, OutletID: c.OutletID, BrandID: c.BrandID, Kind: c.Kind, Kid: c.Kid, Pub: c.Pub, Recovers: c.Recovers}}
+	env := sp.CredentialEnvelope{Cred: sp.Credential{DeviceID: c.DeviceID, TenantID: c.TenantID, OutletID: c.OutletID, BrandID: c.BrandID, Kind: c.Kind, Kid: c.Kid, Pub: c.Pub, Store: c.Store, Recovers: c.Recovers}}
 	d.creds.put(k, env, d.now(), 0)
 	return env, true
 }

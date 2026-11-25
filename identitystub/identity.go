@@ -117,13 +117,18 @@ func (i *Identity) Activate(tenant, outlet, brand, id, kind string, kp *sp.KeyPa
 
 // ActivatePub registers a device by its public key (base64url) alone: the private key never reaches identity.
 func (i *Identity) ActivatePub(tenant, outlet, brand, id, kind, kid, pub, recovers string) (sp.CredentialEnvelope, error) {
+	return i.ActivateStore(tenant, outlet, brand, id, kind, kid, pub, recovers, sp.StoreProtected)
+}
+
+// ActivateStore is ActivatePub with the device store claim (ADR-0002 A3.5 item 1).
+func (i *Identity) ActivateStore(tenant, outlet, brand, id, kind, kid, pub, recovers, store string) (sp.CredentialEnvelope, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if _, ok := i.devices[id]; ok {
 		return sp.CredentialEnvelope{}, errors.New("identitystub: device exists")
 	}
 	env, err := sp.SignCredential(i.Key, sp.Credential{DeviceID: id, TenantID: tenant, OutletID: outlet, BrandID: brand, Kind: kind,
-		Kid: kid, Pub: pub, Recovers: recovers, NotAfter: i.now().Add(24 * 365 * time.Hour).Unix()})
+		Kid: kid, Pub: pub, Store: store, Recovers: recovers, NotAfter: i.now().Add(24 * 365 * time.Hour).Unix()})
 	if err != nil {
 		return env, err
 	}

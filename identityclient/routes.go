@@ -39,7 +39,7 @@ func answer(status int) error {
 
 // DeviceCredential is the identity credential of a device as the pack carries it (getDeviceCredential).
 type DeviceCredential struct {
-	DeviceID, TenantID, OutletID, BrandID, Kind, Kid, Pub, Recovers string
+	DeviceID, TenantID, OutletID, BrandID, Kind, Kid, Pub, Store, Recovers string
 }
 
 // GetDeviceCredential asks for the credential of a device in any state (A3.2 row 1).
@@ -62,7 +62,7 @@ func (c *Client) GetDeviceCredential(ctx context.Context, tenant, device string)
 	d := out.JSON200
 	// Identity signs brand_id at activation and never answers without it (503 until filled, ADR-0014 A3.4); an older identity may
 	// still answer none, and a device with no brand is then bound to no brand stream (streamAllowed), never to a guessed one.
-	cr := DeviceCredential{DeviceID: d.DeviceId, TenantID: d.TenantId, OutletID: d.OutletId, BrandID: string(d.BrandId), Kind: string(d.Kind), Kid: d.Kid, Pub: d.Pub}
+	cr := DeviceCredential{DeviceID: d.DeviceId, TenantID: d.TenantId, OutletID: d.OutletId, BrandID: string(d.BrandId), Kind: string(d.Kind), Kid: d.Kid, Pub: d.Pub, Store: string(d.Store)}
 	if d.Recovers != nil {
 		cr.Recovers = *d.Recovers
 	}

@@ -192,6 +192,12 @@ const (
 	KindPersonal = "personal"
 )
 
+// Store claims of a credential (ADR-0002 A3.5 item 1).
+const (
+	StoreProtected   = "protected"
+	StoreUnprotected = "unprotected"
+)
+
 // Credential is an identity-signed device credential (the part of the offline pack that peers
 // use, ADR-0005 section 6): who the device is and which public key it holds.
 type Credential struct {
@@ -202,6 +208,9 @@ type Credential struct {
 	Kind     string `json:"kind"`
 	Kid      string `json:"kid"`
 	Pub      string `json:"pub"`
+	// Store is the device's own statement of how its local store is held: StoreProtected or
+	// StoreUnprotected (ADR-0002 A3.5 item 1). Always present; fixed for the life of the device id.
+	Store string `json:"store"`
 	// Recovers names the key-lost device this one adopted (A1.3 item 3).
 	Recovers string `json:"recovers,omitempty"`
 	// NotAfter is Unix seconds; a node with an expired pack is refused on the LAN.
