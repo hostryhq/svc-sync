@@ -332,7 +332,7 @@ func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configCl
 		i.fail[pk] = f
 	}
 	i.refreshLock(f)
-	if configClass && f.locked {
+	if configClass && f.locked { // answered without a check; trading facts stay verified (sim RB5)
 		return ProofLocked
 	}
 	if proof == "" {
@@ -343,8 +343,11 @@ func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configCl
 	if hmac.Equal([]byte(proof), []byte("p1:"+hex.EncodeToString(mac.Sum(nil))[:24])) {
 		return ProofValid
 	}
-	if _, seen := f.sids[sid]; !seen {
-		f.sids[sid] = i.now()
+	// Each distinct wrong proof counts (key: sid plus proof digest); an identical retry does not.
+	ph := sha256.Sum256([]byte(proof))
+	fk := sid + "|" + hex.EncodeToString(ph[:12])
+	if _, seen := f.sids[fk]; !seen {
+		f.sids[fk] = i.now()
 		i.refreshLock(f)
 	}
 	return ProofInvalid
