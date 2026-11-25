@@ -61,7 +61,7 @@ func Emit(mux *http.ServeMux, g *service.Gateway, a AdminAuth) {
 	guard := a.Guard()
 	guard.Handle(mux, "POST "+EmitPath, auth.Policy{OperationID: "emitOps", Internal: true, Callers: EmitCallers, ServiceOnly: true},
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			out, err := emitHandle(r, g)
+			out, err := emitHandle(r, g, a.Tenant)
 			if err != nil {
 				writeEmitError(w, r, err)
 				return
@@ -70,7 +70,7 @@ func Emit(mux *http.ServeMux, g *service.Gateway, a AdminAuth) {
 		}))
 }
 
-func emitHandle(r *http.Request, g *service.Gateway) ([]emitResDTO, error) {
+func emitHandle(r *http.Request, g *service.Gateway, users *auth.Verifier) ([]emitResDTO, error) {
 	tc, err := tenancy.Require(r.Context())
 	if err != nil {
 		return nil, apperr.New(apperr.Unauthenticated, "auth.tenant_missing", "tenant context missing")
@@ -92,6 +92,25 @@ func emitHandle(r *http.Request, g *service.Gateway) ([]emitResDTO, error) {
 	if req.TenantID != tc.TenantID.String() {
 		// The body names a tenant other than the one the service token carries.
 		return nil, apperr.New(apperr.Forbidden, "emit.tenant_mismatch", "the request tenant is not the tenant of the service token")
+	}
+	// An interactive emit forwards the user's token next to the service token (ruling 7 (b)). It is verified, and its tenant and
+	// subject must be the request's tenant and the asserted actor of every op. A queued emission carries none.
+	if tok := bearerToken(r); tok != "" {
+		if users == nil {
+			return nil, apperr.New(apperr.Unauthenticated, "auth.invalid_token", "authentication required")
+		}
+		c, err := users.Verify(tok)
+		if err != nil {
+			return nil, apperr.New(apperr.Unauthenticated, "auth.invalid_token", "authentication required")
+		}
+		if c.TenantID != tc.TenantID.String() {
+			return nil, apperr.New(apperr.Forbidden, "emit.user_token_mismatch", "the forwarded user token is not of the request tenant")
+		}
+		for _, o := range req.Ops {
+			if o.Actor != c.Subject {
+				return nil, apperr.New(apperr.Forbidden, "emit.user_token_mismatch", "the forwarded user token is not the actor of every op")
+			}
+		}
 	}
 	ops := make([]service.EmitOp, 0, len(req.Ops))
 	for i, o := range req.Ops {
@@ -132,12 +151,23 @@ func writeEmitError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &ee):
 		apperr.WriteProblem(w, r, apperr.New(apperr.Validation, ee.Code, ee.Detail))
+	case errors.Is(err, service.ErrEmitRateLimited):
+		w.Header().Set("Retry-After", "5")
+		apperr.WriteProblem(w, r, apperr.New(apperr.RateLimited, "emit.rate_limited", "too many ops emitted, retry later with the same keys"))
 	case errors.Is(err, service.ErrEmitUnavailable):
 		w.Header().Set("Retry-After", "5")
 		apperr.WriteProblem(w, r, apperr.New(apperr.Unavailable, "emit.unavailable", "cloud emit is unavailable, retry later"))
 	default:
 		apperr.WriteProblem(w, r, err)
 	}
+}
+
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
 }
 
 // normaliseMuts turns json.Number field values into int64 and refuses everything an op body may not

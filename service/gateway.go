@@ -53,6 +53,7 @@ type Gateway struct {
 	revokedKids map[string]bool
 	eng         map[string]*engine.Engine
 	pokes       map[string]*poker
+	emitBuckets map[string]*emitBucket
 }
 
 type poker struct {

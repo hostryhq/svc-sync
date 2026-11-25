@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hostryhq/go-common/logx"
 	"github.com/hostryhq/svc-sync/engine"
@@ -38,6 +39,54 @@ func (e *EmitError) Error() string { return "service: emit refused: " + e.Code }
 // ErrEmitUnavailable means the gateway cannot accept an emit now (restore in progress or its store
 // is unavailable). Nothing changed; the caller retries with the same keys (503 emit.unavailable).
 var ErrEmitUnavailable = errors.New("service: emit unavailable")
+
+// ErrEmitRateLimited means the caller has used its share of emitted ops (EmitBurst, refilled at EmitRatePerSecond). Nothing was
+// stored; the caller retries later with the same keys (429 emit.rate_limited).
+var ErrEmitRateLimited = errors.New("service: emit rate limited")
+
+// Per-caller emit limits (security ruling 7 (e)): a token bucket of ops per (tenant, calling service). A menu import is some
+// hundreds of ops; a compromised caller cannot flood every device of a tenant faster than this.
+const (
+	EmitBurst         = 1000
+	EmitRatePerSecond = 50
+)
+
+// supportActable lists the permissions that carry the catalogue flag support_actable (api-specs common/permissions.yaml). An emit
+// by a `support:` actor is allowed only when the intent is authorised by one of them (ruling 7 (f)).
+var supportActable = map[string]bool{"catalog.import": true, "sync.quarantine.confirm": true}
+
+type emitBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// takeEmit charges n ops to the caller's bucket and reports whether they fit.
+func (g *Gateway) takeEmit(tenant, caller string, n int) bool {
+	now := g.cfg.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.emitBuckets == nil {
+		g.emitBuckets = map[string]*emitBucket{}
+	}
+	k := tenant + "|" + caller
+	b, ok := g.emitBuckets[k]
+	if !ok {
+		b = &emitBucket{tokens: EmitBurst, at: now}
+		g.emitBuckets[k] = b
+	}
+	if d := now.Sub(b.at).Seconds(); d > 0 {
+		b.tokens += d * EmitRatePerSecond
+		if b.tokens > EmitBurst {
+			b.tokens = EmitBurst
+		}
+		b.at = now
+	}
+	if b.tokens < float64(n) {
+		return false
+	}
+	b.tokens -= float64(n)
+	return true
+}
 
 // EmitOp is one cloud-origin op requested by a service. The gateway chooses origin, seq, ph and hlc.
 type EmitOp struct {
@@ -115,6 +164,9 @@ func (g *Gateway) checkEmit(tenant, callerSvc string, o EmitOp) *EmitError {
 	if in.Owner != callerSvc {
 		return &EmitError{Code: EmitCallerNotOwner}
 	}
+	if strings.HasPrefix(o.Actor, "support:") && (o.AuthorisedBy == nil || !supportActable[*o.AuthorisedBy]) {
+		return &EmitError{Code: EmitCallerNotOwner, Detail: "a support actor needs an intent authorised by a support_actable permission"}
+	}
 	if o.AuthorisedBy != nil {
 		found := false
 		for _, a := range in.AuthorisedBy {
@@ -161,6 +213,9 @@ func (g *Gateway) Emit(ctx context.Context, tenant, callerSvc string, ops []Emit
 		if e := g.checkEmit(tenant, callerSvc, o); e != nil {
 			return nil, e
 		}
+	}
+	if !g.takeEmit(tenant, callerSvc, len(ops)) {
+		return nil, ErrEmitRateLimited
 	}
 	e := g.engineFor(tenant)
 	var res []EmitResult
