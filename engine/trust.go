@@ -64,16 +64,14 @@ func (c *CredCache) Get(device string) (sp.CredentialEnvelope, bool) {
 	return e, ok
 }
 
-// OriginKey implements Trust.
+// OriginKey implements Trust. For a cloud-<epoch> origin it only says whether any op-signing key is
+// installed: a seal is verified under the key its own kid names (OpKey), never under whichever key
+// the cache happens to hold (review L8). The returned key is nil for a cloud origin.
 func (c *CredCache) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if strings.HasPrefix(origin, CloudOriginPrefix) {
-		// The cloud seals with one op-signing key at a time; the seal names the kid, so try all.
-		for _, k := range c.cloudKeys {
-			return k, true
-		}
-		return nil, false
+		return nil, len(c.cloudKeys) > 0
 	}
 	e, ok := c.creds[origin]
 	if !ok {
@@ -81,16 +79,6 @@ func (c *CredCache) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	}
 	pub, err := e.Cred.PubKey()
 	return pub, err == nil
-}
-
-// CloudKey returns the gateway op-signing key from the pack.
-func (c *CredCache) CloudKey() (*ecdsa.PublicKey, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, k := range c.cloudKeys {
-		return k, true
-	}
-	return nil, false
 }
 
 // RevokeCloudKey stops accepting seals and endorsements under an op-signing key (pack refresh

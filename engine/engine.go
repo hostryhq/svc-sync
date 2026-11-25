@@ -591,8 +591,8 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 			}
 			n := 0
 			for _, r := range recs {
-				if r.Body == "" {
-					break // cannot offer a slot known only by hash; the body holder must
+				if r.Body == "" || (!own && hasMarkS(r.Marks, MarkUnbound)) {
+					break // cannot offer a slot known only by hash; the body holder must. An unbound op is never relayed (A2.8 item 1.3).
 				}
 				req.Items = append(req.Items, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
 				n++
@@ -795,8 +795,12 @@ type IngestReq struct {
 	Attestations []sp.Attestation
 	Endorsements []sp.Endorsement
 	Caller       Caller
-	// FromUpstream marks a pull response: placeholders are allowed and trailing placeholders need no seal.
+	// FromUpstream marks a pull response: placeholders are allowed inside a sealed range.
 	FromUpstream bool
+	// FromCloud marks the upstream as the cloud itself. Only the cloud may serve a placeholder above
+	// an origin's sealed head, and a body taken over a placeholder with no seal comes only from it
+	// (A2.8 item 1.1; hubs and peers never).
+	FromCloud bool
 	// Recovery marks a quarantine-upload.
 	Recovery bool
 }
@@ -809,6 +813,8 @@ type IngestRes struct {
 	New     []repository.OpRec
 	// Drained is true when every group of a recovery upload reached its attested seq.
 	Drained bool
+	// StaleCloudSeal: a cloud-origin seal under a key this node does not accept was refused (A2.8 item 2.2).
+	StaleCloudSeal bool
 }
 
 type group struct {
@@ -943,6 +949,9 @@ func (e *Engine) Ingest(ctx context.Context, req IngestReq) (IngestRes, error) {
 	if err != nil {
 		return IngestRes{}, err
 	}
+	if res.StaleCloudSeal {
+		_ = e.cfg.Store.InTx(ctx, e.cfg.Tenant, func(tx repository.Tx) error { return tx.SetMeta(metaStaleSeal, "1") })
+	}
 	for _, b := range applyList {
 		e.applyBody(b)
 	}
@@ -958,6 +967,14 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 	refuse := func(from int, reason string) {
 		for _, it := range g.items[from:] {
 			res.Refused = append(res.Refused, sp.Refusal{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq, Reason: reason})
+		}
+	}
+	if req.FromUpstream {
+		if gated, err := conflictGate(tx, g.origin, g.stream, req.FromCloud); err != nil {
+			return false, err
+		} else if gated {
+			refuse(0, sp.ReasonChainConflict) // takes nothing more of this origin from that upstream (A2.8 item 1.4)
+			return false, nil
 		}
 	}
 	if h := e.cfg.Hooks.Authorize; h != nil {
@@ -1021,6 +1038,12 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 					}
 				}
 			}
+		case rec.H != it.H && req.FromUpstream && !it.IsPlaceholder():
+			// An upstream serves a body that contradicts what this node holds at the slot: never
+			// silent (A2.8 item 1.4). The node keeps what it holds.
+			if err := e.conflict(tx, req, res, rec, it.H); err != nil {
+				return false, err
+			}
 		case rec.H != it.H:
 			if !it.IsPlaceholder() && e.cfg.Hooks.OnFork != nil {
 				if err := e.cfg.Hooks.OnFork(tx, req.Caller, rec, it); err != nil {
@@ -1031,15 +1054,27 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 				res.Refused = append(res.Refused, sp.Refusal{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq, Reason: sp.ReasonFork})
 			}
 		case rec.Status == repository.StPlaceholder && !it.IsPlaceholder() && req.FromUpstream:
-			// A released op reaching a node that held only its slot (RB3). Beyond the last seal of the
-			// origin it must carry an endorsement that passes the rule of A2.1 (the unsealed tail).
-			if sp.Hash(it.Body) != rec.H {
+			// A released op reaching a node that held only its slot (RB3, A2.8 item 1).
+			hb := sp.Hash(it.Body)
+			b, derr := sp.DecodeBody(it.Body)
+			if hb != rec.H {
+				// The body contradicts the hash held for the slot: never silent.
+				if err := e.conflict(tx, req, res, rec, hb); err != nil {
+					return false, err
+				}
 				continue
 			}
-			// An endorsement that comes with the body must pass the rule of A2.1; a body without one
-			// is an ordinary released slot, taken by hash as before (the placeholder's hash came from
-			// the same authenticated upstream).
+			if derr != nil {
+				continue
+			}
+			if b.TenantID != e.cfg.Tenant || b.Origin != rec.Origin || b.Stream != rec.Stream || b.Seq != rec.Seq {
+				res.Refused = append(res.Refused, sp.Refusal{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq, Reason: sp.ReasonFramed})
+				continue
+			}
+			endorsed := false
 			if en, has := g.ends[endKey(it.Origin, it.Stream, it.Seq)]; has {
+				// An endorsement that comes with the body must pass the rule of A2.1 (the released
+				// unsealed tail); it also binds the slot, naming (origin, stream, seq, h).
 				att, ok := e.endorsedOK(tx, en, rec.H, req.Attestations, func(q int64) (string, bool) { return heldHash(tx, g, q) })
 				if !ok {
 					continue
@@ -1051,12 +1086,45 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 					return false, err
 				}
 				rec.Marks = MarkUnsealed
+				endorsed = true
 			}
-			b, err := sp.DecodeBody(it.Body)
-			if err != nil {
-				continue
+			bind := bindOK
+			if !endorsed {
+				if !req.FromCloud && !e.sealedAtOrAbove(tx, seals, rec) {
+					// No placeholder is filled by hash above the origin's sealed head except by the
+					// cloud; above it only the endorsement rule of A2.1 applies (A2.8 item 1.1).
+					res.Refused = append(res.Refused, sp.Refusal{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq, Reason: sp.ReasonUnsealed})
+					continue
+				}
+				var seen string
+				var berr error
+				bind, seen, berr = e.bindSlot(tx, g, seals, rec, hb, b)
+				if berr != nil {
+					return false, berr
+				}
+				if bind == conflict {
+					if err := e.conflict(tx, req, res, rec, seen); err != nil {
+						return false, err
+					}
+					continue
+				}
 			}
-			rec.Body, rec.Status, rec.Intent, rec.HLC = it.Body, repository.StAccepted, b.Intent, b.HLC
+			if bind == unbound {
+				rec.Marks = withMark(rec.Marks, MarkUnbound)
+				if err := addUnbound(tx, sp.Ref{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq}); err != nil {
+					return false, err
+				}
+			} else if rec.Seq > 1 {
+				// The body is bound: the slot below, if it was taken unbound, is bound by this link.
+				if lo, ok, err := tx.GetOp(rec.Stream, rec.Origin, rec.Seq-1); err != nil {
+					return false, err
+				} else if ok && lo.H == b.PH {
+					if err := clearUnbound(tx, lo); err != nil {
+						return false, err
+					}
+				}
+			}
+			rec.Body, rec.PH, rec.Status, rec.Intent, rec.HLC = it.Body, b.PH, repository.StAccepted, b.Intent, b.HLC
 			if err := tx.UpdateOp(rec); err != nil {
 				return false, err
 			}
@@ -1091,6 +1159,45 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 				refuse(0, sp.ReasonFramed)
 				return false, nil
 			}
+		}
+	}
+	// A new op that does not link to a head slot taken by hash and still unbound contradicts it
+	// (A2.8 item 1.2: "when a later pull supplies the op above, the link is checked then").
+	if req.FromUpstream && head > 0 && !items[0].IsPlaceholder() && sp.Hash(items[0].Body) == items[0].H {
+		if hr, ok, err := tx.GetOp(g.stream, g.origin, head); err != nil {
+			return false, err
+		} else if ok && hasMarkS(hr.Marks, MarkUnbound) {
+			if b0, derr := sp.DecodeBody(items[0].Body); derr == nil && b0.PH != hr.H {
+				if err := noteConflict(tx, sp.Conflict{Origin: g.origin, Stream: g.stream, Seq: head, Held: hr.H, Seen: b0.PH}, srcOf(req.FromCloud)); err != nil {
+					return false, err
+				}
+				refuse(0, sp.ReasonChainConflict)
+				return false, nil
+			}
+		}
+	}
+	// A cloud-origin seal under a key this node does not accept is noted: the node reads that origin
+	// from the cloud directly until its hub has refreshed the seal (A2.8 item 2.2).
+	if req.FromUpstream && strings.HasPrefix(g.origin, CloudOriginPrefix) {
+		if rt, ok := e.cfg.Trust.(RecoveryTrust); ok {
+			for _, sl := range seals {
+				if sl.Origin == g.origin && sl.Stream == g.stream {
+					if _, ok := rt.OpKey(sl.Kid); !ok {
+						res.StaleCloudSeal = true
+					}
+				}
+			}
+		}
+	}
+	// The signed body names the tenant; it must be this node's tenant (review M3). Neither the seal
+	// nor the genesis hash binds it, so the check is here, for device, hub and cloud alike.
+	for _, it := range items {
+		if it.IsPlaceholder() || sp.Hash(it.Body) != it.H {
+			continue
+		}
+		if b, derr := sp.DecodeBody(it.Body); derr == nil && b.TenantID != e.cfg.Tenant {
+			refuse(0, sp.ReasonFramed)
+			return false, nil
 		}
 	}
 	// Walk the chain; find the highest op covered by a valid seal.
@@ -1173,8 +1280,9 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			covered = endTo
 		}
 	}
-	// Trailing placeholders from the cloud need no seal.
-	if req.FromUpstream && chainOK {
+	// Trailing placeholders from the cloud need no seal; from any other upstream a placeholder is
+	// accepted only inside a range a seal or endorsement covers (A2.8 item 1.1).
+	if req.FromUpstream && req.FromCloud && chainOK {
 		j := len(steps)
 		for j > covered && steps[j-1].p.Item.IsPlaceholder() {
 			j--
@@ -1226,6 +1334,13 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			if err := tx.PutOp(rec); err != nil {
 				return false, err
 			}
+			// A seal that names a placeholder slot is kept too: it is what lets this node serve the slot
+			// onward (a relay serves no placeholder above a sealed head, A2.8 item 1.1).
+			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && i < len(steps) && steps[i].sealed {
+				if err := tx.PutSeal(it.Stream, it.Origin, it.Seq, sl.H, sl.Kid, sl.Sig); err != nil {
+					return false, err
+				}
+			}
 			res.New = append(res.New, rec)
 			continue
 		}
@@ -1276,6 +1391,18 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		if len(it.PII) > 0 {
 			if err := tx.PutPII(it.Stream, it.Origin, it.Seq, string(it.PII)); err != nil {
 				return false, err
+			}
+		}
+	}
+	if req.FromUpstream && head > 0 && len(items) > 0 && !items[0].IsPlaceholder() {
+		// The first stored op links to the head slot: that binds a head taken unbound.
+		if hr, ok, err := tx.GetOp(g.stream, g.origin, head); err != nil {
+			return false, err
+		} else if ok && hasMarkS(hr.Marks, MarkUnbound) {
+			if b0, derr := sp.DecodeBody(items[0].Body); derr == nil && b0.PH == hr.H {
+				if err := clearUnbound(tx, hr); err != nil {
+					return false, err
+				}
 			}
 		}
 	}
@@ -1417,7 +1544,7 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 			if err != nil {
 				return err
 			}
-			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) {
+			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) && (e.cfg.Role == RoleCloud || !hasMarkS(rec.Marks, MarkUnbound)) {
 				resp.Items = append(resp.Items, sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body})
 				if en, ok, err := tx.GetEndorsement(rec.Stream, rec.Origin, rec.Seq); err != nil {
 					return err
@@ -1441,6 +1568,17 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 						resp.Creds = append(resp.Creds, c)
 					}
 				}
+			}
+		}
+		// Cloud seals under a key the caller dropped: the current ones (A2.8 item 2).
+		for _, r := range req.StaleSeals {
+			if !strings.HasPrefix(r.Origin, CloudOriginPrefix) || (len(o.Streams) > 0 && !contains(o.Streams, r.Stream)) || len(resp.SealRefresh) >= 200 {
+				continue
+			}
+			if kid, sig, h, ok, err := tx.GetSeal(r.Stream, r.Origin, r.Seq); err != nil {
+				return err
+			} else if ok {
+				resp.SealRefresh = append(resp.SealRefresh, sp.Seal{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: h, Kid: kid, Sig: sig})
 			}
 		}
 		// Own held list (A1.2): the complete current set.
@@ -1469,6 +1607,28 @@ func (e *Engine) serveRange(tx repository.Tx, h repository.HeadRow, after int64,
 	if err != nil {
 		return nil, nil, false, err
 	}
+	if e.cfg.Role != RoleCloud {
+		// A relay never serves an unbound op, nor anything after it in the origin's chain (A2.8 item 1.3).
+		ub, err := unboundRefs(tx)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		var first int64
+		for _, u := range ub {
+			if u.Origin == h.Origin && u.Stream == h.Stream && u.Seq > after && (first == 0 || u.Seq < first) {
+				first = u.Seq
+			}
+		}
+		if first > 0 {
+			kept := bounds[:0:0]
+			for _, b := range bounds {
+				if b < first {
+					kept = append(kept, b)
+				}
+			}
+			bounds = kept
+		}
+	}
 	var cut int64
 	for _, s := range bounds {
 		if s-after <= int64(budget) {
@@ -1493,8 +1653,9 @@ func (e *Engine) serveRange(tx repository.Tx, h repository.HeadRow, after int64,
 			more = true
 		}
 	}
-	// Trailing slots with no body served (quarantined / voided) need no seal.
-	if cut == 0 || cut == bounds[len(bounds)-1] {
+	// Trailing slots with no body served (quarantined / voided) need no seal, from the cloud only: a
+	// relay serves no placeholder above a sealed head (A2.8 item 1.1).
+	if e.cfg.Role == RoleCloud && (cut == 0 || cut == bounds[len(bounds)-1]) {
 		start := cut
 		if start == 0 {
 			start = after
@@ -1645,9 +1806,10 @@ func (e *Engine) RecoveryUpload(ctx context.Context, old string, up sp.Vector, l
 func (e *Engine) sealOK(s sp.Seal, origin string, originPub *ecdsa.PublicKey) bool {
 	if strings.HasPrefix(origin, CloudOriginPrefix) {
 		if rt, ok := e.cfg.Trust.(RecoveryTrust); ok {
-			k, ok := rt.OpKey(s.Kid)
+			k, ok := rt.OpKey(s.Kid) // the named kid only; a revoked or unknown kid is refused
 			return ok && s.Verify(k)
 		}
+		return false
 	}
-	return s.Verify(originPub)
+	return originPub != nil && s.Verify(originPub)
 }

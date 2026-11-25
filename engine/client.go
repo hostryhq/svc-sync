@@ -75,9 +75,32 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		return nil
 	})
 	sent := cfg.Clock.Time()
-	hello, err := c.T.Hello(ctx, sp.HelloRequest{Protocol: sp.ProtocolVersion, Vector: vec, Epoch: lastEpoch})
+	hreq := sp.HelloRequest{Protocol: sp.ProtocolVersion, Vector: vec, Epoch: lastEpoch}
+	if c.UpstreamIsCloud {
+		// Only the cloud can check a slot taken by hash and only it takes a conflict report (A2.8 item 1.3, 1.4).
+		if hreq.Unbound, err = c.E.UnboundSlots(ctx); err != nil {
+			return res, err
+		}
+		if hreq.Conflicts, err = c.E.Conflicts(ctx, true); err != nil {
+			return res, err
+		}
+	}
+	hello, err := c.T.Hello(ctx, hreq)
 	if err != nil {
 		return res, err
+	}
+	if c.UpstreamIsCloud {
+		if err := c.E.NoteCloudHello(ctx); err != nil {
+			return res, err
+		}
+		if err := c.E.ResolveUnbound(ctx, hello.UnboundH); err != nil {
+			return res, err
+		}
+		if len(hreq.Conflicts) > 0 {
+			if err := c.E.markReported(ctx); err != nil {
+				return res, err
+			}
+		}
 	}
 	if hello.Time != "" {
 		if ut, err := time.Parse(time.RFC3339Nano, hello.Time); err == nil {
@@ -171,8 +194,15 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		if err != nil {
 			return res, err
 		}
-		pr, err := c.T.Pull(ctx, sp.PullRequest{Vector: vec, Streams: c.Streams, Placeholders: pl})
+		stale, err := c.E.StaleSeals(ctx, 200)
 		if err != nil {
+			return res, err
+		}
+		pr, err := c.T.Pull(ctx, sp.PullRequest{Vector: vec, Streams: c.Streams, Placeholders: pl, StaleSeals: stale})
+		if err != nil {
+			return res, err
+		}
+		if _, err := c.E.RefreshSeals(ctx, pr.SealRefresh); err != nil {
 			return res, err
 		}
 		c.OwnHeld, c.RelayHeld = pr.OwnHeld, pr.RelayHeld
@@ -184,7 +214,7 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		if len(pr.Items) == 0 {
 			break
 		}
-		ir, err := c.E.Ingest(ctx, IngestReq{Items: pr.Items, Seals: pr.Seals, Endorsements: pr.Endorsements, Attestations: pr.Attestations, FromUpstream: true, Caller: Caller{ID: "upstream"}})
+		ir, err := c.E.Ingest(ctx, IngestReq{Items: pr.Items, Seals: pr.Seals, Endorsements: pr.Endorsements, Attestations: pr.Attestations, FromUpstream: true, FromCloud: c.UpstreamIsCloud, Caller: Caller{ID: "upstream"}})
 		if err != nil {
 			return res, err
 		}

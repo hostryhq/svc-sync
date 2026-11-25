@@ -171,8 +171,8 @@ func (d *Device) Sync(ctx context.Context) error {
 		}
 	} else {
 		d.W.Via.HubOK++
-		if d.HubC.ReofferPending(ctx) && !d.KeyLost {
-			// After a cloud restore the origin re-offers directly: the hub may hold only a placeholder.
+		if (d.HubC.ReofferPending(ctx) || d.Eng.DirectCloudDue(ctx)) && !d.KeyLost {
+			// After a cloud restore the origin re-offers directly: the hub may hold only a placeholder. A node also reaches the cloud directly at least every 24 hours and whenever an unbound slot, an unreported conflict or a stale cloud seal waits (A2.8).
 			_ = d.SyncCloud(ctx)
 		}
 	}

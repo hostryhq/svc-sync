@@ -309,7 +309,11 @@ func (g *Gateway) Hello(ctx context.Context, tenant string, c engine.Caller, req
 	if err := g.noteGaps(ctx, tenant, req.Vector, vec); err != nil {
 		return sp.HelloResponse{}, err
 	}
-	return sp.HelloResponse{
+	unboundH, err := g.answerUnbound(ctx, tenant, c, req)
+	if err != nil {
+		return sp.HelloResponse{}, err
+	}
+	return sp.HelloResponse{UnboundH: unboundH,
 		Protocol: sp.ProtocolVersion, Role: string(engine.RoleCloud), NodeID: "gateway", Time: g.cfg.Now().UTC().Format(time.RFC3339Nano),
 		Epoch: g.Epoch(), Vector: out, CloudVector: out, MinSupportedVersion: g.cfg.MinSupportedVersion, Streams: list,
 	}, nil
@@ -477,10 +481,9 @@ func (g *Gateway) publish(tx repository.Tx, rec repository.OpRec) error {
 		ID: g.cfg.IDs.New(), Type: "sync.op.stored", V: 1, Source: "sync", TenantID: ids.ID(tx.Tenant()),
 		Key: rec.Origin + "/" + rec.Stream, KeySeq: rec.Seq, OccurredAt: g.cfg.Now(), Actor: rec.Origin, Epoch: g.Epoch(), Data: data,
 	}
-	if env.TenantID != "" {
-		if _, err := ids.Parse(string(env.TenantID)); err != nil {
-			return nil // test tenants that are not UUIDs publish nothing
-		}
+	if _, err := ids.Parse(string(env.TenantID)); err != nil {
+		// Never drop an event silently (review L5): an accepted op that cannot be published must not be stored.
+		return fmt.Errorf("service: tenant id %q is not a UUID; refusing to store an op that cannot be published", tx.Tenant())
 	}
 	return outbox.Publish(context.Background(), tx.SQLTx(), env)
 }
@@ -490,4 +493,48 @@ var ErrNotFound = errors.New("service: not found")
 
 func (g *Gateway) alert(tx repository.Tx, aud, sev, kind string, rec repository.OpRec) error {
 	return tx.AddAlert(aud, sev, kind, fmt.Sprintf("%s/%s/%d", rec.Origin, rec.Stream, rec.Seq))
+}
+
+// answerUnbound answers a node's list of slots taken by hash with the cloud's own hash for each, and
+// raises a vendor alert for every chain conflict the node reports (A2.8 items 1.3 and 1.4). Only
+// slots of streams the caller may read are answered or alerted.
+func (g *Gateway) answerUnbound(ctx context.Context, tenant string, c engine.Caller, req sp.HelloRequest) ([]sp.SlotHash, error) {
+	if len(req.Unbound) == 0 && len(req.Conflicts) == 0 {
+		return nil, nil
+	}
+	var out []sp.SlotHash
+	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
+		out = out[:0]
+		for i, u := range req.Unbound {
+			if i >= 500 || !streamAllowed(c, tenant, u.Stream) {
+				continue
+			}
+			rec, ok, err := tx.GetOp(u.Stream, u.Origin, u.Seq)
+			if err != nil {
+				return err
+			}
+			if ok {
+				out = append(out, sp.SlotHash{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H})
+			}
+		}
+		for i, cf := range req.Conflicts {
+			if i >= 100 || !streamAllowed(c, tenant, cf.Stream) {
+				continue
+			}
+			key := fmt.Sprintf("%s/%s/%d", cf.Origin, cf.Stream, cf.Seq)
+			if _, done, err := tx.GetMeta("chain-conflict-alerted:" + key); err != nil {
+				return err
+			} else if done {
+				continue
+			}
+			if err := tx.AddAlert("vendor", "high", "chain_conflict", key); err != nil {
+				return err
+			}
+			if err := tx.SetMeta("chain-conflict-alerted:"+key, "1"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return out, err
 }

@@ -258,6 +258,8 @@ const (
 	ReasonRecovery    = "recovery_not_authorised"
 	ReasonRelayedOnly = "relay_not_allowed"
 	ReasonFork        = "fork_evidence_kept"
+	// ReasonChainConflict: a body or link contradicts what the node holds or a seal states (A2.8 item 1).
+	ReasonChainConflict = "chain_conflict"
 )
 
 // HelloRequest opens a sync contact.
@@ -270,6 +272,29 @@ type HelloRequest struct {
 	Epoch string `json:"epoch,omitempty"`
 	// CloudVector is the cloud vector the node last saw (a hub passes it on).
 	CloudVector Vector `json:"cloud_vector,omitempty"`
+	// Unbound lists the slots this node took by hash with no binding yet (A2.8 item 1.3). Only the
+	// cloud answers it; a node lists it at every direct cloud hello.
+	Unbound []Ref `json:"unbound,omitempty"`
+	// Conflicts reports the chain conflicts this node recorded and has not yet reported (A2.8 item 1.4).
+	Conflicts []Conflict `json:"chain_conflicts,omitempty"`
+}
+
+// SlotHash is a slot with the hash a node holds or the cloud states for it.
+type SlotHash struct {
+	Origin string `json:"origin"`
+	Stream string `json:"stream"`
+	Seq    int64  `json:"seq"`
+	H      string `json:"h"`
+}
+
+// Conflict is a recorded chain conflict: the hash the node holds and the one the upstream or the
+// cloud contradicted it with (A2.8 item 1.4).
+type Conflict struct {
+	Origin string `json:"origin"`
+	Stream string `json:"stream"`
+	Seq    int64  `json:"seq"`
+	Held   string `json:"held"`
+	Seen   string `json:"seen,omitempty"`
 }
 
 // HelloResponse answers hello.
@@ -284,6 +309,8 @@ type HelloResponse struct {
 	MinSupportedVersion string   `json:"min_supported_version"`
 	SnapshotRequired    bool     `json:"snapshot_required"`
 	Streams             []string `json:"streams"`
+	// UnboundH answers HelloRequest.Unbound with the cloud's own hash for each slot it holds.
+	UnboundH []SlotHash `json:"unbound_h,omitempty"`
 }
 
 // PushRequest delivers ops. Items must be in origin-sequence order per (origin, stream);
@@ -316,7 +343,10 @@ type PullRequest struct {
 	Streams []string `json:"streams,omitempty"`
 	// Placeholders lists slots the caller holds only as placeholders, to receive them if released.
 	Placeholders []Ref `json:"placeholders,omitempty"`
-	Limit        int   `json:"limit,omitempty"`
+	// StaleSeals lists stored cloud-origin seals under an op-signing key the caller no longer accepts;
+	// the answer carries the current seal for each (A2.8 item 2).
+	StaleSeals []Ref `json:"stale_seals,omitempty"`
+	Limit      int   `json:"limit,omitempty"`
 }
 
 // PullResponse returns the missing slots.
@@ -329,7 +359,9 @@ type PullResponse struct {
 	// the ops of a released unsealed tail, as seals and credentials do (A2.1 item 3).
 	Endorsements []Endorsement `json:"endorsements,omitempty"`
 	Attestations []Attestation `json:"attestations,omitempty"`
-	More         bool          `json:"more"`
+	// SealRefresh answers PullRequest.StaleSeals with the seals as the upstream now holds them.
+	SealRefresh []Seal `json:"seal_refresh,omitempty"`
+	More        bool   `json:"more"`
 	// OwnHeld is the complete current list of the caller's own held slots (A1.2).
 	OwnHeld []HeldSlot `json:"own_held"`
 	// RelayHeld is given to nodes with role hub: held slots of the origins it relays.
