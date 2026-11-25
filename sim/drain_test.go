@@ -8,41 +8,11 @@ import (
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
-// statementOf builds the drain statement a device signs: every stream in which its log holds an own-origin op with
-// the head, and every series of its pack with the last number it allocated (ADR-0005 A3.3 item 1).
 func (w *World) statementOf(t *testing.T, d *Device, key *sp.KeyPair, edit func(*sp.DrainStatement)) sp.DrainStatement {
 	t.Helper()
-	st := sp.DrainStatement{Origin: d.ID, By: d.ID, At: w.Clock.Now().UTC().Format("2006-01-02T15:04:05Z"), Streams: []sp.DrainStream{}, Series: []sp.DrainSeriesLast{}}
-	must0(d.Eng.InTxLocked(bg, func(tx repository.Tx) error {
-		hs, err := tx.Heads()
-		if err != nil {
-			return err
-		}
-		for _, h := range hs {
-			if h.Origin != d.ID {
-				continue
-			}
-			op, _, err := tx.GetOp(h.Stream, h.Origin, h.Seq)
-			if err != nil {
-				return err
-			}
-			st.Streams = append(st.Streams, sp.DrainStream{Stream: h.Stream, Seq: h.Seq, H: op.H})
-		}
-		for _, s := range w.Identity.SeriesOf(w.Tenant, d.ID) {
-			n, err := tx.PeekNumber(s.Code, engine.FY(w.Clock.Now()))
-			if err != nil {
-				return err
-			}
-			st.Series = append(st.Series, sp.DrainSeriesLast{SeriesID: "series-" + s.Code, Code: s.Code, FY: engine.FY(w.Clock.Now()), LastNumber: n})
-		}
-		return nil
-	}))
-	if edit != nil {
-		edit(&st)
-	}
-	signed, err := sp.MakeDrainStatement(key, st)
+	st, err := w.StatementOf(d, key, edit)
 	must0(err)
-	return signed
+	return st
 }
 
 // drainWorld revokes a POS that holds unsent ops and uploads them to quarantine, as the drain token of the device.

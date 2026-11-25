@@ -72,7 +72,7 @@ func appDSN(t *testing.T, admin string) string {
 
 func clean(t *testing.T, st repository.Store) {
 	t.Helper()
-	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state, vendor_access_log, audit_log`)
+	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state, vendor_access_log, audit_log, approval_verdicts, drain_statements, series_numbers, emit_dedup`)
 	if err != nil {
 		t.Fatal(err)
 	}

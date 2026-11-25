@@ -23,6 +23,8 @@ import (
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/directory/dirtest"
 	"github.com/hostryhq/svc-sync/identityclient"
+	"github.com/hostryhq/svc-sync/realdir"
+	sp "github.com/hostryhq/svc-sync/syncproto"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -42,7 +44,7 @@ type fixture struct {
 	packV    int
 	opened   time.Time
 	proofKey []byte
-	dir      *identityclient.Directory
+	dir      *realdir.Directory
 }
 
 func newFixture(t *testing.T) *fixture { return newFixtureOn(t, double.Options{}) }
@@ -94,14 +96,7 @@ func newFixtureOn(t *testing.T, o double.Options) *fixture {
 		t.Fatal(err)
 	}
 	cl.Sleep = func(context.Context, time.Duration) {}
-	f.dir = &identityclient.Directory{Client: cl, Clock: f.d.Clock.Now,
-		// The op does not carry pin_v or opened_at yet (contract/README.md, open question 1): the test supplies them.
-		Proof: func(_, device, actor, _ string) (identityclient.ProofParams, bool) {
-			if device != f.dev.ID {
-				return identityclient.ProofParams{}, false
-			}
-			return identityclient.ProofParams{PackV: f.packV, PinV: 1, OpenedAt: f.opened}, true
-		}}
+	f.dir = &realdir.Directory{Identity: cl, Clock: f.d.Clock.Now}
 	return f
 }
 
@@ -178,12 +173,18 @@ func (f *fixture) proof(sid string) string {
 	return double.SessionProof(f.proofKey, sid, f.dev.ID, f.staff, f.packV, 1, f.opened)
 }
 
+// question is what the gateway asks about the proof of session sid (A3.1): every field the proof binds.
+func (f *fixture) question(sid string) directory.ProofQuestion {
+	return directory.ProofQuestion{Kind: directory.ProofKindSession, Device: f.dev.ID, Member: f.staff, SID: sid, PackV: f.packV, PinV: 1,
+		OpenedAt: f.opened, Proof: f.proof(sid)}
+}
+
 // The security condition: stub and real identity answer `locked` alike, for every op kind. The same contract
 // runs against the stub in svc-sync/identitystub.
 func TestRealIdentityAnswersLockedLikeTheStub(t *testing.T) {
 	f := newFixture(t)
-	dirtest.Run(t, dirtest.Target{Dir: f.dir, Tenant: tenant, Device: f.dev.ID, Actor: f.staff,
-		Valid: f.proof, Wrong: func(i int) string { return fmt.Sprintf("wrong-%d", i) }})
+	dirtest.Run(t, dirtest.Target{Dir: f.dir, Tenant: tenant,
+		Valid: f.question, Wrong: func(i int) string { return fmt.Sprintf("wrong-%d", i) }})
 }
 
 // The same contract against identity assembled over Postgres (its real repository, row-level security and
@@ -219,58 +220,133 @@ func TestRealIdentityOverPostgresAnswersLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := newFixtureOn(t, double.Options{Store: st, AccessLog: &postgres.AccessLog{DB: st.DB(), Role: "identity_app"}, Idem: postgres.NewIdempotency(st)})
-	dirtest.Run(t, dirtest.Target{Dir: f.dir, Tenant: tenant, Device: f.dev.ID, Actor: f.staff,
-		Valid: f.proof, Wrong: func(i int) string { return fmt.Sprintf("wrong-%d", i) }})
+	dirtest.Run(t, dirtest.Target{Dir: f.dir, Tenant: tenant,
+		Valid: f.question, Wrong: func(i int) string { return fmt.Sprintf("wrong-%d", i) }})
 }
 
 // Another tenant's service token never sees this tenant's members: the same proof is not valid there.
 func TestRealIdentityProofIsTenantScoped(t *testing.T) {
 	f := newFixture(t)
 	other := testkit.TenantB.String()
-	if got := f.dir.CheckProof(other, f.dev.ID, f.staff, "s0", f.proof("s0"), false); got == directory.ProofValid || got == directory.ProofLocked {
+	ask := func(tenant string, q directory.ProofQuestion) directory.ProofResult {
+		q.Key = fmt.Sprintf("scoped-%d", n)
+		n++
+		return f.dir.VerifyProof(tenant, q)
+	}
+	if got := ask(other, f.question("s0")); got == directory.ProofValid || got == directory.ProofLocked {
 		t.Fatalf("a proof for another tenant's member must not verify: %v", got)
 	}
-	if got := f.dir.CheckProof(tenant, f.dev.ID, f.staff, "s0", f.proof("s0"), false); got != directory.ProofValid {
+	if got := ask(tenant, f.question("s0")); got != directory.ProofValid {
 		t.Fatalf("own tenant: %v", got)
 	}
-	if got := f.dir.CheckProof(tenant, f.dev.ID, f.staff, "s0", "", false); got != directory.ProofMissing {
+	q := f.question("s0")
+	q.Proof = ""
+	if got := ask(tenant, q); got != directory.ProofMissing {
 		t.Fatalf("no proof: %v", got)
 	}
 }
 
-// Pack history is judged against the pack the device held; the revocation feed and the drain report work end to end.
-func TestRealIdentityPackHistoryRevocationAndDrain(t *testing.T) {
+// A question repeated under the same Idempotency-Key is a replay at identity: the failure is counted once (A3.1 item 2).
+func TestRealIdentityReplayedQuestionCountsOnce(t *testing.T) {
 	f := newFixture(t)
-	if !f.dir.InAnyPack(tenant, f.dev.ID, f.staff) {
-		t.Fatal("the member is in the pack the device holds")
+	q := f.question("s0")
+	q.Proof, q.Key = "wrong", "sync:dev:outlet:1"
+	for i := 0; i < 20; i++ {
+		if got := f.dir.VerifyProof(tenant, q); got != directory.ProofInvalid {
+			t.Fatalf("replay %d answered %v", i, got)
+		}
 	}
-	if f.dir.InAnyPack(tenant, f.dev.ID, string(ids.New())) {
-		t.Fatal("a member that was never in the pack is not in any pack")
+	// Four more distinct failures stay below the cap of five in fifteen minutes, so the right proof is still valid.
+	for i := 0; i < 3; i++ {
+		q.Proof, q.Key = fmt.Sprintf("wrong-%d", i), fmt.Sprintf("sync:dev:outlet:%d", i+2)
+		f.dir.VerifyProof(tenant, q)
 	}
-	if err := f.dir.Poll(context.Background()); err != nil {
+	good := f.question("s9")
+	good.Key = "sync:dev:outlet:99"
+	if got := f.dir.VerifyProof(tenant, good); got != directory.ProofValid {
+		t.Fatalf("20 replays of one failure counted more than once: %v", got)
+	}
+}
+
+// The directory routes of ADR-0005 A3.2 against real identity: the credential in any state, the pack an issued
+// version granted, the member's current grants, pack history without a version, the revocation feed with its reason
+// and the drain report with the statement the device signed itself.
+func TestRealIdentityDirectoryRoutesAndDrain(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	cred, ok := f.dir.Credential(tenant, f.dev.ID)
+	if !ok || cred.Cred.DeviceID != f.dev.ID || cred.Cred.OutletID != outletA || cred.Cred.Kid != f.dev.KID() || cred.Cred.Kind != sp.KindPOS {
+		t.Fatalf("credential: %+v %v", cred, ok)
+	}
+	if pub, err := cred.Cred.PubKey(); err != nil || !pub.Equal(&f.dev.Priv.PublicKey) {
+		t.Fatalf("the credential's key is the device's key: %v", err)
+	}
+	if _, ok := f.dir.Credential(testkit.TenantB.String(), f.dev.ID); ok {
+		t.Fatal("another tenant's token must not read the credential")
+	}
+	if _, ok := f.dir.Credential(tenant, string(ids.New())); ok {
+		t.Fatal("an unknown device has no credential")
+	}
+	pk, ok := f.dir.PackFor(tenant, f.dev.ID, f.packV)
+	if !ok || pk.Version != f.packV || pk.Members[f.staff] == nil || pk.Expires.IsZero() {
+		t.Fatalf("pack: %+v %v", pk, ok)
+	}
+	if _, ok := f.dir.PackFor(tenant, f.dev.ID, f.packV+100); ok {
+		t.Fatal("a pack never issued is not found")
+	}
+	for perm := range pk.Members[f.staff] {
+		if !f.dir.StillHolds(tenant, outletA, f.staff, perm) {
+			t.Fatalf("the member still holds %s", perm)
+		}
+	}
+	if f.dir.StillHolds(tenant, outletA, f.staff, "bill.void") || f.dir.StillHolds(tenant, outletA, string(ids.New()), "member.read") {
+		t.Fatal("a permission the member never held, and a member that does not exist, hold nothing")
+	}
+	if !f.dir.InAnyPack(tenant, f.dev.ID, f.staff) || f.dir.InAnyPack(tenant, f.dev.ID, string(ids.New())) {
+		t.Fatal("pack history: the staff member is in a pack the device held, a stranger is not")
+	}
+	if _, ok := f.dir.RecoveryFor(tenant, f.dev.ID); ok {
+		t.Fatal("no recovery was made")
+	}
+	if _, lk := f.dir.StrongSession(tenant, string(ids.New())); lk != directory.NotFound {
+		t.Fatalf("an unknown session: %v", lk)
+	}
+	if err := f.dir.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if revoked, _ := f.dir.Revoked(tenant, f.dev.ID); revoked {
 		t.Fatal("not revoked yet")
 	}
 	f.call(200, "PUT", "/v1/devices/"+f.dev.ID+"/revocation", f.owner, map[string]any{"reason": "lost"}, nil)
-	if err := f.dir.Poll(context.Background()); err != nil {
+	if err := f.dir.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if revoked, _ := f.dir.Revoked(tenant, f.dev.ID); !revoked {
-		t.Fatal("the feed must show the revoked device")
+	if revoked, reason := f.dir.Revoked(tenant, f.dev.ID); !revoked || reason != "revoked" {
+		t.Fatalf("the feed shows the revoked device with its reason: %v %q", revoked, reason)
 	}
 	if revoked, _ := f.dir.Revoked(testkit.TenantB.String(), f.dev.ID); revoked {
 		t.Fatal("the feed entry belongs to its organisation only")
 	}
-	ctx := context.Background()
-	if err := f.dir.RecordDrained(ctx, tenant, f.dev.ID, map[string]int64{"outlet:" + outletA: 7}); err != nil {
+	// The credential is answered in any state: a revoked device's key still verifies its drain statement.
+	if _, ok := f.dir.Credential(tenant, f.dev.ID); !ok {
+		t.Fatal("the credential of a revoked device is still answered")
+	}
+	// The drain report carries the statement the device signed itself; identity verifies it and the series set.
+	key := &sp.KeyPair{Kid: f.dev.KID(), Priv: f.dev.Priv}
+	st, err := sp.MakeDrainStatement(key, sp.DrainStatement{Origin: f.dev.ID, By: f.dev.ID, At: f.d.Clock.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		Streams: []sp.DrainStream{{Stream: "outlet:" + outletA, Seq: 7, H: strings.Repeat("ab", 32)}}, Series: []sp.DrainSeriesLast{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(st)
+	rep := directory.DrainReport{Key: "drain-key-1", Through: map[string]int64{"outlet:" + outletA: 7}, Statement: raw}
+	if err := f.dir.RecordDrained(ctx, tenant, f.dev.ID, rep); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if err := f.dir.RecordDrained(ctx, tenant, f.dev.ID, map[string]int64{"outlet:" + outletA: 7}); err != nil {
+	if err := f.dir.RecordDrained(ctx, tenant, f.dev.ID, rep); err != nil {
 		t.Fatalf("a second report of the same drain is the same answer: %v", err)
 	}
-	if err := f.dir.RecordDrained(ctx, tenant, string(ids.New()), map[string]int64{"s": 1}); err == nil {
+	if err := f.dir.RecordDrained(ctx, tenant, string(ids.New()), rep); err == nil {
 		t.Fatal("a device identity does not know cannot be drained")
 	}
 }
