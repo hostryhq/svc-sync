@@ -455,7 +455,7 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 		for _, m := range b.Muts {
 			if m.E == "session" {
 				st, _ := m.F["type"].(string)
-				if err := tx.PutSession(origin, m.ID, st); err != nil {
+				if err := tx.PutSession(origin, m.ID, st, b.At); err != nil {
 					return sp.Item{}, sp.Body{}, err
 				}
 			}
@@ -1517,7 +1517,7 @@ func (e *Engine) storeOp(tx repository.Tx, rec *repository.OpRec, b *sp.Body, v 
 		for _, m := range b.Muts {
 			if m.E == "session" {
 				st, _ := m.F["type"].(string)
-				if err := tx.PutSession(rec.Origin, m.ID, st); err != nil {
+				if err := tx.PutSession(rec.Origin, m.ID, st, b.At); err != nil {
 					return err
 				}
 			}

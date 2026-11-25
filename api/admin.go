@@ -94,6 +94,8 @@ type exceptionDTO struct {
 	Stream string `json:"stream"`
 	Seq    int64  `json:"seq"`
 	Flag   string `json:"flag"`
+	// Reason is why an approval_flag was raised (api-specs Exception.reason); absent on any other flag.
+	Reason string `json:"reason,omitempty"`
 	Intent string `json:"intent,omitempty"`
 	Number string `json:"number,omitempty"`
 }
@@ -190,7 +192,8 @@ func Admin(mux *http.ServeMux, g *service.Gateway, a AdminAuth) {
 		l, err := g.ListExceptions(ctx)
 		items := make([]exceptionDTO, 0, len(l))
 		for _, q := range l {
-			items = append(items, exceptionDTO{Origin: q.Ref.Origin, Stream: q.Ref.Stream, Seq: q.Ref.Seq, Flag: strings.Join(q.Marks, ","), Intent: q.Intent, Number: q.Number})
+			reason, rest := service.ApprovalReason(q.Marks)
+			items = append(items, exceptionDTO{Origin: q.Ref.Origin, Stream: q.Ref.Stream, Seq: q.Ref.Seq, Flag: strings.Join(rest, ","), Reason: reason, Intent: q.Intent, Number: q.Number})
 		}
 		return map[string]any{"items": items}, err
 	})

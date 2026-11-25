@@ -108,7 +108,10 @@ func (g *Gateway) publish(tx repository.Tx, rec repository.OpRec) error {
 func flagCode(marks []string) string {
 	for _, m := range marks {
 		switch m {
-		case MarkReleased, MarkPIIDropped, MarkVendorConfirmed, MarkFork, MarkRecoveredSealed, MarkProofPending, MarkConfigShared:
+		case MarkReleased, MarkPIIDropped, MarkVendorConfirmed, MarkFork, MarkRecoveredSealed, MarkProofPending, MarkConfigShared, MarkApprovalPending:
+			continue
+		}
+		if strings.HasPrefix(m, MarkApprovalReason) || strings.HasPrefix(m, MarkApprovedBy) {
 			continue
 		}
 		return m

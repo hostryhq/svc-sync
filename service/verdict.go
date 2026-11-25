@@ -53,6 +53,8 @@ const (
 	MarkPIIDropped            = "pii_dropped"
 )
 
+// (approval marks: approval.go)
+
 // releaseCtx tells judge which holds a manager's release has already cleared.
 type releaseCtx struct {
 	// Marks the op already carries (kept: a released unsealed op stays marked unsealed).
@@ -260,6 +262,8 @@ func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.Verdic
 	proof := directory.ProofValid
 	if !devActor {
 		proof = g.proofOf(tx, p)
+	} else if deviceSessionExpired(tx, origin, b) {
+		proof = directory.ProofInvalid // a device session lives 26 hours and is re-opened each business day: an older op is one of a closed session
 	}
 	switch proof {
 	case directory.ProofValid:
@@ -289,7 +293,29 @@ func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.Verdic
 			flag(MarkPermissionFlag)
 		}
 	} else if in.Permission != "" {
-		if !havePack || !pack.Members[b.Actor][in.Permission] {
+		held := havePack && pack.Members[b.Actor][in.Permission]
+		if !held && in.Override && b.Approval != "" {
+			// An op of an override intent cites an approval: the permission is satisfied by the approver, or the op is
+			// flagged `approval_flag` with a reason; never `permission_flag` (ADR-0014 A3.3).
+			switch out := g.checkApproval(tx, b, in, p.Item.Stream, origin, cred.Cred.OutletID); out.State {
+			case approvalOK:
+				marks = append(marks, MarkApprovedBy+out.Approver)
+			case approvalPending:
+				if config {
+					return quarantine(ReasonConfigPending)
+				}
+				marks = append(marks, MarkApprovalPending)
+				if err := waitApproval(tx, p.Item.Stream, origin, b.Seq, b.Approval); err != nil {
+					return quarantine(ReasonConfigPending)
+				}
+			default:
+				if config {
+					return engine.Verdict{Status: repository.StVoided, Reason: ReasonApprovalFailed, Void: true, Marks: []string{MarkApprovalFlag, MarkApprovalReason + out.Reason}}
+				}
+				flag(MarkApprovalFlag)
+				marks = append(marks, MarkApprovalReason+out.Reason)
+			}
+		} else if !held {
 			if config {
 				return void(ReasonPermAbsent)
 			}
@@ -351,6 +377,25 @@ func deviceSession(tx repository.Tx, origin string, b sp.Body) bool {
 	}
 	st, ok, _ := tx.SessionType(origin, b.SID)
 	return ok && st == sp.SessionDevice
+}
+
+// deviceSessionMaxAge is the longest a device session (a KDS; no member, no PIN) lasts. It is exempt from the 16-hour limit of
+// a pin session and is re-opened at the start of each business day, or after 26 hours when none is open
+// (sync/protocol-v1.md, Device-session lifetime).
+const deviceSessionMaxAge = 26 * time.Hour
+
+// deviceSessionExpired reports whether the op was recorded in a device session more than 26 hours after its opening, or before it.
+func deviceSessionExpired(tx repository.Tx, origin string, b sp.Body) bool {
+	if b.Intent == sp.IntentSessionOpen {
+		return false
+	}
+	row, ok, _ := tx.GetSession(origin, b.SID)
+	if !ok || row.OpenedAt == "" {
+		return false
+	}
+	at, err1 := time.Parse(sp.TimeLayout, b.At)
+	opened, err2 := time.Parse(sp.TimeLayout, row.OpenedAt)
+	return err1 != nil || err2 != nil || at.Before(opened) || at.After(opened.Add(deviceSessionMaxAge))
 }
 
 // manualBookEntry reports whether an op may take a number from a paper bill book: the intent types the
@@ -422,6 +467,20 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 		if hasMark(marks, MarkAttributionUnverified) {
 			if err := g.alert(tx, "owner", "medium", "attribution_unverified", rec); err != nil {
 				return err
+			}
+		}
+		if hasMark(marks, MarkApprovalFlag) {
+			if err := g.alert(tx, "owner", "high", "approval_flag", rec); err != nil { // a trading fact is accepted at high severity
+				return err
+			}
+		}
+		if (rec.Intent == sp.IntentApprovalGrant || rec.Intent == sp.IntentApprovalSelfConfirm) && !p.Opaque {
+			for _, m := range p.Body.Muts {
+				if m.E == "approval" {
+					if err := g.resolveApprovalWaiters(tx, rec.Origin, m.ID); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		if rec.Intent == "series.close" && !p.Opaque {

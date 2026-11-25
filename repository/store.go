@@ -111,6 +111,18 @@ type SessionRow struct {
 	Verdict                  string
 }
 
+// ApprovalRow is one approval of an origin (ADR-0014 A3.3 item 1): the record the approval op carries, identity's
+// verdict on its proof and the op that cites it. One row per (tenant, origin, approval id).
+type ApprovalRow struct {
+	Origin, ID, Verdict string
+	// Kind is the intent of the approving op: approval.grant or approval.self_confirm.
+	Kind, SID, Intent, Permission, Target, ActionHash, Requester, Approver, Reason string
+	// ApprovedAt is the `at` of the approving op.
+	ApprovedAt string
+	// Citer is "stream|origin|seq" of the op that cites the approval; CiterHLC its clock.
+	Citer, CiterHLC string
+}
+
 // Drain statement states (ADR-0005 A3.3).
 const (
 	DrainSatisfied = "satisfied" // every check held; the report to identity is pending
@@ -182,7 +194,7 @@ type Tx interface {
 	PutPII(stream, origin string, seq int64, data string) error
 	GetPII(stream, origin string, seq int64) (string, bool, error)
 	ErasePII(stream, origin string, seq int64) error
-	PutSession(origin, sid, stype string) error
+	PutSession(origin, sid, stype, openedAt string) error
 	SessionType(origin, sid string) (string, bool, error)
 	// PutSessionRow stores the session with the verdict of its proof. A row whose verdict is already final
 	// (valid, invalid, locked) is never overwritten: identity is asked once.
@@ -192,6 +204,11 @@ type Tx interface {
 	PendingSessions() ([]SessionRow, error)
 	PutApprovalVerdict(origin, approvalID, verdict string) error
 	GetApprovalVerdict(origin, approvalID string) (string, bool, error)
+	// PutApprovalRecord stores the record of an approval.grant or approval.self_confirm beside its verdict (the row exists).
+	PutApprovalRecord(r ApprovalRow) error
+	GetApproval(origin, approvalID string) (ApprovalRow, bool, error)
+	// ClaimApproval sets the one op that cites the approval.
+	ClaimApproval(origin, approvalID, citer, citerHLC string) error
 	PutDrain(d DrainRec) error
 	Drains(origin string) ([]DrainRec, error)
 	SetDrainState(origin, hash, state string) error
@@ -605,8 +622,8 @@ func (t *sqlTx) ErasePII(stream, origin string, seq int64) error {
 	return t.exec(`DELETE FROM op_pii WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`, t.tenant, stream, origin, seq)
 }
 
-func (t *sqlTx) PutSession(origin, sid, stype string) error {
-	return t.exec(`INSERT INTO sessions (tenant_id, origin, sid, stype) VALUES (?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, origin, sid, stype)
+func (t *sqlTx) PutSession(origin, sid, stype, openedAt string) error {
+	return t.exec(`INSERT INTO sessions (tenant_id, origin, sid, stype, opened_at) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, origin, sid, stype, openedAt)
 }
 
 func (t *sqlTx) SessionType(origin, sid string) (string, bool, error) {
@@ -668,6 +685,28 @@ func (t *sqlTx) GetApprovalVerdict(origin, approvalID string) (string, bool, err
 		return "", false, nil
 	}
 	return v, err == nil, err
+}
+
+const approvalCols = `origin, approval_id, verdict, kind, sid, intent, permission, target, action_hash, requester, approver, reason, approved_at, citer, citer_hlc`
+
+func (t *sqlTx) PutApprovalRecord(r ApprovalRow) error {
+	return t.exec(`UPDATE approval_verdicts SET kind=?, sid=?, intent=?, permission=?, target=?, action_hash=?, requester=?, approver=?, reason=?, approved_at=?
+		WHERE tenant_id=? AND origin=? AND approval_id=? AND kind=''`,
+		r.Kind, r.SID, r.Intent, r.Permission, r.Target, r.ActionHash, r.Requester, r.Approver, r.Reason, r.ApprovedAt, t.tenant, r.Origin, r.ID)
+}
+
+func (t *sqlTx) GetApproval(origin, approvalID string) (ApprovalRow, bool, error) {
+	var r ApprovalRow
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT `+approvalCols+` FROM approval_verdicts WHERE tenant_id=? AND origin=? AND approval_id=?`), t.tenant, origin, approvalID).
+		Scan(&r.Origin, &r.ID, &r.Verdict, &r.Kind, &r.SID, &r.Intent, &r.Permission, &r.Target, &r.ActionHash, &r.Requester, &r.Approver, &r.Reason, &r.ApprovedAt, &r.Citer, &r.CiterHLC)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ApprovalRow{}, false, nil
+	}
+	return r, err == nil, err
+}
+
+func (t *sqlTx) ClaimApproval(origin, approvalID, citer, citerHLC string) error {
+	return t.exec(`UPDATE approval_verdicts SET citer=?, citer_hlc=? WHERE tenant_id=? AND origin=? AND approval_id=?`, citer, citerHLC, t.tenant, origin, approvalID)
 }
 
 func (t *sqlTx) PutDrain(d DrainRec) error {

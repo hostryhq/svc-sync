@@ -50,7 +50,7 @@ func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/credential") && strings.Contains(r.URL.Path, device):
-		_, _ = w.Write([]byte(`{"device_id":"` + device + `","tenant_id":"` + tenant + `","outlet_id":"` + outlet + `","kind":"pos","kid":"k1","pub":"BAAA"}`))
+		_, _ = w.Write([]byte(`{"device_id":"` + device + `","tenant_id":"` + tenant + `","outlet_id":"` + outlet + `","brand_id":"brand-1","kind":"pos","kid":"k1","pub":"BAAA"}`))
 	case strings.HasSuffix(r.URL.Path, "/series") && strings.Contains(r.URL.Path, device):
 		_, _ = w.Write([]byte(`{"items":[{"id":"s1","tax_registration_id":"r1","code":"A7K","doc_type":"tax_invoice","outlet_id":"` + outlet + `","device_id":"` + device + `","status":"closed_unreconciled","issued_at":"2026-11-24T13:15:11.120Z"}]}`))
 	case strings.HasSuffix(r.URL.Path, "/manual-book-series"):

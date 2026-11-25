@@ -66,7 +66,7 @@ func final(verdict string) bool {
 func (g *Gateway) proofOf(tx repository.Tx, p *engine.Parsed) directory.ProofResult {
 	b := p.Body
 	switch b.Intent {
-	case sp.IntentApprovalGrant:
+	case sp.IntentApprovalGrant, sp.IntentApprovalSelfConfirm:
 		return g.approvalProof(tx, p)
 	case sp.IntentSessionOpen:
 		switch typ, _ := openedSession(b); typ {
@@ -173,6 +173,8 @@ func (g *Gateway) approvalProof(tx repository.Tx, p *engine.Parsed) directory.Pr
 			ActionHash: str("action_hash"), ApprovedAt: at})
 	}
 	_ = tx.PutApprovalVerdict(origin, rec.ID, verdictOf(res))
+	_ = tx.PutApprovalRecord(repository.ApprovalRow{Origin: origin, ID: rec.ID, Kind: b.Intent, SID: b.SID, Intent: str("intent"), Permission: str("permission"),
+		Target: str("target"), ActionHash: str("action_hash"), Requester: str("requester"), Approver: approver, Reason: str("reason"), ApprovedAt: b.At})
 	return res
 }
 

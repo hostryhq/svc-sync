@@ -61,8 +61,9 @@ func (c *Client) GetDeviceCredential(ctx context.Context, tenant, device string)
 	}
 	d := out.JSON200
 	cr := DeviceCredential{DeviceID: d.DeviceId, TenantID: d.TenantId, OutletID: d.OutletId, Kind: string(d.Kind), Kid: d.Kid, Pub: d.Pub}
-	if d.BrandId != nil {
-		cr.BrandID = *d.BrandId
+	cr.BrandID = string(d.BrandId)
+	if cr.BrandID == "" {
+		return DeviceCredential{}, ErrUnavailable // a credential without brand_id is never usable: a device's stream binding rests on it (ADR-0014 A3.4)
 	}
 	if d.Recovers != nil {
 		cr.Recovers = *d.Recovers

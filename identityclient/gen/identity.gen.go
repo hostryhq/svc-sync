@@ -251,12 +251,12 @@ type Device struct {
 	State DeviceState `json:"state"`
 }
 
-// DeviceCredential The identity-signed credential of a device as the offline pack carries it (ADR-0005 A3.2 row 1). `not_after` is not part of this answer; the gateway ignores it.
+// DeviceCredential The identity-signed credential of a device as the offline pack carries it (ADR-0005 A3.2 row 1). `not_after` is not part of this answer; the gateway ignores it. `brand_id` is always present (ADR-0014 A3.4).
 type DeviceCredential struct {
-	// BrandId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
+	// BrandId Brand of the outlet, read from tenancy when the device was activated, stored on the device row and signed into the credential; never re-read (ADR-0014 A3.4). The gateway caches the credential with no expiry and judges a device's stream binding from it, not from a tenancy call.
 	//
 	// Example: 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b
-	BrandId *Id `json:"brand_id,omitempty"`
+	BrandId Id `json:"brand_id"`
 
 	// DeviceId Client-generated, time-sortable UUIDv7 in lower-case canonical form (ADR-0003 policy; ULID is not accepted). The row id of an entity whose entity file declares a deterministic id (id.rule uuidv5, ADR-0014) is a UUIDv5 in the same form, so two devices that write the same natural key converge on one row.
 	//
@@ -686,7 +686,7 @@ type RecordDrain struct {
 	// Series The last number per series, copied from the device-signed statement (ADR-0005 A3.3 item 5). Must be exactly the series identity issued to the device (422 drain.series_mismatch, vendor alert, nothing recorded). Empty only for a device that never held a series (kds, hub).
 	Series *[]DrainSeries `json:"series,omitempty"`
 
-	// Statement The device-signed list of everything a revoked device holds and its last document numbers (ADR-0005 A3.3, domain tag `hostry-drain-v1`). Ordinary drain: `by` = `origin`, signed with the revoked device's key. Key loss: `by` = the adopting device, `rec` = the recovery id, signed with the new key.
+	// Statement The device-signed drain statement the report rests on. `series` must list exactly the series identity issued to the device (a billing device holds a pair: its tax-invoice series and its credit-note series), each with the statement's own number.
 	Statement *DrainStatement `json:"statement,omitempty"`
 }
 
@@ -810,6 +810,9 @@ type Forbidden = Problem
 
 // NotFound RFC 9457 problem details. `type` is a stable URI per error kind.
 type NotFound = Problem
+
+// TenancyUnavailable RFC 9457 problem details. `type` is a stable URI per error kind.
+type TenancyUnavailable = Problem
 
 // Unauthorized RFC 9457 problem details. `type` is a stable URI per error kind.
 type Unauthorized = Problem
@@ -935,7 +938,7 @@ type ClientInterface interface {
 
 	// GetDeviceCredential The identity-signed credential of a device, in any state
 	//
-	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached. Never answers a credential without `brand_id`: a device row that has none yet (created before ADR-0014 A3.4) is filled once by a start-up job that asks tenancy, and until then this answers 503 `tenancy.unavailable`.
 	//
 	// Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
 	GetDeviceCredential(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1018,7 +1021,7 @@ type ClientInterface interface {
 
 // GetDeviceCredential The identity-signed credential of a device, in any state
 //
-// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached. Never answers a credential without `brand_id`: a device row that has none yet (created before ADR-0014 A3.4) is filled once by a start-up job that asks tenancy, and until then this answers 503 `tenancy.unavailable`.
 //
 // Corresponds with GET /internal/v1/devices/{device_id}/credential (the `GetDeviceCredential` operationId).
 func (c *Client) GetDeviceCredential(ctx context.Context, deviceId Id, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -1696,7 +1699,7 @@ type ClientWithResponsesInterface interface {
 
 	// GetDeviceCredentialWithResponse The identity-signed credential of a device, in any state
 	//
-	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+	// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached. Never answers a credential without `brand_id`: a device row that has none yet (created before ADR-0014 A3.4) is filled once by a start-up job that asks tenancy, and until then this answers 503 `tenancy.unavailable`.
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -1789,6 +1792,11 @@ type ClientWithResponsesInterface interface {
 	GetSessionWithResponse(ctx context.Context, sessionId Id, reqEditors ...RequestEditorFn) (*GetSessionResponse, error)
 }
 
+// GetDeviceCredentialResponse503Headers the declared response headers of an HTTP 503 response for GetDeviceCredential
+type GetDeviceCredentialResponse503Headers struct {
+	RetryAfter *int
+}
+
 type GetDeviceCredentialResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -1800,6 +1808,10 @@ type GetDeviceCredentialResponse struct {
 	ApplicationproblemJSON403 *Forbidden
 	// ApplicationproblemJSON404 the response for an HTTP 404 `application/problem+json` response
 	ApplicationproblemJSON404 *NotFound
+	// ApplicationproblemJSON503 the response for an HTTP 503 `application/problem+json` response
+	ApplicationproblemJSON503 *TenancyUnavailable
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *GetDeviceCredentialResponse503Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -1820,6 +1832,11 @@ func (r GetDeviceCredentialResponse) GetApplicationproblemJSON403() *Forbidden {
 // GetApplicationproblemJSON404 returns the response for an HTTP 404 `application/problem+json` response
 func (r GetDeviceCredentialResponse) GetApplicationproblemJSON404() *NotFound {
 	return r.ApplicationproblemJSON404
+}
+
+// GetApplicationproblemJSON503 returns the response for an HTTP 503 `application/problem+json` response
+func (r GetDeviceCredentialResponse) GetApplicationproblemJSON503() *TenancyUnavailable {
+	return r.ApplicationproblemJSON503
 }
 
 // GetBody returns the raw response body bytes
@@ -2356,7 +2373,7 @@ func (r GetSessionResponse) ContentType() string {
 
 // GetDeviceCredentialWithResponse The identity-signed credential of a device, in any state
 //
-// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached.
+// Sync gateway directory question (ADR-0005 A3.2 row 1). Answers the credential as the pack carries it, whatever the device state. One key per device id for life (ADR-0002 S7), so the gateway caches it without expiry; 404 is not cached. Never answers a credential without `brand_id`: a device row that has none yet (created before ADR-0014 A3.4) is filled once by a start-up job that asks tenancy, and until then this answers 503 `tenancy.unavailable`.
 //
 // Returns a wrapper object for the known response body format(s).
 //
@@ -2562,6 +2579,26 @@ func ParseGetDeviceCredentialResponse(rsp *http.Response) (*GetDeviceCredentialR
 		}
 		response.ApplicationproblemJSON404 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest TenancyUnavailable
+		if err := runtime.JSONUnmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 503:
+		var headers GetDeviceCredentialResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers503 = &headers
 	}
 
 	return response, nil
