@@ -92,7 +92,7 @@ Open and judgement calls:
 - `identityreal/` (own module) still pins svc-identity at the ADR-0005 A3 head; its live test needs svc-identity and svc-tenancy at round 5.
 
 ## ADR-0002 A3 (LAN transport, hub at rest, hub pack source, placement)
-Contract api-specs-p2 `010e6b1`; identity `418c61c` (hub packs). `docs/poc-notes.md` lines 42 and 136 (per-request LAN assertion, plain pack file) no longer apply.
+Contract api-specs-p2 `17de74f`; identity `d51e743` (hub packs). `docs/poc-notes.md` lines 42 and 136 (per-request LAN assertion, plain pack file) no longer apply.
 - **Credential `store`** is in `syncproto.Credential` (always present), the identity client and the stub. **Placement:** `syncproto.PIIPlacement`
   (kds never; another origin's pii only to `store: protected`; own pii unaffected), used by pull, released placeholders and snapshots in both
   roles. `PIIToUnprotected` (gateway, hub engine) is the dev, test and ci switch; `cmd/hub` refuses it outside those environments.
@@ -101,11 +101,15 @@ Contract api-specs-p2 `010e6b1`; identity `418c61c` (hub packs). `docs/poc-notes
   hub restart). Vectors: `syncproto/lan_vectors_test.go`. The per-request assertion is gone.
 - **At rest:** `keyprotect/` (DPAPI user scope for Windows, build-tagged, no CGO; `dev` provider for Linux CI, refuses outside dev, test, ci),
   `repository/crypt.go` (AES-256-GCM on `ops.body`, `op_pii.data`, `meta.v`, `forks.body`, AAD = table, key, column, key id; 90-day data key;
-  `secure_delete` and a WAL truncate after an erasure). `alerts.detail` stays clear: it is matched by value and holds ids, not field values.
+  `secure_delete` and a WAL truncate after an erasure). Round 7 also seals `alerts.detail` (resolved by reading and comparing in Go) and `approval_verdicts.reason`.
 - **Pack source:** `hub/identitysource.go` (activateDevice, createDeviceToken, getDeviceOfflinePack), `hub/applypack.go`, `cmd/hub` (`hub activate`,
   `hub`). The `file` source and the plain listener exist only in a binary built with `-tags devlan`.
-- **Open:** the pack JWS is signed by identity's pack-signing key, which no published document carries, so the hub cannot verify the pack
-  signature itself; it verifies the hub credential under the pack's `identity_public_keys` and relies on HTTPS (activation, refresh) and the
-  encrypted store. A hub pack lists no peer credentials, so a hub relays a tablet's ops only after the cloud has served that tablet's
-  `hostry-cred-v1` envelope upstream; until then it verifies the tablet's seals from its LAN credential but a third device cannot verify them.
-  `alerts`, `approval_verdicts.reason` are not encrypted. HS1 needs a Windows PC (pilot gate).
+- **Round 7 (contract `17de74f`):** `hub.VerifyPack(jws, deviceID, PackPolicy)` verifies the whole pack JWS (ES256, typ `hostry-pack+jws`, `kid` among
+  the pack's own `identity_public_keys`, signature under that key), the hub credential and every `peers` credential (device id, kind, kid, store, key,
+  tenant, outlet; a hub is not a peer). `ApplyPack` makes listed peers known on the LAN (`CredCache.AddLAN`), except revoked ones, so tablet-to-tablet
+  relay needs no cloud contact first. `issuer_env`: `PackPolicy{Env, DevLAN}` (from `HOSTRY_ENV` and the devlan tag) refuses a live pack in a devlan build and
+  a non-live pack when `HOSTRY_ENV=live`; a missing or unknown claim is refused. `Exception.reason` `missing` and 429 `emit.rate_limited` (with
+  `Retry-After`) were already served; the 429 now has an HTTP-level test. Tests: `hub/pack_test.go`, `repository/crypt_round7_test.go`,
+  `sim/emit_429_test.go`; `engine/entities_gen.go` regenerated for `credit_note.replacement_total_paise`.
+- `identityreal/` is pinned to svc-identity `d51e743` (pack `issuer_env`, identity-key pack JWS, hub peers); HP1 and HP2 pass against it.
+- HS1 (column encryption on DPAPI) needs a Windows PC (pilot gate).

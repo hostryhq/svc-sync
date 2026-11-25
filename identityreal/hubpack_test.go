@@ -75,7 +75,15 @@ func TestHP1_HubActivatesAgainstIdentityRunsOnItsPackAndRefusesARevokedTablet(t 
 	if err := h.ApplyPack(ctx, p); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := hub.LoadStoredPack(ctx, st, p.Tenant, act.DeviceID); err != nil || got.PackV != p.PackV {
+	// Round 7: the pack lists the outlet's tablet, so the hub knows its key with no cloud contact, and the claim of the issuer's
+	// environment is honoured: a live hub refuses what a non-live identity signed.
+	if _, ok := h.Cache().OriginKey(f.dev.ID); !ok || p.IssuerEnv == "" {
+		t.Fatalf("the hub pack lists the tablet and claims issuer_env (got %q)", p.IssuerEnv)
+	}
+	if _, err := hub.VerifyPack(p.Raw, act.DeviceID, hub.PackPolicy{Env: "live"}); err == nil && p.IssuerEnv != "live" {
+		t.Fatal("a live hub must refuse a pack from a non-live issuer")
+	}
+	if got, err := hub.LoadStoredPack(ctx, st, p.Tenant, act.DeviceID, idc.Policy); err != nil || got.PackV != p.PackV {
 		t.Fatalf("the stored pack reloads with no internet: %v", err)
 	}
 
