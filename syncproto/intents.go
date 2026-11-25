@@ -1,5 +1,7 @@
 package syncproto
 
+import "sync"
+
 // Intent classes (S4, S11).
 const (
 	ClassTrading = "trading"
@@ -7,63 +9,37 @@ const (
 	ClassControl = "control"
 )
 
-// Intent is one row of the intent registry (S4). The real registry is api-specs/sync/intents/*.yaml
-// and generates the client `can()` table, the gateway check and the hub structural check; this is
-// the demo subset used by the PoC and the simulator.
+// Intent is one row of the canonical intent registry (api-specs sync/intents/*.yaml). The table
+// itself is generated (intents_gen.go, cmd/genintents); it generates the gateway check (S11) and
+// the hub structural check (S8). Permissions are catalogue keys (common/permissions.yaml).
 type Intent struct {
-	Name       string `json:"name"`
-	Class      string `json:"class"`
-	Permission string `json:"permission"`
-	// Kinds are the device kinds allowed to record it.
-	Kinds []string `json:"kinds"`
-	// Doc is the document type the intent allocates a legal number for.
-	Doc string `json:"doc,omitempty"`
+	Name  string
+	Class string
+	// Owner is the service that owns the intent's meaning (or identity or gateway).
+	Owner string
+	// Permission is the catalogue key a device op needs; empty for control and cloud-origin intents.
+	Permission string
+	// AuthorisedBy lists the online permissions that authorise a cloud-origin emit.
+	AuthorisedBy []string
+	// Kinds are the device kinds allowed to record it; "cloud" alone for a gateway emit.
+	Kinds []string
+	// Sessions are the session types allowed to record it (empty for cloud origin).
+	Sessions []string
+	Streams  []string
+	// Numbering is allocated, typed or none; Documents the document types it consumes.
+	Numbering string
+	Documents []string
+	// Entities maps each touched entity to the mutation kinds the intent may use.
+	Entities map[string][]string
+	// Records are protocol records that are not synced entities (session, approval, sync_void, ...).
+	Records   []string
+	PIIFields []string
 	// MaxV is the highest intent_v the gateway has an upcaster for (S13).
-	MaxV int `json:"max_v"`
-	// ConfigOnly sessions: sessions allowed to record it ("" means any).
-	Sessions []string `json:"sessions,omitempty"`
+	MaxV int
 }
 
-var (
-	billingKinds = []string{KindPOS, KindWaiter}
-	floorKinds   = []string{KindPOS, KindWaiter, KindKDS}
-)
-
-// Intents is the demo registry.
-var Intents = map[string]Intent{
-	"session.open":     {Name: "session.open", Class: ClassControl, Permission: "session.open", Kinds: floorKinds, MaxV: 1},
-	"approval.grant":   {Name: "approval.grant", Class: ClassControl, Permission: "approval.grant", Kinds: billingKinds, MaxV: 1},
-	"series.activate":  {Name: "series.activate", Class: ClassControl, Permission: "series.activate", Kinds: billingKinds, MaxV: 1},
-	"order.create":     {Name: "order.create", Class: ClassTrading, Permission: "order.create", Kinds: billingKinds, MaxV: 1},
-	"order.line.add":   {Name: "order.line.add", Class: ClassTrading, Permission: "order.create", Kinds: billingKinds, MaxV: 1},
-	"kot.send":         {Name: "kot.send", Class: ClassTrading, Permission: "order.create", Kinds: billingKinds, MaxV: 1},
-	"kds.status":       {Name: "kds.status", Class: ClassTrading, Permission: "kds.update", Kinds: floorKinds, MaxV: 1},
-	"bill.finalize":    {Name: "bill.finalize", Class: ClassTrading, Permission: "bill.finalize", Kinds: billingKinds, Doc: "tax_invoice", MaxV: 1},
-	"creditnote.issue": {Name: "creditnote.issue", Class: ClassTrading, Permission: "bill.refund", Kinds: billingKinds, Doc: "credit_note", MaxV: 1},
-	"payment.record":   {Name: "payment.record", Class: ClassTrading, Permission: "payment.take", Kinds: billingKinds, MaxV: 1},
-	"stock.move":       {Name: "stock.move", Class: ClassTrading, Permission: "stock.adjust", Kinds: billingKinds, MaxV: 1},
-	"menu.item.edit":   {Name: "menu.item.edit", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"menu.price.set":   {Name: "menu.price.set", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	// Names used by the TypeScript client demo (client-core src/sync); same classes and permissions.
-	"stock.out":         {Name: "stock.out", Class: ClassTrading, Permission: "stock.adjust", Kinds: billingKinds, MaxV: 1},
-	"stock.in":          {Name: "stock.in", Class: ClassTrading, Permission: "stock.adjust", Kinds: billingKinds, MaxV: 1},
-	"pay":               {Name: "pay", Class: ClassTrading, Permission: "payment.take", Kinds: billingKinds, MaxV: 1},
-	"refund":            {Name: "refund", Class: ClassTrading, Permission: "bill.refund", Kinds: billingKinds, MaxV: 1},
-	"order.edit":        {Name: "order.edit", Class: ClassTrading, Permission: "order.create", Kinds: billingKinds, MaxV: 1},
-	"kds.new":           {Name: "kds.new", Class: ClassTrading, Permission: "kds.update", Kinds: floorKinds, MaxV: 1},
-	"kds.ready":         {Name: "kds.ready", Class: ClassTrading, Permission: "kds.update", Kinds: floorKinds, MaxV: 1},
-	"kds.late":          {Name: "kds.late", Class: ClassTrading, Permission: "kds.update", Kinds: floorKinds, MaxV: 1},
-	"credit_note.issue": {Name: "credit_note.issue", Class: ClassTrading, Permission: "bill.refund", Kinds: billingKinds, Doc: "credit_note", MaxV: 1},
-	"menu.add":          {Name: "menu.add", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"menu.price":        {Name: "menu.price", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"menu.rename":       {Name: "menu.rename", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"menu.del":          {Name: "menu.del", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"menu.undel":        {Name: "menu.undel", Class: ClassConfig, Permission: "menu.edit", Kinds: billingKinds, MaxV: 1},
-	"conflict.confirm":  {Name: "conflict.confirm", Class: ClassControl, Permission: "approval.grant", Kinds: billingKinds, MaxV: 1},
-	// Cloud-origin only: the void of a refused configuration op, and cloud edits (S6, S11).
-	IntentVoid:   {Name: IntentVoid, Class: ClassControl, Permission: "", Kinds: []string{"cloud"}, MaxV: 1},
-	"cloud.emit": {Name: "cloud.emit", Class: ClassConfig, Permission: "", Kinds: []string{"cloud"}, MaxV: 1},
-}
+// CloudKind is the device kind of an intent only the gateway emit may write.
+const CloudKind = "cloud"
 
 // Allows reports whether the device kind may record the intent.
 func (i Intent) Allows(kind string) bool {
@@ -73,4 +49,57 @@ func (i Intent) Allows(kind string) bool {
 		}
 	}
 	return false
+}
+
+// CloudOrigin reports whether the intent is written only by the gateway emit.
+func (i Intent) CloudOrigin() bool { return len(i.Kinds) == 1 && i.Kinds[0] == CloudKind }
+
+// AllowsEntity reports whether the intent lists the entity with the mutation kind.
+func (i Intent) AllowsEntity(entity, kind string) bool {
+	for _, k := range i.Entities[entity] {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// HasRecord reports whether the intent lists the protocol record.
+func (i Intent) HasRecord(rec string) bool {
+	for _, r := range i.Records {
+		if r == rec {
+			return true
+		}
+	}
+	return false
+}
+
+// Protocol records that are not synced entities.
+const (
+	RecordSyncVoid  = "sync_void"
+	RecordPIIErase  = "pii_erase"
+	RecordSeriesEnd = "series_close"
+)
+
+// init adds the one intent that is not in the registry yet: the cloud-signed erasure of an op's pii
+// (PROVISIONAL, security ruling of the Phase 1 re-review; it needs an entry in sync/intents/cloud.yaml
+// and a go-common record type). The record pii_erase has the id stream|origin|seq of the op whose pii
+// is erased; nodes remove the stored values and salts and acknowledge in their next hello
+// (contract/README.md).
+func init() {
+	Intents[IntentPIIErase] = Intent{Name: IntentPIIErase, Class: ClassControl, Owner: "gateway", Kinds: []string{CloudKind},
+		Streams: []string{"outlet", "brand", "tenant"}, Numbering: "none", Records: []string{RecordPIIErase}, MaxV: 1}
+}
+
+var demoOnce sync.Once
+
+// RegisterDemoIntents adds the intents that exist only in the simulator and the unit tests (the
+// registry has no stock intent before Phase 4). The gateway and hub binaries never call it; a
+// device op of such an intent is then refused like any unknown intent. Permission keys are
+// prefixed demo. so that they can never be mistaken for catalogue keys.
+func RegisterDemoIntents() {
+	demoOnce.Do(func() {
+		Intents["stock.move"] = Intent{Name: "stock.move", Class: ClassTrading, Owner: "demo", Permission: "demo.stock.move",
+			Kinds: []string{KindPOS, KindWaiter}, Sessions: []string{"pin", "strong"}, Streams: []string{"outlet"}, Numbering: "none", MaxV: 1}
+	})
 }

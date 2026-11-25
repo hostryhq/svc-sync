@@ -49,7 +49,7 @@ func main() {
 	check(err)
 	issuer := authtest.NewTenantIssuer(clock.Func(now))
 	tenant, outlet, brand := "018f0000-0000-7000-8000-0000000000a0", "018f0000-0000-7000-8000-0000000000a1", "018f0000-0000-7000-8000-0000000000b1"
-	id.SetMember(tenant, "m1", "order.create", "payment.take", "bill.finalize", "bill.refund", "stock.adjust", "kds.update", "session.open", "menu.edit")
+	id.SetMember(tenant, "m1", "order.create", "order.edit", "payment.record", "bill.finalize", "bill.credit_note.create", "kds.bump", "session.open", "menu.manage", "menu.price.edit")
 
 	st, err := repository.Open(*dsn)
 	check(err)
@@ -59,7 +59,7 @@ func main() {
 	check(err)
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})
-	services := authtest.NewServiceRegistry(clock.Func(now), "admin", "sync")
+	services := authtest.NewServiceRegistry(clock.Func(now), "admin", "sync", "catalog", "billing")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: issuer.Verifier(), Services: services.Verifier("sync"), Audit: &repository.AccessSink{S: st}, Clock: clock.Func(now)})
 	cloudURL := serve(ctx, *cloudAddr, mux)
 

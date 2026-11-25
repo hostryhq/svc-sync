@@ -33,6 +33,7 @@ const (
 // Intent names the engine itself understands.
 const (
 	IntentVoid        = "sync.void"
+	IntentPIIErase    = "sync.pii.erase"
 	IntentSessionOpen = "session.open"
 )
 
@@ -82,7 +83,9 @@ type Body struct {
 	IntentV int    `json:"intent_v"`
 	At      string `json:"at"`
 	Doc     *Doc   `json:"doc,omitempty"`
-	Muts    []Mut  `json:"muts"`
+	// PIIC holds the salted per-field commitments of the op's pii (piic.go; provisional).
+	PIIC PIICommit `json:"pii_c,omitempty"`
+	Muts []Mut     `json:"muts"`
 }
 
 // Item is one op or one placeholder on the wire. Body is the canonical JSON text of the Body
@@ -277,6 +280,9 @@ type HelloRequest struct {
 	Unbound []Ref `json:"unbound,omitempty"`
 	// Conflicts reports the chain conflicts this node recorded and has not yet reported (A2.8 item 1.4).
 	Conflicts []Conflict `json:"chain_conflicts,omitempty"`
+	// PIIErased acknowledges the cloud-signed erasures (intent sync.pii.erase) this node applied to
+	// its rows, op log, caches and spool (PROVISIONAL; syncproto/piic.go, contract/README.md).
+	PIIErased []Ref `json:"pii_erased,omitempty"`
 }
 
 // SlotHash is a slot with the hash a node holds or the cloud states for it.
@@ -386,3 +392,63 @@ type SnapshotRow struct {
 
 // VoidID is the row id of the sync_void record that names a refused op: "<stream>|<origin>|<seq>".
 func VoidID(r Ref) string { return r.Stream + "|" + r.Origin + "|" + strconv.FormatInt(r.Seq, 10) }
+
+// docFields names, per entity, the field marked doc_number in api-specs entities/ (checked against
+// the registry by a test) and where the document type comes from: a field of the row, or a fixed type.
+var docFields = map[string]struct{ Field, TypeField, Type string }{
+	"bill":        {Field: "number", TypeField: "doc_type"},
+	"credit_note": {Field: "number", Type: "credit_note"},
+}
+
+// DocFieldEntities lists the entities that carry a legal document number.
+func DocFieldEntities() []string {
+	out := make([]string, 0, len(docFields))
+	for e := range docFields {
+		out = append(out, e)
+	}
+	return out
+}
+
+// Documents lists every legal document number the op allocates: the one in `doc` first, then the
+// number of every inserted row of an entity with a doc_number field (protocol-v1 "Several document
+// numbers in one op": bill.rebill takes a credit note number and a new bill number in one
+// transaction). Duplicates are listed once.
+func (b Body) Documents() []Doc {
+	var out []Doc
+	seen := map[string]bool{}
+	add := func(d Doc) {
+		if d.Number != "" && !seen[d.Number] {
+			seen[d.Number] = true
+			out = append(out, d)
+		}
+	}
+	if b.Doc != nil {
+		add(*b.Doc)
+	}
+	for _, m := range b.Muts {
+		df, ok := docFields[m.E]
+		if !ok || m.K != KInsert {
+			continue
+		}
+		n, _ := m.F[df.Field].(string)
+		t := df.Type
+		if df.TypeField != "" {
+			t, _ = m.F[df.TypeField].(string)
+		}
+		add(Doc{Type: t, Number: n})
+	}
+	return out
+}
+
+// ParseNumber splits <code>/<FY>/<running>.
+func (d Doc) ParseNumber() (code, fy string, n int64, ok bool) {
+	parts := strings.Split(d.Number, "/")
+	if len(parts) != 3 {
+		return "", "", 0, false
+	}
+	n, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || n < 1 {
+		return "", "", 0, false
+	}
+	return parts[0], parts[1], n, true
+}
