@@ -55,6 +55,12 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer st.Close()
+	if err := st.CheckAppRole(ctx); err != nil {
+		if os.Getenv("SYNC_DEV_STUB") != "1" {
+			return err // outside development a privileged role is refused
+		}
+		log.Warn("development only: " + err.Error())
+	}
 	id, err := identitystub.New(time.Now, nil)
 	if err != nil {
 		return err
@@ -72,7 +78,8 @@ func run(log *slog.Logger) error {
 	}
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})
-	api.Admin(mux, gw, issuer.Verifier())
+	services := authtest.NewServiceRegistry(clock.Func(time.Now), "admin", "sync")
+	api.Admin(mux, gw, api.AdminAuth{Tenant: issuer.Verifier(), Services: services.Verifier("sync"), Audit: &repository.AccessSink{S: st}, Clock: clock.Func(time.Now)})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.DB().PingContext(r.Context()); err != nil || gw.Guard().Check(r.Context()) != nil {

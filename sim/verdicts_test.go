@@ -230,22 +230,29 @@ func TestV7_ForeignSeriesCannotBeDiscardedAndNeedsVendorToRelease(t *testing.T) 
 	if _, err := w.GW.Release(bg, w.Tenant, ref, service.ReleaseOpts{}); !errors.Is(err, service.ErrNeedsVendor) {
 		t.Fatalf("release without vendor confirmation must be refused, got %v", err)
 	}
-	// Over HTTP: only a support token in act mode counts as vendor confirmation.
+	// Over HTTP: only Hostry support's confirmation (a support token in act mode, with the admin
+	// service token) lets the owner's manager release (see admin_test.go for the full cases).
 	user := w.Issuer.Mint(authtest.Spec{Type: auth.TypeUser, Tenant: ids.ID(w.Tenant), Grants: authtest.OwnerGrants()})
-	body, _ := json.Marshal(ref)
-	call := func(tok string) int {
-		req := httptest.NewRequest(http.MethodPost, "/sync/v1/quarantine/release", strings.NewReader(string(body)))
+	body, _ := json.Marshal(map[string]any{"origin": ref.Origin, "stream": ref.Stream, "seq": ref.Seq, "reason": "test"})
+	call := func(path, tok, svc string) int {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
 		req.Header.Set("Authorization", "Bearer "+tok)
+		if svc != "" {
+			req.Header.Set(auth.ServiceTokenHeader, svc)
+		}
 		rec := httptest.NewRecorder()
 		w.CloudH.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	if c := call(user); c != http.StatusConflict {
+	if c := call("/sync/v1/quarantine/release", user, ""); c != http.StatusConflict {
 		t.Fatalf("owner release of a foreign series: want 409, got %d", c)
 	}
-	support := w.Issuer.Mint(authtest.Spec{Type: auth.TypeSupport, Tenant: ids.ID(w.Tenant), Mode: auth.ModeAct, Grants: authtest.OwnerGrants()})
-	if c := call(support); c != http.StatusOK {
-		t.Fatalf("support act release: want 200, got %d", c)
+	support := w.Issuer.Mint(authtest.Spec{Type: auth.TypeSupport, Tenant: ids.ID(w.Tenant), Mode: auth.ModeAct, Grants: authtest.Grants(nil, service.PermQuarantineConfirm)})
+	if c := call("/sync/v1/quarantine/confirm", support, w.serviceToken(t)); c != http.StatusOK {
+		t.Fatalf("support act confirm: want 200, got %d", c)
+	}
+	if c := call("/sync/v1/quarantine/release", user, ""); c != http.StatusOK {
+		t.Fatalf("release after confirmation: want 200, got %d", c)
 	}
 	if r := w.rec(t, it); r.Status == repository.StQuarantined {
 		t.Fatal("released op must leave quarantine")

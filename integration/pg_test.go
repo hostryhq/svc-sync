@@ -9,16 +9,25 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	auth "github.com/hostryhq/go-auth"
+	"github.com/hostryhq/go-auth/authtest"
 
 	"github.com/hostryhq/go-common/events"
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/go-common/outbox"
+	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
+	"github.com/hostryhq/svc-sync/service"
 	"github.com/hostryhq/svc-sync/sim"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -63,7 +72,7 @@ func appDSN(t *testing.T, admin string) string {
 
 func clean(t *testing.T, st repository.Store) {
 	t.Helper()
-	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state`)
+	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state, vendor_access_log, audit_log`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,3 +244,118 @@ func rows(t *testing.T, st repository.Store, from string) int {
 
 var _ = sp.ProtocolVersion
 var _ *sql.DB
+
+// A role that bypasses row-level security is refused at start-up; the service role passes.
+func TestStartupRefusesARoleThatBypassesRowLevelSecurity(t *testing.T) {
+	admin := dsn(t)
+	ast, err := repository.Open(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ast.Close() }()
+	if err := ast.CheckAppRole(bg); !errors.Is(err, repository.ErrPrivilegedRole) {
+		t.Fatalf("the dev stack's admin role must be refused, got %v", err)
+	}
+	st, err := repository.Open(appDSN(t, admin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.CheckAppRole(bg); err != nil {
+		t.Fatalf("the service role must pass: %v", err)
+	}
+}
+
+// The audit tables are tenant tables: another tenant's context, a forged predicate and no context at all
+// see none of their rows.
+func TestAuditTablesAreRowLevelIsolated(t *testing.T) {
+	admin := dsn(t)
+	ast, err := repository.Open(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean(t, ast)
+	_ = ast.Close()
+	st, err := repository.Open(appDSN(t, admin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	a, b := "018f0000-0000-7000-8000-0000000000a0", "018f0000-0000-7000-8000-0000000000c0"
+	sink := &repository.AccessSink{S: st}
+	for i, tenant := range []string{a, b} {
+		err := st.InTx(bg, tenant, func(tx repository.Tx) error {
+			if err := tx.PutAudit(repository.AuditRec{ID: ids.New().String(), At: time.Now(), Actor: "m", ActorType: "user", Action: "release", Origin: "d", Stream: "outlet:o", Seq: int64(i + 1), Reason: "r", Before: "quarantined", After: "accepted"}); err != nil {
+				return err
+			}
+			return sink.RecordInTx(bg, tx.SQLTx(), auth.VendorAccessEntry{ID: ids.New(), Time: time.Now(), TenantID: tenant, VendorUser: "v", TokenType: auth.TypeSupport, ActionKey: "x", Outcome: auth.OutcomeOK})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, table := range []string{"audit_log", "vendor_access_log"} {
+		var n int
+		if err := st.DB().QueryRowContext(bg, "SELECT count(*) FROM "+table).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("%s with no tenant context: %d rows (%v)", table, n, err)
+		}
+		err := st.InTx(bg, a, func(tx repository.Tx) error {
+			return tx.SQLTx().QueryRowContext(bg, "SELECT count(*) FROM "+table+" WHERE tenant_id = $1", b).Scan(&n)
+		})
+		if err != nil || n != 0 {
+			t.Fatalf("%s: tenant A read %d rows of tenant B through a forged predicate (%v)", table, n, err)
+		}
+		err = st.InTx(bg, a, func(tx repository.Tx) error {
+			return tx.SQLTx().QueryRowContext(bg, "SELECT count(*) FROM "+table).Scan(&n)
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("%s: tenant A sees %d rows, want its own 1 (%v)", table, n, err)
+		}
+	}
+}
+
+// The audited transaction of go-auth commits the decision, its audit record and the vendor access row
+// together on Postgres.
+func TestSupportConfirmIsAuditedOnPostgres(t *testing.T) {
+	d := dsn(t)
+	adm, err := repository.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adm.Close() }()
+	clean(t, adm)
+	w, err := sim.NewWorld(bg, sim.NewRand(9), sim.WorldOptions{Dir: t.TempDir(), Pos: 2, CloudDSN: appDSN(t, d)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	a, b := w.Devices[0], w.Devices[1]
+	a.SetBadSeries(b.SaleCode())
+	it, err := a.Do("m1", engine.Input{Intent: "bill.finalize", DocType: "tax_invoice", MutsFn: func(n string) []sp.Mut {
+		return []sp.Mut{{E: "bill", ID: "b-pg-1", K: sp.KInsert, F: map[string]any{"number": n, "total_paise": int64(100)}}}
+	}})
+	a.SetBadSeries("")
+	if err != nil {
+		t.Skipf("the simulator cannot stage a foreign-series bill here: %v", err)
+	}
+	if err := a.SyncCloud(bg); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := w.Services.Signer("admin").Sign("sync", w.Tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := w.Issuer.Mint(authtest.Spec{Type: auth.TypeSupport, Tenant: ids.ID(w.Tenant), Mode: auth.ModeAct, Grants: authtest.Grants(nil, service.PermQuarantineConfirm)})
+	body, _ := json.Marshal(map[string]any{"origin": it.Origin, "stream": it.Stream, "seq": it.Seq, "reason": "cause confirmed"})
+	req := httptest.NewRequest(http.MethodPost, "/sync/v1/quarantine/confirm", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set(auth.ServiceTokenHeader, svc)
+	rec := httptest.NewRecorder()
+	w.CloudH.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("confirm: %d %s", rec.Code, rec.Body.String())
+	}
+	if n, v := rows(t, adm, "audit_log WHERE action = 'confirm'"), rows(t, adm, "vendor_access_log WHERE outcome = 'ok'"); n != 1 || v != 1 {
+		t.Fatalf("one audit record and one vendor access row, got %d and %d", n, v)
+	}
+}

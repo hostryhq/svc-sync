@@ -192,7 +192,7 @@ func Run(t *testing.T, tg Target) {
 		if rec := tg.do(t, "POST", "/sync/v1/quarantine-upload", a.d.Token(), sp.PushRequest{}, nil); rec.Code != 403 {
 			t.Fatalf("device token at upload: %d", rec.Code)
 		}
-		if rec := tg.do(t, "GET", "/sync/v1/exceptions", a.d.Token(), nil, nil); rec.Code != 401 {
+		if rec := tg.do(t, "GET", "/sync/v1/exceptions", a.d.Token(), nil, nil); rec.Code != 403 {
 			t.Fatalf("device token at exceptions: %d", rec.Code)
 		}
 	})

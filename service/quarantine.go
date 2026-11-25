@@ -88,37 +88,50 @@ func (g *Gateway) Exceptions(ctx context.Context, tenant string) ([]QuarantineIt
 	return out, err
 }
 
-// Release lets a held slot into normal processing, where it is checked as above (S11).
+// MarkVendorConfirmed marks a held slot whose cause Hostry support has confirmed (S11): a
+// chain-broken, foreign-series or fork hold can be released by a manager only after it.
+const MarkVendorConfirmed = "vendor_confirmed"
+
+// Release lets a held slot into normal processing, where it is checked as above (S11). It is the
+// service-level call (tests, simulator, the ingest hooks); the manager endpoint goes through
+// ReleaseAs, which checks outlet scope and permission and writes the audit record.
 func (g *Gateway) Release(ctx context.Context, tenant string, ref sp.Ref, o ReleaseOpts) (string, error) {
-	e := g.engineFor(tenant)
 	var status string
 	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
-		rec, ok, err := tx.GetOp(ref.Stream, ref.Origin, ref.Seq)
-		if err != nil {
-			return err
-		}
-		if !ok || rec.Status != repository.StQuarantined {
-			return ErrNotFound
-		}
-		switch rec.Reason {
-		case ReasonChainBroken, ReasonForeignSeries, ReasonFork:
-			if !o.VendorConfirmed {
-				return ErrNeedsVendor
-			}
-		case ReasonUnsealedTail:
-			if !o.DeviceRecover {
-				return ErrNeedsRecoverPerm
-			}
-		case ReasonOpaque:
-			return ErrCannotRelease
-		}
-		status, err = g.releaseTx(tx, e, rec, nil)
+		var err error
+		status, _, err = g.releaseIn(tx, ref, o)
 		return err
 	})
 	if err == nil && status != "" {
 		g.poker(tenant).bump()
 	}
 	return status, err
+}
+
+// releaseIn is Release inside the caller's transaction. before is the status the slot had.
+func (g *Gateway) releaseIn(tx repository.Tx, ref sp.Ref, o ReleaseOpts) (status, before string, err error) {
+	e := g.engineFor(tx.Tenant())
+	rec, ok, err := tx.GetOp(ref.Stream, ref.Origin, ref.Seq)
+	if err != nil {
+		return "", "", err
+	}
+	if !ok || rec.Status != repository.StQuarantined {
+		return "", "", ErrNotFound
+	}
+	switch rec.Reason {
+	case ReasonChainBroken, ReasonForeignSeries, ReasonFork:
+		if !o.VendorConfirmed && !hasMark(splitMarks(rec.Marks), MarkVendorConfirmed) {
+			return "", "", ErrNeedsVendor
+		}
+	case ReasonUnsealedTail:
+		if !o.DeviceRecover {
+			return "", "", ErrNeedsRecoverPerm
+		}
+	case ReasonOpaque:
+		return "", "", ErrCannotRelease
+	}
+	status, err = g.releaseTx(tx, e, rec, nil)
+	return status, rec.Status, err
 }
 
 // releaseTx judges a held slot as released. An op accepted without an origin seal gets a gateway
@@ -240,28 +253,34 @@ func (g *Gateway) RotateOpKey(ctx context.Context, next *sp.KeyPair, tenants ...
 }
 
 // Discard removes a held slot's effect: allowed only for an op with no legal document number. It
-// is carried out as a void so that LAN peers that already applied the op converge (S11).
+// is carried out as a void so that LAN peers that already applied the op converge (S11). Like
+// Release it is the service-level call; the manager endpoint uses DiscardAs.
 func (g *Gateway) Discard(ctx context.Context, tenant string, ref sp.Ref) error {
-	e := g.engineFor(tenant)
 	return g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
-		rec, ok, err := tx.GetOp(ref.Stream, ref.Origin, ref.Seq)
-		if err != nil {
-			return err
-		}
-		if !ok || rec.Status != repository.StQuarantined {
-			return ErrNotFound
-		}
-		b, derr := sp.DecodeBody(rec.Body)
-		if derr != nil || b.Doc != nil || rec.Reason == ReasonForeignSeries {
-			return ErrDiscardNumbered
-		}
-		rec.Status, rec.Reason = repository.StVoided, ReasonDiscarded
-		if err := tx.UpdateOp(rec); err != nil {
-			return err
-		}
-		return g.stored(tx, e, rec, &engine.Parsed{Item: sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq}, Body: b},
-			engine.Verdict{Status: repository.StVoided, Reason: ReasonDiscarded, Void: true})
+		_, err := g.discardIn(tx, ref)
+		return err
 	})
+}
+
+func (g *Gateway) discardIn(tx repository.Tx, ref sp.Ref) (before string, err error) {
+	e := g.engineFor(tx.Tenant())
+	rec, ok, err := tx.GetOp(ref.Stream, ref.Origin, ref.Seq)
+	if err != nil {
+		return "", err
+	}
+	if !ok || rec.Status != repository.StQuarantined {
+		return "", ErrNotFound
+	}
+	b, derr := sp.DecodeBody(rec.Body)
+	if derr != nil || b.Doc != nil || rec.Reason == ReasonForeignSeries {
+		return "", ErrDiscardNumbered
+	}
+	rec.Status, rec.Reason = repository.StVoided, ReasonDiscarded
+	if err := tx.UpdateOp(rec); err != nil {
+		return "", err
+	}
+	return repository.StQuarantined, g.stored(tx, e, rec, &engine.Parsed{Item: sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq}, Body: b},
+		engine.Verdict{Status: repository.StVoided, Reason: ReasonDiscarded, Void: true})
 }
 
 // ReverifyPending re-judges configuration ops that waited for identity (S11, A1.2 item 4).
@@ -307,49 +326,66 @@ type RegisterReport struct {
 func (g *Gateway) Register(ctx context.Context, tenant string) (RegisterReport, error) {
 	var rep RegisterReport
 	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
-		entries, err := tx.Register()
-		if err != nil {
-			return err
-		}
-		rep.Entries = entries
-		type key struct{ code, fy string }
-		have := map[key]map[int64]bool{}
-		for _, e := range entries {
-			switch e.Mark {
-			case MarkForeign:
-				rep.Foreign = append(rep.Foreign, e)
-				continue
-			case MarkUnknownSeries:
-				rep.Unknown = append(rep.Unknown, e)
-				continue
-			}
-			k := key{e.Code, e.FY}
-			if have[k] == nil {
-				have[k] = map[int64]bool{}
-			}
-			have[k][e.Num] = true
-		}
-		for k, nums := range have {
-			var max int64
-			for n := range nums {
-				if n > max {
-					max = n
-				}
-			}
-			var missing []int64
-			for n := int64(1); n <= max; n++ {
-				if !nums[n] {
-					missing = append(missing, n)
-				}
-			}
-			if len(missing) > 0 {
-				rep.Gaps = append(rep.Gaps, Gap{Code: k.code, FY: k.fy, Missing: missing})
-			}
-		}
-		sort.Slice(rep.Gaps, func(i, j int) bool { return rep.Gaps[i].Code+rep.Gaps[i].FY < rep.Gaps[j].Code+rep.Gaps[j].FY })
-		return nil
+		var err error
+		rep, err = registerReport(tx, nil)
+		return err
 	})
 	return rep, err
+}
+
+// registerReport builds the register with its gap check; keep, when set, narrows the entries (to the
+// outlets of the caller). The gap check runs on what is kept, so a manager sees gaps of their outlets.
+func registerReport(tx repository.Tx, keep func(repository.RegisterEntry) bool) (RegisterReport, error) {
+	rep := RegisterReport{Entries: []repository.RegisterEntry{}}
+	all, err := tx.Register()
+	if err != nil {
+		return rep, err
+	}
+	var entries []repository.RegisterEntry
+	for _, e := range all {
+		if keep == nil || keep(e) {
+			entries = append(entries, e)
+		}
+	}
+	if entries != nil {
+		rep.Entries = entries
+	}
+	type key struct{ code, fy string }
+	have := map[key]map[int64]bool{}
+	for _, e := range entries {
+		switch e.Mark {
+		case MarkForeign:
+			rep.Foreign = append(rep.Foreign, e)
+			continue
+		case MarkUnknownSeries:
+			rep.Unknown = append(rep.Unknown, e)
+			continue
+		}
+		k := key{e.Code, e.FY}
+		if have[k] == nil {
+			have[k] = map[int64]bool{}
+		}
+		have[k][e.Num] = true
+	}
+	for k, nums := range have {
+		var max int64
+		for n := range nums {
+			if n > max {
+				max = n
+			}
+		}
+		var missing []int64
+		for n := int64(1); n <= max; n++ {
+			if !nums[n] {
+				missing = append(missing, n)
+			}
+		}
+		if len(missing) > 0 {
+			rep.Gaps = append(rep.Gaps, Gap{Code: k.code, FY: k.fy, Missing: missing})
+		}
+	}
+	sort.Slice(rep.Gaps, func(i, j int) bool { return rep.Gaps[i].Code+rep.Gaps[i].FY < rep.Gaps[j].Code+rep.Gaps[j].FY })
+	return rep, nil
 }
 
 // Alerts lists the tenant's alerts.

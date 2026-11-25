@@ -47,6 +47,7 @@ type World struct {
 	Net      *Net
 	Identity *identitystub.Identity
 	Issuer   *authtest.Issuer
+	Services *authtest.ServiceRegistry
 	Tenant   string
 	Outlet   string
 	Brand    string
@@ -153,7 +154,9 @@ func (w *World) startGateway() error {
 	w.GW = gw
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: w.Issuer.Verifier(), Dir: w.Identity}, Backend: api.GatewayBackend{G: gw}})
-	api.Admin(mux, gw, w.Issuer.Verifier())
+	w.Services = authtest.NewServiceRegistry(clock.Func(w.Clock.Now), "admin", "sync")
+	api.Admin(mux, gw, api.AdminAuth{Tenant: w.Issuer.Verifier(), Services: w.Services.Verifier("sync"),
+		Audit: &repository.AccessSink{S: w.GWStore.(*repository.SQL)}, Clock: clock.Func(w.Clock.Now)})
 	w.CloudH = mux
 	return nil
 }

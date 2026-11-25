@@ -39,9 +39,28 @@ svc-sync during the Phase 1 proof of concept; it should move to `api-specs` (`op
   unmarked), the stored attestation(s), and in a pull the credential(s) of the adopting device. A node therefore must
   *store* what it verified (endorsements, attestations) and re-serve it with the ops. A released op answered for a
   `placeholders` entry carries its endorsement, attestation and the credential the same way. A node holding the
-  placeholder verifies an endorsement that arrives with the body by the rule above and marks the op `unsealed`; a body that
-  arrives with no endorsement is an ordinary released slot and is taken by hash, as before A2 (a residual: the same upstream
-  gave the placeholder's hash).
+  placeholder verifies an endorsement that arrives with the body by the rule above and marks the op `unsealed`. A body that
+  arrives with no endorsement is taken by hash under the A2.8 rules below.
+- **Placeholders and bodies taken by hash (ADR-0002 A2.8 item 1).**
+  1. *No placeholder above the proven head.* A node accepts a placeholder only inside a range a valid seal (or an
+     endorsement under the A2.1 rule) covers. A placeholder after the last covered slot is accepted only from the **cloud**
+     (the node's upstream is the cloud itself: a hub's own upstream, or a device's direct cloud route); from a hub or any
+     other relay it is refused (`unsealed`) and nothing is stored. A relay never **serves** a trailing placeholder either,
+     and a seal that names a placeholder slot is stored and served with it.
+  2. *Bind whenever it can be bound.* A body for a held placeholder must hash to the held `h`; it must chain to the op
+     held at `seq-1` (genesis for 1); if a seal names `(seq, h)` it must match; if the op at `seq+1` is held with a body
+     (and is not itself `unbound`) its `ph` must equal the body's hash. A body for a slot above the origin's sealed head is
+     taken only from the cloud. When a later pull supplies the op above a slot taken `unbound`, the link is checked then and
+     clears the mark.
+  3. *Mark and cross-check.* A body taken with nothing to bind it is marked `unbound` in the node's audit views. A node
+     **never relays an `unbound` op** (a hub's `pull` and `push` stop before it, and before everything after it in that
+     origin's chain). At every **direct cloud `hello`** the node lists them in `unbound`; the gateway answers `unbound_h`
+     with its own `h` for each slot it holds; equal clears the mark. A node that reaches the cloud only through a hub must
+     do a direct `hello` at least every 24 hours when the cloud is reachable (`Engine.DirectCloudDue`).
+  4. *A mismatch is never silent.* A body that contradicts the held hash, a seal or a link, and an `unbound_h` that
+     differs, is a **`chain_conflict`**: the slot is refused (`chain_conflict` in `refused`), the node keeps what it holds,
+     takes nothing more of that origin and stream from that kind of upstream (cloud or relay), and sends the conflict in
+     `chain_conflicts` of its next direct cloud `hello`; the gateway raises one vendor alert (`chain_conflict`) per slot.
 - **After a cloud restore (A2.1 item 5).** While its re-offer is open a node's push also carries `items` + `endorsements`
   (+ `attestations`) for endorsed ops *at or below* the cloud's vector. The gateway takes a slot it holds as `quarantined`
   (`unsealed_tail`) as released, marked `unsealed`, with no owner action, if endorsement, credential and attestation
@@ -51,6 +70,12 @@ svc-sync during the Phase 1 proof of concept; it should move to `api-specs` (`op
   lists any op whose stored endorsement is under a dropped key in `placeholders`; the answer carries the re-issued
   endorsement and replaces the stored one. A node that holds only the new key converges from the cloud (or from a hub
   that has refreshed).
+- **Stale cloud seals (A2.8 item 2).** A relay also refreshes the cloud-origin **seals** it stored: `pull` carries
+  `stale_seals` (the `origin/stream/seq` of every stored seal under a dropped key, at most 200) and the answer carries
+  `seal_refresh` (the seals as the upstream holds them now). A refreshed seal replaces the stored one only if it verifies
+  under a key the node accepts, **under the `kid` it names** (never another held key), and names the hash already held.
+  Interim: a node that refuses a cloud-origin seal under a dropped key marks a direct cloud read as due, so it does not
+  stall silently.
 - Vectors are flat maps keyed `origin/stream`. Placeholders (no `body`) fill held slots and carry `h`.
 
 ## Sync void (answer to "is the assumed encoding right")
@@ -91,6 +116,18 @@ defeat the seal). `KeyRing.addCloudKey(kid, pub)` is the right entry. Seals carr
   contact for another reason (pack refresh, delivery of an op a hub will not relay) compares epoch and vector the same way.
   A device with no cloud route stays open; the gateway raises "unrecoverable origin gap" 24 hours after a node first reports
   a vector above the cloud's, and clears it when the node's vector is no longer above.
+
+## Manager and vendor endpoints
+Cloud only, on go-auth's `Guard`: tenant-realm user or support token, never a device token. A support token is accepted
+only with the `admin` service token (ADR-0013 V2), never carries `*`, a sensitive, strong-only or owner-grant permission,
+and every request on its authority is written to `vendor_access_log` in the transaction of the action (a refusal in a short
+one of its own). Lists and decisions are scoped by outlet: a slot of another outlet is 404, a brand or tenant stream needs
+an all-outlets grant. `release`, `discard` and `confirm` take `{origin, stream, seq, reason}` (reason 1 to 200 characters)
+and write the tenant-visible `audit_log` record (actor, action, slot, reason, status before and after) in the same
+transaction as the status change. Release of a chain-broken, foreign-series or fork hold needs the vendor confirmation first:
+`confirm` (a support token in act mode, permission `sync.quarantine.confirm`, `support_actable`) marks the slot
+`vendor_confirmed` and releases nothing. An unsealed tail also needs `device.recover` (`strong_only`): refused with
+`approval_required` on a binding under caution. The permissions and flags are in `docs/poc-notes.md`.
 
 ## Verdicts and read-back
 Devices learn about their own held slots only as `held` (push) and `own_held` (pull) with one of

@@ -97,6 +97,8 @@ type Alert struct {
 type Store interface {
 	// InTx runs fn in one transaction scoped to tenant (empty tenant only for platform tables).
 	InTx(ctx context.Context, tenant string, fn func(Tx) error) error
+	// Use runs fn on a transaction begun elsewhere (go-auth's audited transaction), tenant already set.
+	Use(ctx context.Context, tenant string, tx *sql.Tx, fn func(Tx) error) error
 	// Dialect is "sqlite" or "postgres".
 	Dialect() string
 	Close() error
@@ -151,6 +153,9 @@ type Tx interface {
 	PutRecovery(r Recovery) error
 	GetRecovery(recID string) (Recovery, bool, error)
 	RecoveryByOld(old string) (Recovery, bool, error)
+	// PutAudit appends a tenant-visible decision record; Audit lists them.
+	PutAudit(a AuditRec) error
+	Audit() ([]AuditRec, error)
 	AddAlert(audience, severity, kind, detail string) error
 	Alerts() ([]Alert, error)
 	// Exec is for service-owned tables in the same transaction (the outbox).

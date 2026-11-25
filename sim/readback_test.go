@@ -68,11 +68,11 @@ func TestRB1_AValidAndAnInvalidProofGiveTheDeviceIdenticalAnswers(t *testing.T) 
 		return rec.Code
 	}
 	dev := badW.Token(auth.TypeDevice, badW.Devices[0].ID, "")
-	if c := get(badW, dev); c != http.StatusUnauthorized {
+	if c := get(badW, dev); c != http.StatusForbidden {
 		t.Fatalf("a device token must not reach the exceptions report, got %d", c)
 	}
 	cashier := badW.Issuer.Mint(authtest.Spec{Type: auth.TypePin, Tenant: ids.ID(badW.Tenant), Device: badW.Devices[0].ID, Grants: authtest.Grants(nil, "order.create")})
-	if c := get(badW, cashier); c != http.StatusUnauthorized {
+	if c := get(badW, cashier); c != http.StatusForbidden {
 		t.Fatalf("a cashier pin session must not reach the exceptions report, got %d", c)
 	}
 	owner := badW.Issuer.Mint(authtest.Spec{Type: auth.TypeUser, Tenant: ids.ID(badW.Tenant), Grants: authtest.OwnerGrants()})

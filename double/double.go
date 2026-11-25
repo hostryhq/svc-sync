@@ -36,6 +36,7 @@ const (
 type Double struct {
 	Identity *identitystub.Identity
 	Issuer   *authtest.Issuer
+	Services *authtest.ServiceRegistry
 	Gateway  *service.Gateway
 	Store    repository.Store
 
@@ -70,7 +71,9 @@ func New(ctx context.Context) (*Double, error) {
 	}
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: d.Issuer.Verifier(), Dir: d.Identity}, Backend: api.GatewayBackend{G: d.Gateway}})
-	api.Admin(mux, d.Gateway, d.Issuer.Verifier())
+	d.Services = authtest.NewServiceRegistry(clock.Func(d.Now), "admin", "sync")
+	api.Admin(mux, d.Gateway, api.AdminAuth{Tenant: d.Issuer.Verifier(), Services: d.Services.Verifier("sync"),
+		Audit: &repository.AccessSink{S: d.Store.(*repository.SQL)}, Clock: clock.Func(d.Now)})
 	d.h = mux
 	return d, nil
 }

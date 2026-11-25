@@ -86,33 +86,42 @@ paths:
         '403': {$ref: '#/components/responses/Problem'}
   /sync/v1/quarantine:
     get:
-      operationId: listQuarantine
-      x-permission: sync.quarantine.manage
+      operationId: listSyncQuarantine
+      x-permission: sync.quarantine.read
       tags: [admin]
       summary: Cloud only, member token. The held list with reasons (never sent to devices).
       security: [{memberBearer: []}]
       responses: {'200': {description: ok}}
   /sync/v1/quarantine/release:
     post:
-      operationId: releaseQuarantine
+      operationId: releaseSyncQuarantine
       x-permission: sync.quarantine.manage
       tags: [admin]
-      summary: Release a held slot into normal processing; chain-broken, foreign-series and fork need a support token in act mode; an unsealed tail needs device.recover.
+      summary: Release a held slot into normal processing; chain-broken, foreign-series and fork need the vendor confirmation first; an unsealed tail needs device.recover. Outlet-scoped, audited.
       security: [{memberBearer: []}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Ref'}}}}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
       responses: {'200': {description: ok}, '409': {$ref: '#/components/responses/Problem'}}
   /sync/v1/quarantine/discard:
     post:
-      operationId: discardQuarantine
+      operationId: discardSyncQuarantine
       x-permission: sync.quarantine.manage
       tags: [admin]
-      summary: Discard a held slot that carries no legal number (carried out as a void).
+      summary: Discard a held slot that carries no legal number (carried out as a void). Outlet-scoped, audited.
       security: [{memberBearer: []}]
-      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Ref'}}}}
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
       responses: {'200': {description: ok}, '409': {$ref: '#/components/responses/Problem'}}
+  /sync/v1/quarantine/confirm:
+    post:
+      operationId: confirmSyncQuarantine
+      x-permission: sync.quarantine.confirm
+      tags: [admin]
+      summary: Hostry support confirms the cause of a chain-broken, foreign-series or fork hold (support token in act mode with the admin service token). Releases nothing; the owner's manager releases afterwards.
+      security: [{memberBearer: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/Decision'}}}}
+      responses: {'200': {description: ok}, '403': {$ref: '#/components/responses/Problem'}, '409': {$ref: '#/components/responses/Problem'}}
   /sync/v1/exceptions:
     get:
-      operationId: listExceptions
+      operationId: listSyncExceptions
       x-permission: sync.exceptions.read
       tags: [admin]
       summary: Flagged ops with their marks. The only place flags and attribution labels are readable; never reachable with a device token (A1.2 item 2).
@@ -120,7 +129,7 @@ paths:
       responses: {'200': {description: ok}}
   /sync/v1/series-register:
     get:
-      operationId: getSeriesRegister
+      operationId: getSyncSeriesRegister
       x-permission: sync.register.read
       tags: [admin]
       summary: Every legal number seen, with gaps, foreign claims and unknown series.
@@ -295,6 +304,33 @@ components:
         vector: {$ref: '#/components/schemas/Vector'}
         epoch: {type: string, description: Cloud epoch this node last synced under.}
         cloud_vector: {$ref: '#/components/schemas/Vector'}
+        unbound: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: "Direct cloud hello only: slots taken by hash with no binding yet (A2.8 item 1.3). The cloud answers `unbound_h`."}
+        chain_conflicts: {type: array, items: {$ref: '#/components/schemas/Conflict'}, description: "Direct cloud hello only: chain conflicts recorded and not yet reported (A2.8 item 1.4). The gateway raises one vendor alert per slot."}
+    Conflict:
+      type: object
+      required: [origin, stream, seq, held]
+      properties:
+        origin: {type: string, description: Origin of the slot.}
+        stream: {type: string, description: Stream of the slot.}
+        seq: {type: integer, format: int64, description: Sequence of the slot.}
+        held: {type: string, description: The hash the node holds at the slot.}
+        seen: {type: string, description: The contradicting hash the upstream or the cloud presented.}
+    SlotHash:
+      type: object
+      required: [origin, stream, seq, h]
+      properties:
+        origin: {type: string, description: Origin of the slot.}
+        stream: {type: string, description: Stream of the slot.}
+        seq: {type: integer, format: int64, description: Sequence of the slot.}
+        h: {type: string, description: The cloud's own hash for the slot.}
+    Decision:
+      type: object
+      required: [origin, stream, seq, reason]
+      properties:
+        origin: {type: string, description: Origin of the held slot.}
+        stream: {type: string, description: Stream of the held slot.}
+        seq: {type: integer, format: int64, description: Sequence of the held slot.}
+        reason: {type: string, minLength: 1, maxLength: 200, description: Why; kept in the tenant-visible audit record.}
     HelloResponse:
       type: object
       required: [protocol, role, node_id, time, vector, min_supported_version, snapshot_required, streams]
@@ -309,6 +345,7 @@ components:
         min_supported_version: {type: string, description: Gates pulling (S13).}
         snapshot_required: {type: boolean, description: Always false in the PoC; the snapshot client is not built.}
         streams: {type: array, items: {type: string}, description: Streams the caller is bound to.}
+        unbound_h: {type: array, items: {$ref: '#/components/schemas/SlotHash'}, description: "The cloud's own hash for each listed `unbound` slot it holds; equal clears the mark, different is a chain_conflict."}
     PushRequest:
       type: object
       required: [items]
@@ -333,6 +370,7 @@ components:
         vector: {$ref: '#/components/schemas/Vector'}
         streams: {type: array, items: {type: string}, description: Restrict to streams.}
         placeholders: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: Slots held only as placeholders, to receive them once released.}
+        stale_seals: {type: array, items: {$ref: '#/components/schemas/Ref'}, description: "Stored cloud-origin seals under a dropped op-signing key, at most 200 (A2.8 item 2). The answer is `seal_refresh`."}
         limit: {type: integer, description: Soft cap, at most 500; a batch always ends at a seal.}
     PullResponse:
       type: object
@@ -344,6 +382,7 @@ components:
         creds: {type: array, items: {$ref: '#/components/schemas/CredentialEnvelope'}, description: Credentials of the origins in items, and of the adopting devices (`recovers`) when endorsements are present.}
         endorsements: {type: array, items: {$ref: '#/components/schemas/Endorsement'}, description: Every endorsement of the ops in this batch, and of released ops answered for `placeholders`. A hub re-serves what it stored.}
         attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}, description: The attestations that go with the endorsements.}
+        seal_refresh: {type: array, items: {$ref: '#/components/schemas/Seal'}, description: "The seals for `stale_seals` as the upstream holds them now."}
         more: {type: boolean, description: More slots are available.}
         own_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: Complete current list of the caller's own held slots; replace the local list.}
         relay_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: For role hub only.}
