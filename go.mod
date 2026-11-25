@@ -4,14 +4,16 @@ go 1.27
 
 require (
 	github.com/enbility/zeroconf/v2 v2.0.0-20240920094356-be1cae74fda6
-	github.com/hostryhq/go-auth v0.0.0-20261125000521-b19b5407e3f2
-	github.com/hostryhq/go-common v0.0.0-20261125020101-732c3b1fd21a
+	github.com/hostryhq/go-auth v0.0.0-20261125030157-94f1970efd79
+	github.com/hostryhq/go-common v0.0.0-20261125032613-92884d6c83f8
 	github.com/jackc/pgx/v5 v5.13.0
+	github.com/oapi-codegen/runtime v1.9.1
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.63.0
 )
 
 require (
+	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
