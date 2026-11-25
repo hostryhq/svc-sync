@@ -646,7 +646,18 @@ func (t *sqlTx) PutPII(stream, origin string, seq int64, data string) error {
 }
 
 func (t *sqlTx) ErasePII(stream, origin string, seq int64) error {
-	return t.exec(`DELETE FROM op_pii WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`, t.tenant, stream, origin, seq)
+	if err := t.exec(`DELETE FROM op_pii WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`, t.tenant, stream, origin, seq); err != nil {
+		return err
+	}
+	if t.s.Dialect() != "postgres" {
+		return nil // the outbox exists on the gateway's Postgres only
+	}
+	// P2-M1: the outbox copy of the op's event holds the values and salts; published rows are kept for the relay's retention and a
+	// bus reset republishes them, so the pii is cut out of every row of the op (published or not) in the erasing transaction.
+	_, err := t.tx.ExecContext(t.ctx, `UPDATE outbox SET payload = convert_to((convert_from(payload, 'UTF8')::jsonb #- '{data,pii}')::text, 'UTF8')
+		WHERE tenant_id = $1 AND key = $2 AND key_seq = $3 AND type LIKE 'sync.op.%' AND convert_from(payload, 'UTF8')::jsonb #> '{data,pii}' IS NOT NULL`,
+		t.tenant, stream+"|"+origin, seq)
+	return err
 }
 
 func (t *sqlTx) PutSession(origin, sid, stype, openedAt string) error {
