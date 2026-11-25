@@ -32,6 +32,13 @@ func (h *Hub) ApplyPack(ctx context.Context, p HubPack) error {
 	for _, d := range p.Revoked {
 		h.Revoke(d)
 	}
+	// The peers the pack lists are known on the LAN at once, so a tablet relays to another with no cloud contact first. A peer
+	// revoked here or earlier is not added.
+	for _, pc := range p.Peers {
+		if !h.IsRevoked(pc.DeviceID) {
+			h.cache.AddLAN(pc)
+		}
+	}
 	return h.cfg.Store.InTx(ctx, h.cfg.Tenant, func(tx repository.Tx) error { return tx.SetMeta(metaPack, p.Raw) })
 }
 
@@ -78,7 +85,7 @@ func StorePack(ctx context.Context, st repository.Store, tenant, raw string) err
 
 // LoadStoredPack reads the pack kept by StorePack and verifies it against the identity keys it names itself: the store's
 // authenticated encryption is what vouches for the file, the signature is the integrity check of the pack's content.
-func LoadStoredPack(ctx context.Context, st repository.Store, tenant, deviceID string) (HubPack, error) {
+func LoadStoredPack(ctx context.Context, st repository.Store, tenant, deviceID string, pol PackPolicy) (HubPack, error) {
 	var raw string
 	var ok bool
 	err := st.InTx(ctx, tenant, func(tx repository.Tx) error {
@@ -92,7 +99,7 @@ func LoadStoredPack(ctx context.Context, st repository.Store, tenant, deviceID s
 	if !ok {
 		return HubPack{}, ErrPack
 	}
-	return VerifyPack(raw, nil, deviceID)
+	return VerifyPack(raw, deviceID, pol)
 }
 
 // ID is the hub's own device id.

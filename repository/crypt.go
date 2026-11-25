@@ -15,8 +15,8 @@ import (
 )
 
 // Column encryption of the hub store (ADR-0002 A3.2). Every column that carries a field value is AES-256-GCM sealed under a
-// random 256-bit data key: op bodies, personal data (values and salts), meta values (the stored pack, markers) and fork
-// evidence. Ids, sequence numbers, clocks, hashes, seals, commitments and intent names stay clear because the hub indexes on
+// random 256-bit data key: op bodies, personal data (values and salts), meta values (the stored pack, markers), fork
+// evidence, alert details and approval-verdict reasons (round 7: both can quote an operator's words). Ids, sequence numbers, clocks, hashes, seals, commitments and intent names stay clear because the hub indexes on
 // them. The table, primary key, column and key id are bound as associated data, so a ciphertext copied to another row fails to
 // open. The data keys are wrapped by a keyprotect.Provider and stored beside the data; a new data key is made every 90 days.
 
@@ -137,7 +137,8 @@ func (s *SQL) PruneDataKeys(ctx context.Context) error {
 			continue
 		}
 		cited := false
-		for _, q := range []string{`SELECT 1 FROM ops WHERE substr(body,1,?)=? LIMIT 1`, `SELECT 1 FROM op_pii WHERE substr(data,1,?)=? LIMIT 1`, `SELECT 1 FROM meta WHERE substr(v,1,?)=? LIMIT 1`, `SELECT 1 FROM forks WHERE substr(body,1,?)=? LIMIT 1`} {
+		for _, q := range []string{`SELECT 1 FROM ops WHERE substr(body,1,?)=? LIMIT 1`, `SELECT 1 FROM op_pii WHERE substr(data,1,?)=? LIMIT 1`, `SELECT 1 FROM meta WHERE substr(v,1,?)=? LIMIT 1`, `SELECT 1 FROM forks WHERE substr(body,1,?)=? LIMIT 1`,
+			`SELECT 1 FROM alerts WHERE substr(detail,1,?)=? LIMIT 1`, `SELECT 1 FROM approval_verdicts WHERE substr(reason,1,?)=? LIMIT 1`} {
 			p := encPrefix + id + "."
 			var one int
 			err := s.db.QueryRowContext(ctx, q, len(p), p).Scan(&one)

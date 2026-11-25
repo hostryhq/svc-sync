@@ -40,7 +40,7 @@ func identityNode(ctx context.Context, log *slog.Logger, get func(string) string
 	if err != nil {
 		return nil, err
 	}
-	pack, err := hub.LoadStoredPack(ctx, store, st.Tenant, st.DeviceID)
+	pack, err := hub.LoadStoredPack(ctx, store, st.Tenant, st.DeviceID, packPolicy(get))
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -63,7 +63,7 @@ func identityNode(ctx context.Context, log *slog.Logger, get func(string) string
 	}
 	n := &node{h: h, close: func() { _ = store.Close() }, cloudURL: get("SYNC_HUB_CLOUD_URL")}
 	if base := get("SYNC_HUB_IDENTITY_URL"); base != "" {
-		idc := &hub.IdentityClient{Base: base}
+		idc := &hub.IdentityClient{Base: base, Policy: packPolicy(get)}
 		n.token = func(ctx context.Context) (string, error) { return idc.Token(ctx, st.DeviceID, key) }
 		n.refresh = func(ctx context.Context) error {
 			p, err := idc.Pack(ctx, st.DeviceID, key)

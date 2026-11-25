@@ -73,12 +73,52 @@ type HubPackClaims struct {
 		Status      string   `json:"status"`
 		Permissions []string `json:"permissions"`
 	} `json:"members"`
-	RevokedDeviceIDs   []string `json:"revoked_device_ids"`
-	IntentTableVersion int      `json:"intent_table_version"`
-	IssuedAt           string   `json:"issued_at"`
-	OfflineValidUntil  string   `json:"offline_valid_until"`
-	IdentityPublicKeys []Jwk    `json:"identity_public_keys"`
-	OpSigningPublicKey Jwk      `json:"op_signing_public_key"`
+	RevokedDeviceIDs   []string      `json:"revoked_device_ids"`
+	IntentTableVersion int           `json:"intent_table_version"`
+	IssuedAt           string        `json:"issued_at"`
+	OfflineValidUntil  string        `json:"offline_valid_until"`
+	IssuerEnv          string        `json:"issuer_env"`
+	Peers              []HubPackPeer `json:"peers"`
+	IdentityPublicKeys []Jwk         `json:"identity_public_keys"`
+	OpSigningPublicKey Jwk           `json:"op_signing_public_key"`
+}
+
+// HubPackPeer is a peer device of the hub's outlet as the hub pack lists it (HubPackPeer in api-specs): the same facts as the
+// peer's own PackDevice, so tablet-to-tablet relay needs no cloud contact first. It holds no member data.
+type HubPackPeer struct {
+	DeviceID   string `json:"device_id"`
+	Kind       string `json:"kind"`
+	Kid        string `json:"kid"`
+	PublicKey  Jwk    `json:"public_key"`
+	Store      string `json:"store"`
+	Credential string `json:"credential"`
+}
+
+// PackJWSType is the `typ` header of a pack JWS.
+const PackJWSType = "hostry-pack+jws"
+
+// PackPolicy is what this hub build and environment accept of a pack's issuer (the `issuer_env` claim, signed with the pack).
+type PackPolicy struct {
+	// Env is this hub's HOSTRY_ENV. Live refuses a pack from any other issuer environment.
+	Env string
+	// DevLAN is true in a binary built with the tag devlan, which refuses a pack from a live issuer.
+	DevLAN bool
+}
+
+// Accept judges an issuer_env claim: a known value, never a live pack in a devlan build, never a non-live pack in a live hub.
+func (p PackPolicy) Accept(issuerEnv string) error {
+	switch issuerEnv {
+	case "dev", "test", "ci", "live":
+	default:
+		return fmt.Errorf("%w: issuer_env", ErrPack)
+	}
+	if p.DevLAN && issuerEnv == "live" {
+		return fmt.Errorf("%w: a development build refuses a live pack", ErrPack)
+	}
+	if p.Env == "live" && issuerEnv != "live" {
+		return fmt.Errorf("%w: a live hub refuses a pack from a %s issuer", ErrPack, issuerEnv)
+	}
+	return nil
 }
 
 // HubPack is a verified hub pack in the form the hub runs on.
@@ -98,36 +138,27 @@ type HubPack struct {
 	Members    map[string][]string
 	Revoked    []string
 	ValidUntil time.Time
+	IssuerEnv  string
+	// Peers are the outlet's other devices as the pack lists them, each credential verified under the identity keys.
+	Peers []sp.Credential
 }
 
 // ErrPack is returned for a pack that does not verify or does not belong to this hub.
 var ErrPack = errors.New("hub: pack not acceptable")
 
-// VerifyPack checks a hub pack JWS against the identity keys, that it is for deviceID, and returns it in running form.
-//
-// packSigningKeys are the keys that may have signed the pack JWS itself. Identity signs packs with a pack-signing key that no
-// published document carries yet (open contract question, reported with this change), so callers pass none and the JWS signature
-// is then not checked: the pack is trusted for what the channel vouches for (HTTPS to identity, or the encrypted store), and
-// everything the LAN relies on is verified independently, the hub's own credential under the identity keys the pack names.
-func VerifyPack(jws string, packSigningKeys []*ecdsa.PublicKey, deviceID string) (HubPack, error) {
+// VerifyPack checks a hub pack JWS and returns it in running form. The whole pack is verified: its header must be ES256 with
+// typ hostry-pack+jws, its `kid` must name one of the `identity_public_keys` the pack itself carries, and the signature must
+// verify under that key (the pack claims the current and the next identity key, also served by the identity JWKS). The pack is
+// for deviceID, its hub credential and every peer credential verify under the same keys, and its issuer_env passes pol.
+func VerifyPack(jws, deviceID string, pol PackPolicy) (HubPack, error) {
 	parts := strings.Split(jws, ".")
 	if len(parts) != 3 {
 		return HubPack{}, fmt.Errorf("%w: shape", ErrPack)
 	}
 	hb, err := decodeB64(parts[0])
-	var hdr struct{ Alg string }
-	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr.Alg != "ES256" {
+	var hdr struct{ Alg, Kid, Typ string }
+	if err != nil || json.Unmarshal(hb, &hdr) != nil || hdr.Alg != "ES256" || hdr.Typ != PackJWSType || hdr.Kid == "" {
 		return HubPack{}, fmt.Errorf("%w: header", ErrPack)
-	}
-	ok := len(packSigningKeys) == 0
-	for _, k := range packSigningKeys {
-		if k != nil && sp.VerifySig(k, parts[0]+"."+parts[1], parts[2]) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return HubPack{}, fmt.Errorf("%w: signature", ErrPack)
 	}
 	raw, err := decodeB64(parts[1])
 	if err != nil {
@@ -137,8 +168,24 @@ func VerifyPack(jws string, packSigningKeys []*ecdsa.PublicKey, deviceID string)
 	if json.Unmarshal(raw, &c) != nil || c.Device.DeviceID != deviceID || c.Device.Kind != sp.KindHub || c.Device.Credential == "" {
 		return HubPack{}, fmt.Errorf("%w: claims", ErrPack)
 	}
+	var signer *ecdsa.PublicKey
+	for _, j := range c.IdentityPublicKeys {
+		if j.Kid != hdr.Kid {
+			continue
+		}
+		if k, err := j.Pub(); err == nil {
+			signer = k
+		}
+		break
+	}
+	if signer == nil || !sp.VerifySig(signer, parts[0]+"."+parts[1], parts[2]) {
+		return HubPack{}, fmt.Errorf("%w: signature", ErrPack)
+	}
+	if err := pol.Accept(c.IssuerEnv); err != nil {
+		return HubPack{}, err
+	}
 	p := HubPack{Raw: jws, PackV: c.PackV, Tenant: c.OrganisationID, Outlet: c.Device.OutletID, Brand: c.Device.BrandID, CredJWS: c.Device.Credential,
-		OpKid: c.OpSigningPublicKey.Kid, Members: map[string][]string{}, Revoked: c.RevokedDeviceIDs}
+		OpKid: c.OpSigningPublicKey.Kid, IssuerEnv: c.IssuerEnv, Members: map[string][]string{}, Revoked: c.RevokedDeviceIDs}
 	for _, j := range c.IdentityPublicKeys {
 		k, err := j.Pub()
 		if err != nil {
@@ -162,6 +209,15 @@ func VerifyPack(jws string, packSigningKeys []*ecdsa.PublicKey, deviceID string)
 		return HubPack{}, fmt.Errorf("%w: credential", ErrPack)
 	}
 	p.Cred = cl
+	for _, pr := range c.Peers {
+		pc, err := sp.VerifyCredentialJWS(p.IdentityKeys, pr.Credential)
+		pk, kerr := pr.PublicKey.Pub()
+		if err != nil || kerr != nil || pc.DeviceID != pr.DeviceID || pc.Kind != pr.Kind || pc.Kid != pr.Kid || pc.Store != pr.Store ||
+			pc.TenantID != p.Tenant || pc.OutletID != p.Outlet || pc.Kind == sp.KindHub || pc.Pub != sp.EncodePub(pk) {
+			return HubPack{}, fmt.Errorf("%w: peer", ErrPack)
+		}
+		p.Peers = append(p.Peers, pc)
+	}
 	return p, nil
 }
 
@@ -170,6 +226,8 @@ type IdentityClient struct {
 	Base string
 	HTTP *http.Client
 	Now  func() time.Time
+	// Policy is what this build accepts of a pack's issuer_env.
+	Policy PackPolicy
 
 	mu      sync.Mutex
 	token   string
@@ -284,9 +342,7 @@ func (c *IdentityClient) Activate(ctx context.Context, code, name, deviceID stri
 	if err := c.do(ctx, http.MethodPost, "/v1/device-activations", "", body, &act); err != nil {
 		return Activated{}, err
 	}
-	// The pack came over the HTTPS connection to identity, which vouches for it; its signature must verify under the identity
-	// keys it names (the tenant realm's, which getJwks does not publish). Later packs are checked against these keys.
-	p, err := VerifyPack(act.OfflinePack.JWS, nil, deviceID)
+	p, err := VerifyPack(act.OfflinePack.JWS, deviceID, c.Policy)
 	if err != nil {
 		return Activated{}, err
 	}
@@ -348,5 +404,5 @@ func (c *IdentityClient) Pack(ctx context.Context, deviceID string, key *sp.KeyP
 	if err := c.do(ctx, http.MethodGet, "/v1/devices/"+deviceID+"/offline-packs/latest", tok, nil, &p); err != nil {
 		return HubPack{}, err
 	}
-	return VerifyPack(p.JWS, nil, deviceID)
+	return VerifyPack(p.JWS, deviceID, c.Policy)
 }

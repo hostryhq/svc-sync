@@ -115,3 +115,9 @@ func readState(dir string) (state, error) {
 func openStore(dbPath string, p keyprotect.Provider) (*repository.SQL, error) {
 	return repository.OpenEncrypted("file:"+dbPath, repository.EncryptOptions{Provider: p})
 }
+
+// packPolicy is what this binary and HOSTRY_ENV accept of a pack issuer_env (a devlan build refuses a live pack, a live hub
+// refuses any other).
+func packPolicy(get func(string) string) hub.PackPolicy {
+	return hub.PackPolicy{Env: get("HOSTRY_ENV"), DevLAN: devlanBuild}
+}

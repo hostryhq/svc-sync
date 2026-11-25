@@ -112,5 +112,20 @@ func (t *sqlTx) DeleteMeta(k string) error {
 }
 
 func (t *sqlTx) ResolveAlerts(kind, detail string) error {
-	return t.exec(`DELETE FROM alerts WHERE tenant_id=? AND kind=? AND detail=?`, t.tenant, kind, detail)
+	if t.s.crypt == nil {
+		return t.exec(`DELETE FROM alerts WHERE tenant_id=? AND kind=? AND detail=?`, t.tenant, kind, detail)
+	}
+	// A sealed detail cannot be matched in SQL: read the alerts of the kind, open them, delete the ones that match.
+	all, err := t.Alerts()
+	if err != nil {
+		return err
+	}
+	for _, a := range all {
+		if a.Kind == kind && a.Detail == detail {
+			if err := t.exec(`DELETE FROM alerts WHERE tenant_id=? AND id=?`, t.tenant, a.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

@@ -49,7 +49,7 @@ func activate(log *slog.Logger, get func(string) string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	idc := &hub.IdentityClient{Base: base}
+	idc := &hub.IdentityClient{Base: base, Policy: packPolicy(get)}
 	// The tier is shown to the owner at activation; a `dev` key file reports os-software and declares store unprotected (A3.5).
 	act, err := idc.Activate(ctx, code, envOr(get, "SYNC_HUB_NAME", "Hub"), string(ids.New()), key, "os-software", keyprotect.StoreClaim(prov))
 	if err != nil {

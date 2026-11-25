@@ -768,7 +768,14 @@ func (t *sqlTx) GetApprovalVerdict(origin, approvalID string) (string, bool, err
 
 const approvalCols = `origin, approval_id, verdict, kind, sid, intent, permission, target, action_hash, requester, approver, reason, approved_at, citer, citer_hlc`
 
+func pkApproval(tenant, origin, id string) string { return tenant + "|" + origin + "|" + id }
+
 func (t *sqlTx) PutApprovalRecord(r ApprovalRow) error {
+	reason, err := t.s.seal("approval_verdicts", pkApproval(t.tenant, r.Origin, r.ID), "reason", r.Reason)
+	if err != nil {
+		return err
+	}
+	r.Reason = reason
 	return t.exec(`UPDATE approval_verdicts SET kind=?, sid=?, intent=?, permission=?, target=?, action_hash=?, requester=?, approver=?, reason=?, approved_at=?
 		WHERE tenant_id=? AND origin=? AND approval_id=? AND kind=''`,
 		r.Kind, r.SID, r.Intent, r.Permission, r.Target, r.ActionHash, r.Requester, r.Approver, r.Reason, r.ApprovedAt, t.tenant, r.Origin, r.ID)
@@ -781,6 +788,10 @@ func (t *sqlTx) GetApproval(origin, approvalID string) (ApprovalRow, bool, error
 	if errors.Is(err, sql.ErrNoRows) {
 		return ApprovalRow{}, false, nil
 	}
+	if err != nil {
+		return r, false, err
+	}
+	r.Reason, err = t.s.open("approval_verdicts", pkApproval(t.tenant, r.Origin, r.ID), "reason", r.Reason)
 	return r, err == nil, err
 }
 
@@ -794,6 +805,10 @@ func (t *sqlTx) PendingApprovals() ([]ApprovalRow, error) {
 	for rows.Next() {
 		var r ApprovalRow
 		if err := rows.Scan(&r.Origin, &r.ID, &r.Verdict, &r.Kind, &r.SID, &r.Intent, &r.Permission, &r.Target, &r.ActionHash, &r.Requester, &r.Approver, &r.Reason, &r.ApprovedAt, &r.Citer, &r.CiterHLC); err != nil {
+			return nil, err
+		}
+		var err error
+		if r.Reason, err = t.s.open("approval_verdicts", pkApproval(t.tenant, r.Origin, r.ID), "reason", r.Reason); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -936,7 +951,13 @@ func (t *sqlTx) AddAlert(audience, severity, kind, detail string) error {
 	if err != nil {
 		return err
 	}
-	return t.exec(`INSERT INTO alerts (tenant_id, id, audience, severity, kind, detail) VALUES (?,?,?,?,?,?)`, t.tenant, id, audience, severity, kind, detail)
+	// detail names ids and outcomes of an outlet's own operations; the hub seals it (A3.2), so it is read back and compared in
+	// Go (ResolveAlerts), not in SQL.
+	sealed, err := t.s.seal("alerts", fmt.Sprintf("%s|%d", t.tenant, id), "detail", detail)
+	if err != nil {
+		return err
+	}
+	return t.exec(`INSERT INTO alerts (tenant_id, id, audience, severity, kind, detail) VALUES (?,?,?,?,?,?)`, t.tenant, id, audience, severity, kind, sealed)
 }
 
 func (t *sqlTx) Alerts() ([]Alert, error) {
@@ -949,6 +970,10 @@ func (t *sqlTx) Alerts() ([]Alert, error) {
 	for rows.Next() {
 		a := Alert{Tenant: t.tenant}
 		if err := rows.Scan(&a.ID, &a.Audience, &a.Severity, &a.Kind, &a.Detail); err != nil {
+			return nil, err
+		}
+		var err error
+		if a.Detail, err = t.s.open("alerts", fmt.Sprintf("%s|%d", t.tenant, a.ID), "detail", a.Detail); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
