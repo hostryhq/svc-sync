@@ -40,7 +40,23 @@ Contract: api-specs `feat/phase2-specs` @ b153c62; go-common `feat/phase2-libs` 
    revocation feed, pack history, drain. `identityreal/` (own module) runs `directory/dirtest` against the real identity service layers, in memory
    and over Postgres: real and stub answer `locked` alike for every op kind.
 
-## Open items
+## ADR-0005 A3 (feat/phase2-sync after 92d2288)
+Contract api-specs `6e63014`, svc-identity `2ba5adc`, svc-tenancy `3792f07`. Items 1 to 3 of the list below are resolved by the amendment; see
+`contract/README.md`, "ADR-0005 A3 on this side".
+- **A3.1** `service/session.go`, `repository` `sessions` columns (actor, pack_v, pin_v, opened_at, verdict) and `approval_verdicts`; ingest takes outlet
+  streams before brand and tenant streams so that a session's open is judged before its configuration ops.
+- **A3.2** `realdir/` (caches, faults, revocation state), `identityclient/routes.go`, `tenancyclient/`. `SYNC_DIRECTORY=identity` starts and serves:
+  checked against identity and tenancy running on the dev stack (own ports), `identityreal` live test, and the dirtest contract against the stub, real
+  identity in memory and real identity over Postgres (stub and real answer `locked` alike).
+- **A3.3** `syncproto/drain.go`, `service/drain.go`, `drain_statements` table; `sim.World.Drain` and `sim/drain_test.go` (DR1, DR2 and the signer,
+  second statement and late upload cases). DR3 (the shell refuses a wipe order that quotes another statement) and DR4 (identity refuses a series set
+  mismatch) are the shell's and identity's.
+- **Dev routes** produce the hub pack `cmd/hub` reads (`GET /dev/v1/hub-packs/{device_id}`, and `hub_pack` in the registration of a hub), and pack versions
+  are the integers the client sends as `pack_v`.
+- Not done here: the day-digest rule of A3.5 (the owners' and `go-common/sync`'s). Infra's `up-full.sh` sets no `SYNC_TENANCY_URL`, `SYNC_OP_SIGNING_KEY_FILE` (the key is `keys/sync-op.key`) or
+  `SYNC_SERVICE_KEYS` for sync, which the identity directory needs.
+
+## Open items (earlier; 1 to 3 resolved by A3)
 1. **ADR needed: how the gateway asks identity about a proof.** `verifyProof` needs `pin_v`, an integer `pack_v` and `opened_at`; the op body has `sid`,
    a text `pack_v` and `proof` only. The op wire (and client-core) must carry the missing fields, or identity must derive them.
 2. **ADR needed: directory questions identity cannot answer.** No internal route gives sync a device's credential (public key, kind, outlet, brand),

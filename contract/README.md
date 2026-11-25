@@ -11,8 +11,10 @@ svc-sync keeps no copy of the contract. It reads the **api-specs** repository (A
 | Entity registry (owners, policies, `doc_number`, `replicated_to`) | `entities/` |
 | Bus events | `events/sync/*` |
 
-Pinned version: branch `feat/phase2-specs` at `b153c62` (round 3; the Go libraries are pinned in `go.mod`: go-common `feat/phase2-libs` @ `92884d6`, go-auth `feat/phase2-auth` @ `94f1970`; svc-identity `feat/phase2-identity` @ `ebebd4c` in `identityreal/go.mod`). The checkout is found through `API_SPECS_DIR`, or as a
-sibling directory `../api-specs`, then `../api-specs-p2` (`contract/specs`). Tests fail, not skip, without it.
+Pinned version: branch `feat/phase2-specs` at `6e63014` (round 4b: ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
+`feat/phase2-libs` @ `92884d6`, go-auth `feat/phase2-auth` @ `94f1970`); svc-identity `feat/phase2-identity` @ `2ba5adc` and svc-tenancy
+`feat/phase2-tenancy` @ `3792f07` in `identityreal/go.mod`. The checkout is found through `API_SPECS_DIR`, or as a sibling directory
+`../api-specs-p2`, then `../api-specs` (`contract/specs`). Tests fail, not skip, without it.
 
 ## What is checked here
 - `syncproto/vectors_test.go`: the shared vectors against this implementation.
@@ -46,10 +48,24 @@ Implemented here and in `client-core-sync`; `protocol-v1.md` still says "no sett
 | `PullResponse` | `seal_refresh` | `[Seal]` | the current seal for each `stale_seals` entry |
 | `Refusal.reason` | `chain_conflict` | enum value | a body or link contradicts what the node holds or a seal states (add to the enum beside `fork_evidence_kept`) |
 
-## Open questions that need a decision (see docs/phase2-notes.md)
-1. **Proof questions to identity.** `verifyProof` needs `pin_v`, `pack_v` as an integer and (for a session proof) `opened_at`; the op body
-   carries `sid`, `pack_v` as text and `proof`, and nothing else. Until the wire carries them the gateway cannot ask identity
-   (`identityclient.ProofParams` is the single hook).
-2. **Directory questions identity cannot answer.** The contract's internal routes (`x-service-callers: sync`) are `listRevocations`,
-   `recordDeviceDrained`, `verifyProof`, `checkPackHistory`. There is none for a device's credential (public key, kind, outlet, brand),
-   the permissions a pack granted, key-loss recovery records, or the revocation reason (`key_lost`).
+## ADR-0005 A3 on this side (resolved; was "open questions")
+1. **Proof on the wire (A3.1).** `pack_v` is an integer on every device op; `proof` and `pin_v` ride only on `session.open` of a `pin` session and on
+   `approval.grant`, and `at` of `session.open` is the opening time the proof binds (`syncproto.Body`). The gateway asks identity once per proof
+   (`service/session.go`, `Idempotency-Key` from origin, stream and seq) and stores the verdict per `(tenant, origin, sid)` in `sessions`
+   (migration 0013); every later op is judged from that row (same actor, within 16 hours); a strong session is judged from `getSession`.
+   Identity unreachable is `pending`; `ResolveSessions` (the worker in `cmd/gateway`) asks again, clears the mark and flags a failure.
+2. **Directory routes (A3.2).** `realdir` answers credential, pack grants, member grants, recovery, session facts, pack history (any pack),
+   revocations with `reason` and `recovery_id` (cursor and set persisted), device series, outlet paper books and stream owner from
+   `identityclient/gen` and `tenancyclient/gen` (generated from the bundled specs). Caches follow A3.2. A lookup that cannot be asked counts a fault
+   (`directory.Faulty`): a configuration op then waits (`config_pending`), a trading fact keeps the pending mark.
+3. **Drain statement (A3.3).** `quarantine-upload` takes `PushRequest.drain_statement` (`hostry-drain-v1`, `syncproto/drain.go`, the three vectors of
+   `sync/conformance/v1.json`). The gateway reports drained only for a statement signed with the device's credential key that names exactly the ops it
+   holds (`service/drain.go`); anything else is stored as evidence with a vendor alert. `ReportPendingDrains` calls `recordDeviceDrained` with the
+   statement hash as its key until identity answers; nothing else calls it.
+
+## Still open
+- **Wire fields of A2.8** (table above) are in `protocol-v1.md` since round 4; `Refusal.reason` `chain_conflict` is in the OpenAPI.
+- **Approval record fields.** `approval.grant` carries its record as a mutation `approval` (`id` = approval id; `permission`, `target`, `requester`,
+  `approver`, `action_hash`, `reason`); the gateway reads those names for `verifyProof` (`ProofVerification` kind approval). The entity file does not
+  name them yet.
+- `cmd/gateway` series events: `tenancy.series.issued` and `.closed` do not list `sync` as subscriber, so a series is seen within the 60-second cache time.
