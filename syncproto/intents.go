@@ -54,6 +54,19 @@ func (i Intent) Allows(kind string) bool {
 // CloudOrigin reports whether the intent is written only by the gateway emit.
 func (i Intent) CloudOrigin() bool { return len(i.Kinds) == 1 && i.Kinds[0] == CloudKind }
 
+// SessionDevice is the session type of a device session: no member, no PIN (a KDS screen).
+const SessionDevice = "device"
+
+// AllowsSession reports whether the intent may be recorded in a session of the type.
+func (i Intent) AllowsSession(typ string) bool {
+	for _, s := range i.Sessions {
+		if s == typ {
+			return true
+		}
+	}
+	return false
+}
+
 // AllowsEntity reports whether the intent lists the entity with the mutation kind.
 func (i Intent) AllowsEntity(entity, kind string) bool {
 	for _, k := range i.Entities[entity] {

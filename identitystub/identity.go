@@ -202,6 +202,14 @@ func (i *Identity) IssueSeries(tenant, device, docType, state string) string {
 	return code
 }
 
+// IssueManualBook registers a paper bill book as an entry-only series (kind manual_book) for the outlets
+// given (none means every outlet), under the code the owner chose. It has no device and no document type.
+func (i *Identity) IssueManualBook(tenant, code string, outlets ...string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.series[tenant+"|"+code] = &SeriesInfo{Tenant: tenant, Code: code, State: SeriesActive, Kind: directory.SeriesKindManualBook, Outlets: outlets}
+}
+
 // SetSeriesState changes a series state (activation, closing).
 func (i *Identity) SetSeriesState(tenant, code, state string) {
 	i.mu.Lock()

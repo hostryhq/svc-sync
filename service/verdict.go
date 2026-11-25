@@ -45,6 +45,8 @@ const (
 	MarkForeign               = "foreign_series"
 	MarkUnknownSeries         = "unknown_series"
 	MarkProofPending          = "proof_pending"
+	MarkManualBook            = "manual_book"
+	MarkAfterClosure          = "after_closure"
 	MarkActivationFlag        = "series_activation"
 	MarkFork                  = "fork"
 	MarkReleased              = "released"
@@ -155,6 +157,19 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		for _, doc := range docs {
 			si, found := dir.Series(tenant, doc.SeriesCode())
 			switch {
+			case found && si.ManualBook():
+				// A paper bill book: entry-only, typed numbers from a billing device of one of its outlets.
+				if !manualBookEntry(si, b.Intent, cred.Cred.OutletID) {
+					if rel == nil {
+						return quarantine(ReasonForeignSeries, MarkForeign)
+					}
+					flag(MarkForeign)
+				} else {
+					marks = append(marks, MarkManualBook)
+					if si.State == directory.SeriesClosed {
+						flag(MarkAfterClosure) // a page found after the book was closed is accepted and flagged
+					}
+				}
 			case !found && rel == nil:
 				return quarantine(ReasonForeignSeries, MarkUnknownSeries)
 			case !found:
@@ -185,8 +200,15 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		}
 		flag(ReasonIntentNotAllow) // a manager accepted the held sale: it stays, flagged
 	}
+	// A device session (no member, no PIN: the KDS screen) has an actor of its own, device:<device id> with the
+	// id equal to the op's origin (sync/protocol-v1.md, Attribution of device-session ops). It is allowed only
+	// for an intent whose registry row lists the device's kind and the device session type (a KOT bump), and
+	// only inside a session.open of type device by the same origin. No member is consulted and no proof exists;
+	// the permission is judged against the device role template of the kind. Free text such as device-kds, or
+	// another device's id, is an unknown actor.
+	devActor := known && b.Actor == DeviceActorPrefix+origin && in.Allows(kind) && in.AllowsSession(sp.SessionDevice) && deviceSession(tx, origin, b)
 	// Actor never appeared in any pack issued to the device.
-	if b.Actor == "" || !dir.InAnyPack(tenant, origin, b.Actor) {
+	if !devActor && (b.Actor == "" || !dir.InAnyPack(tenant, origin, b.Actor)) {
 		if rel == nil || config {
 			return refuse(ReasonActorUnknown)
 		}
@@ -202,7 +224,11 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	// Session and action proofs (identity only). A configuration op waits if identity is down;
 	// a sale never does (S11, A1.2 item 4).
-	switch dir.CheckProof(tenant, origin, b.Actor, b.SID, b.Proof, config) {
+	proof := directory.ProofValid
+	if !devActor {
+		proof = dir.CheckProof(tenant, origin, b.Actor, b.SID, b.Proof, config)
+	}
+	switch proof {
 	case directory.ProofValid:
 	case directory.ProofMissing, directory.ProofInvalid:
 		if config {
@@ -222,7 +248,14 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	// Permission held in the op's own pack, then since withdrawn or pack expired (H-3: flagged, never rejected).
 	pack, havePack := dir.PackFor(tenant, origin, b.PackV)
-	if in.Permission != "" {
+	if devActor {
+		if in.Permission != "" && !DeviceRoleHolds(kind, in.Permission) {
+			if config {
+				return void(ReasonPermAbsent)
+			}
+			flag(MarkPermissionFlag)
+		}
+	} else if in.Permission != "" {
 		if !havePack || !pack.Members[b.Actor][in.Permission] {
 			if config {
 				return void(ReasonPermAbsent)
@@ -250,6 +283,59 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		return engine.Verdict{Status: repository.StFlagged, Marks: marks}
 	}
 	return engine.Verdict{Status: repository.StAccepted, Marks: marks}
+}
+
+// DeviceActorPrefix starts the actor of a device session: device:<device id>.
+const DeviceActorPrefix = "device:"
+
+// deviceRoleTemplates are the permissions a device session holds, by device kind (x-provisional until the
+// ADR-0005 role templates exist; the KDS role is kds.bump and menu.availability.set).
+var deviceRoleTemplates = map[string][]string{
+	sp.KindKDS: {"kds.bump", "menu.availability.set"},
+}
+
+// DeviceRoleHolds reports whether the device role template of the kind holds the permission.
+func DeviceRoleHolds(kind, perm string) bool {
+	for _, p := range deviceRoleTemplates[kind] {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
+// deviceSession reports whether the op is recorded in a session of type device opened by the same origin: the
+// stored session row, or, for the session.open op itself, its own session mutation.
+func deviceSession(tx repository.Tx, origin string, b sp.Body) bool {
+	if b.Intent == sp.IntentSessionOpen {
+		for _, m := range b.Muts {
+			if m.E == "session" && m.ID == b.SID {
+				t, _ := m.F["type"].(string)
+				return t == sp.SessionDevice
+			}
+		}
+		return false
+	}
+	st, ok, _ := tx.SessionType(origin, b.SID)
+	return ok && st == sp.SessionDevice
+}
+
+// manualBookEntry reports whether an op may take a number from a paper bill book: the intent types the
+// number (never allocates it) and the device's outlet is one the book was registered for.
+func manualBookEntry(si directory.SeriesInfo, intent, outlet string) bool {
+	in, known := sp.Intents[intent]
+	if !known || in.Numbering != "typed" {
+		return false
+	}
+	if len(si.Outlets) == 0 {
+		return true
+	}
+	for _, o := range si.Outlets {
+		if o == outlet {
+			return true
+		}
+	}
+	return false
 }
 
 func touchesLWW(muts []sp.Mut) bool {
@@ -345,7 +431,7 @@ func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v 
 		state = repository.StQuarantined
 	}
 	mark := ""
-	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkUnsealed, MarkRecoveredSealed} {
+	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkUnsealed, MarkRecoveredSealed, MarkManualBook} {
 		if hasMark(v.Marks, m) {
 			mark = m
 			break

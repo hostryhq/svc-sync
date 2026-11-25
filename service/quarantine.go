@@ -360,6 +360,8 @@ func registerReport(tx repository.Tx, keep func(repository.RegisterEntry) bool) 
 		case MarkUnknownSeries:
 			rep.Unknown = append(rep.Unknown, e)
 			continue
+		case MarkManualBook:
+			continue // typed from a paper book: numbers may skip; billing reports a book's gaps apart
 		}
 		k := key{e.Code, e.FY}
 		if have[k] == nil {

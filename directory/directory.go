@@ -26,10 +26,24 @@ type Pack struct {
 	Expires time.Time
 }
 
-// SeriesInfo is one issued series.
+// Series kinds. A device series is issued to one device, which allocates its numbers; a manual_book series is a
+// paper bill book the owner registered (ADR-0014 A1.6 item 4): it belongs to no device, billing devices of its
+// outlets enter its numbers by hand, and the allocator never takes from it.
+const (
+	SeriesKindDevice     = "device"
+	SeriesKindManualBook = "manual_book"
+)
+
+// SeriesInfo is one issued series. Kind is empty for a device series (the default). Outlets lists the outlets
+// whose billing devices may enter a manual_book series; empty means every outlet of the tenant.
 type SeriesInfo struct {
 	Tenant, Code, Device, DocType, State string
+	Kind                                 string
+	Outlets                              []string
 }
+
+// ManualBook reports whether the series is a registered paper bill book.
+func (s SeriesInfo) ManualBook() bool { return s.Kind == SeriesKindManualBook }
 
 // ProofResult is identity's answer about a PIN-derived proof.
 type ProofResult int

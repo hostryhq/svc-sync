@@ -231,6 +231,7 @@ func registryEntities() map[string]EntityDef {
 			"credit_note_count":          {Policy: "immutable", Group: "", Order: nil},
 			"credit_note_total_paise":    {Policy: "immutable", Group: "", Order: nil},
 			"cutoff":                     {Policy: "immutable", Group: "", Order: nil},
+			"cutoff_at":                  {Policy: "immutable", Group: "", Order: nil},
 			"discount_paise":             {Policy: "immutable", Group: "", Order: nil},
 			"gross_paise":                {Policy: "immutable", Group: "", Order: nil},
 			"internal_consumption_paise": {Policy: "immutable", Group: "", Order: nil},
