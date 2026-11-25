@@ -346,7 +346,7 @@ func TestSupportConfirmIsAuditedOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	tok := w.Issuer.Mint(authtest.Spec{Type: auth.TypeSupport, Tenant: ids.ID(w.Tenant), Mode: auth.ModeAct, Grants: authtest.Grants(nil, service.PermQuarantineConfirm)})
-	body, _ := json.Marshal(map[string]any{"origin": it.Origin, "stream": it.Stream, "seq": it.Seq, "reason": "cause confirmed"})
+	body, _ := json.Marshal(map[string]any{"origin": it.Origin, "stream": it.Stream, "seq": it.Seq, "reason": "cause confirmed", "h": it.H})
 	req := httptest.NewRequest(http.MethodPost, "/sync/v1/quarantine/confirm", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set(auth.ServiceTokenHeader, svc)

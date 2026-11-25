@@ -63,6 +63,7 @@ func (w *World) adminCall(method, path, token, svc string, body any) (int, strin
 type decision struct {
 	sp.Ref
 	Reason string `json:"reason"`
+	H      string `json:"h,omitempty"`
 }
 
 func refOf(it sp.Item) sp.Ref { return sp.Ref{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq} }
@@ -85,13 +86,15 @@ func (w *World) vendorLog(t *testing.T) []auth.VendorAccessEntry {
 	return out
 }
 
-func listed(t *testing.T, body string) []service.QuarantineItem {
+func listed(t *testing.T, body string) []sp.Ref {
 	t.Helper()
-	var out []service.QuarantineItem
-	if err := json.Unmarshal([]byte(body), &out); err != nil {
-		t.Fatalf("list body %q: %v", body, err)
+	var out struct {
+		Items []sp.Ref `json:"items"`
 	}
-	return out
+	if err := json.Unmarshal([]byte(body), &out); err != nil || out.Items == nil {
+		t.Fatalf("list body %q is not {items:[...]}: %v", body, err)
+	}
+	return out.Items
 }
 
 // An outlet manager reaches only the held slots of their outlet; a slot of another outlet (or of a
@@ -126,13 +129,13 @@ func TestH2_OutletScopeAndAuditOnReleaseAndDiscard(t *testing.T) {
 		}
 	}
 	// Another outlet's slot is 404 to a manager of a different outlet (as a foreign tenant's would be).
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", otherOutlet, "", decision{refOf(foreign), "mine"}); code != 404 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", otherOutlet, "", decision{refOf(foreign), "mine", ""}); code != 404 {
 		t.Fatalf("release across outlets: %d, want 404", code)
 	}
 	// A brand-stream slot belongs to no single outlet: it needs the all-outlets grant (go-auth Require
 	// with no outlet), so an outlet-scoped manager is refused, whichever outlet they manage.
 	for _, tok := range []string{inOutlet, otherOutlet} {
-		if code, _ := w.adminCall("POST", "/sync/v1/quarantine/discard", tok, "", decision{refOf(price), "mine"}); code != 403 {
+		if code, _ := w.adminCall("POST", "/sync/v1/quarantine/discard", tok, "", decision{refOf(price), "mine", ""}); code != 403 {
 			t.Fatalf("discard of a brand-stream slot by an outlet manager: %d, want 403", code)
 		}
 	}
@@ -147,7 +150,7 @@ func TestH2_OutletScopeAndAuditOnReleaseAndDiscard(t *testing.T) {
 		t.Fatal("a refused discard must change nothing")
 	}
 	// The permitted discard is carried out and audited in the same transaction.
-	if code, body := w.adminCall("POST", "/sync/v1/quarantine/discard", allOutlets, "", decision{refOf(price), "entered by mistake"}); code != 200 {
+	if code, body := w.adminCall("POST", "/sync/v1/quarantine/discard", allOutlets, "", decision{refOf(price), "entered by mistake", ""}); code != 200 {
 		t.Fatalf("discard: %d %s", code, body)
 	}
 	if r := w.rec(t, price); r.Status != repository.StVoided {
@@ -159,7 +162,7 @@ func TestH2_OutletScopeAndAuditOnReleaseAndDiscard(t *testing.T) {
 		t.Fatalf("audit record: %+v", au)
 	}
 	// Release in the outlet: held for the vendor's confirmation (conflict), and only the confirmed hold passes.
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", inOutlet, "", decision{refOf(foreign), "checked"}); code != 409 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", inOutlet, "", decision{refOf(foreign), "checked", ""}); code != 409 {
 		t.Fatalf("release before vendor confirmation: %d, want 409", code)
 	}
 	if n := len(w.audit(t)); n != 1 {
@@ -190,7 +193,7 @@ func TestH2_SupportNeedsTheServiceTokenAndConfirmsInActMode(t *testing.T) {
 	if code, body := w.adminCall("GET", "/sync/v1/quarantine", view, svc, nil); code != 200 || len(listed(t, body)) != 1 {
 		t.Fatalf("support view with the service token: %d %s", code, body)
 	}
-	if log := w.vendorLog(t); len(log) != 1 || log[0].ActionKey != "listSyncQuarantine" || log[0].TokenType != auth.TypeSupport || log[0].Outcome != auth.OutcomeOK || log[0].ResultCount != 1 {
+	if log := w.vendorLog(t); len(log) != 1 || log[0].ActionKey != "listQuarantine" || log[0].TokenType != auth.TypeSupport || log[0].Outcome != auth.OutcomeOK || log[0].ResultCount != 1 {
 		t.Fatalf("vendor access log after a support read: %+v", log)
 	}
 	if code, _ := w.adminCall("GET", "/sync/v1/quarantine", wildcard, svc, nil); code != 403 {
@@ -200,25 +203,25 @@ func TestH2_SupportNeedsTheServiceTokenAndConfirmsInActMode(t *testing.T) {
 		t.Fatalf("a refused support request is logged as refused: %+v", log)
 	}
 	// Sensitive: never for support, even in act mode with the permission in the token.
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", act, svc, decision{ref, "x"}); code != 403 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", act, svc, decision{ref, "x", ""}); code != 403 {
 		t.Fatalf("support release: %d, want 403", code)
 	}
 	// Confirm needs act mode and the support_actable permission.
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/confirm", view, svc, decision{ref, "cause found"}); code != 403 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/confirm", view, svc, decision{ref, "cause found", foreign.H}); code != 403 {
 		t.Fatalf("confirm in view mode: %d, want 403", code)
 	}
 	owner := w.mint(authtest.Spec{Type: auth.TypeUser, Grants: authtest.OwnerGrants()})
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/confirm", owner, "", decision{ref, "self"}); code != 403 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/confirm", owner, "", decision{ref, "self", foreign.H}); code != 403 {
 		t.Fatalf("a tenant member must not confirm their own hold: %d, want 403", code)
 	}
-	if code, body := w.adminCall("POST", "/sync/v1/quarantine/confirm", act, svc, decision{ref, "series reissue confirmed with the owner"}); code != 200 {
+	if code, body := w.adminCall("POST", "/sync/v1/quarantine/confirm", act, svc, decision{ref, "series reissue confirmed with the owner", foreign.H}); code != 200 {
 		t.Fatalf("confirm in act mode: %d %s", code, body)
 	}
 	if r := w.rec(t, foreign); r.Status != repository.StQuarantined || !hasMark(r, service.MarkVendorConfirmed) {
 		t.Fatalf("confirm marks the hold, it does not release it: %s %q", r.Status, r.Marks)
 	}
 	// Now the owner's manager may release it, audited under their own name.
-	if code, body := w.adminCall("POST", "/sync/v1/quarantine/release", owner, "", decision{ref, "approved"}); code != 200 {
+	if code, body := w.adminCall("POST", "/sync/v1/quarantine/release", owner, "", decision{ref, "approved", ""}); code != 200 {
 		t.Fatalf("release after confirmation: %d %s", code, body)
 	}
 	au := w.audit(t)
@@ -256,11 +259,11 @@ func TestH2_UnsealedTailReleaseNeedsDeviceRecoverOutsideCaution(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := w.mint(authtest.Spec{Type: auth.TypeUser, Grants: authtest.Grants(nil, pRead, pManage)})
-	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", manager, "", decision{ref, "checked"}); code != 409 {
+	if code, _ := w.adminCall("POST", "/sync/v1/quarantine/release", manager, "", decision{ref, "checked", ""}); code != 409 {
 		t.Fatalf("a manager without device.recover: %d, want 409", code)
 	}
 	underCaution := w.mint(authtest.Spec{Type: auth.TypeUser, Grants: authtest.OwnerGrants(), CautionUntil: w.Clock.Now().Add(time.Hour)})
-	code, body := w.adminCall("POST", "/sync/v1/quarantine/release", underCaution, "", decision{ref, "checked"})
+	code, body := w.adminCall("POST", "/sync/v1/quarantine/release", underCaution, "", decision{ref, "checked", ""})
 	if code != 403 || !strings.Contains(body, "approval_required") {
 		t.Fatalf("an owner on a new device: %d %s, want 403 approval_required", code, body)
 	}

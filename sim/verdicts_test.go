@@ -233,7 +233,7 @@ func TestV7_ForeignSeriesCannotBeDiscardedAndNeedsVendorToRelease(t *testing.T) 
 	// Over HTTP: only Hostry support's confirmation (a support token in act mode, with the admin
 	// service token) lets the owner's manager release (see admin_test.go for the full cases).
 	user := w.Issuer.Mint(authtest.Spec{Type: auth.TypeUser, Tenant: ids.ID(w.Tenant), Grants: authtest.OwnerGrants()})
-	body, _ := json.Marshal(map[string]any{"origin": ref.Origin, "stream": ref.Stream, "seq": ref.Seq, "reason": "test"})
+	body, _ := json.Marshal(map[string]any{"origin": ref.Origin, "stream": ref.Stream, "seq": ref.Seq, "reason": "test", "h": it.H})
 	call := func(path, tok, svc string) int {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
 		req.Header.Set("Authorization", "Bearer "+tok)

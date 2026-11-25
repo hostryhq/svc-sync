@@ -247,13 +247,14 @@ func guessRun(t *testing.T, batch bool) *World {
 	if r := w.rec(t, ok); r.Status != repository.StAccepted {
 		t.Fatalf("same member, other device: %s/%s", r.Status, r.Reason)
 	}
-	// Trading facts by that member on the locked device are still verified, and flagged if invalid.
+	// Identity answers locked for every op kind (security final verdict): a sale by that member on the
+	// locked device is kept, never rejected, and its attribution is flagged as unverified, valid proof or not.
 	good := must(a.Do(pManager, engine.Input{Intent: "stock.move", Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1)}}}}))
 	invalid := must(a.record(engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pManager, SID: "other-sid", Proof: "bogus",
 		Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1)}}}}, true))
 	w.toCloud(t, a)
-	if r := w.rec(t, good); r.Status != repository.StAccepted {
-		t.Fatalf("valid trading proof on a locked pair: %s", r.Status)
+	if r := w.rec(t, good); r.Status != repository.StFlagged || !strings.Contains(r.Marks, service.MarkAttributionUnverified) {
+		t.Fatalf("valid trading proof on a locked pair: %s %s", r.Status, r.Marks)
 	}
 	if r := w.rec(t, invalid); r.Status != repository.StFlagged {
 		t.Fatalf("invalid trading proof on a locked pair: %s", r.Status)
