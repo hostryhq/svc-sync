@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +48,7 @@ const (
 	MarkActivationFlag        = "series_activation"
 	MarkFork                  = "fork"
 	MarkReleased              = "released"
+	MarkPIIDropped            = "pii_dropped"
 )
 
 // releaseCtx tells judge which holds a manager's release has already cleared.
@@ -79,6 +79,9 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	quarantine := func(reason string, marks ...string) engine.Verdict {
 		return engine.Verdict{Status: repository.StQuarantined, Reason: reason, Marks: marks}
+	}
+	if len(p.Item.Body) > sp.MaxBodyBytes {
+		return quarantine(ReasonOpaque) // over the size limit: malformed (S11), kept as an opaque body, never published with its body
 	}
 	if rel == nil {
 		if p.Opaque {
@@ -135,32 +138,43 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	flagged := false
 	flag := func(m string) { flagged = true; marks = append(marks, m) }
 
-	// A1.1: a legal document number must come from a series issued to the origin device.
-	if b.Doc != nil {
+	// A1.1: every legal document number must come from a series issued to the origin device. One op may
+	// carry several (bill.rebill: a credit note and a new bill); it never takes a series twice.
+	if docs := b.Documents(); len(docs) > 0 {
 		if config {
 			return quarantine(ReasonMalformed)
 		}
-		si, found := dir.Series(tenant, b.Doc.SeriesCode())
-		switch {
-		case !found && rel == nil:
-			return quarantine(ReasonForeignSeries, MarkUnknownSeries)
-		case !found:
-			flag(MarkUnknownSeries) // released by a manager after vendor confirmation: kept, flagged
-		case si.Device != origin && rel == nil:
-			return quarantine(ReasonForeignSeries, MarkForeign)
-		case si.Device != origin:
-			flag(MarkForeign)
-		default:
-			if si.State == directory.SeriesClosed && !revoked {
-				flag(MarkSeriesClosed)
+		codes := map[string]bool{}
+		for _, doc := range docs {
+			code, _, _, ok := doc.ParseNumber()
+			if !ok || codes[code] {
+				return quarantine(ReasonMalformed) // an op never takes a number twice from one series
 			}
-			if si.State == directory.SeriesDormant {
-				if on, _, _ := tx.GetMeta("activated:" + si.Code); on == "" {
-					flag(MarkDormantSeries)
+			codes[code] = true
+		}
+		for _, doc := range docs {
+			si, found := dir.Series(tenant, doc.SeriesCode())
+			switch {
+			case !found && rel == nil:
+				return quarantine(ReasonForeignSeries, MarkUnknownSeries)
+			case !found:
+				flag(MarkUnknownSeries) // released by a manager after vendor confirmation: kept, flagged
+			case si.Device != origin && rel == nil:
+				return quarantine(ReasonForeignSeries, MarkForeign)
+			case si.Device != origin:
+				flag(MarkForeign)
+			default:
+				if si.State == directory.SeriesClosed && !revoked {
+					flag(MarkSeriesClosed)
 				}
-			}
-			if si.DocType != b.Doc.Type {
-				flag(MarkDocTypeMismatch)
+				if si.State == directory.SeriesDormant {
+					if on, _, _ := tx.GetMeta("activated:" + si.Code); on == "" {
+						flag(MarkDormantSeries)
+					}
+				}
+				if si.DocType != doc.Type {
+					flag(MarkDocTypeMismatch)
+				}
 			}
 		}
 	}
@@ -199,6 +213,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		if config {
 			return void(ReasonProofLocked)
 		}
+		flag(MarkAttributionUnverified) // identity answers locked for every op kind: a sale is kept, its actor unverified
 	case directory.ProofUnavailable:
 		if config {
 			return quarantine(ReasonConfigPending)
@@ -250,7 +265,7 @@ func touchesLWW(muts []sp.Mut) bool {
 // activation record and the void a refused configuration op needs.
 func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRec, p *engine.Parsed, v engine.Verdict) error {
 	marks := v.Marks
-	if !p.Opaque && p.Body.Doc != nil {
+	if !p.Opaque && len(p.Body.Documents()) > 0 {
 		if err := g.register(tx, rec, p.Body, v); err != nil {
 			return err
 		}
@@ -283,6 +298,11 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 				return err
 			}
 		}
+		if rec.Intent == "series.close" && !p.Opaque {
+			if err := g.noteSeriesClose(tx, rec, p.Body); err != nil {
+				return err
+			}
+		}
 		if rec.Intent == "series.activate" && !p.Opaque {
 			for _, m := range p.Body.Muts {
 				if m.E == "series_activation" {
@@ -306,16 +326,8 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 	return nil
 }
 
-// register keeps the series register: every number seen, whatever its verdict (S7, A1.1).
+// register keeps the series register: every number the op carries, whatever its verdict (S7, A1.1).
 func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v engine.Verdict) error {
-	parts := strings.Split(b.Doc.Number, "/")
-	if len(parts) != 3 {
-		return nil
-	}
-	n, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil {
-		return nil
-	}
 	state := v.Status
 	if state == repository.StVoided {
 		state = repository.StQuarantined
@@ -330,8 +342,20 @@ func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v 
 	if mark == MarkUnsealed {
 		mark = "recovered_unsealed"
 	}
-	return tx.PutRegister(repository.RegisterEntry{Code: parts[0], FY: parts[1], Num: n, Number: b.Doc.Number, DocType: b.Doc.Type,
-		Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark})
+	for _, doc := range b.Documents() {
+		code, fy, n, ok := doc.ParseNumber()
+		if !ok {
+			continue
+		}
+		if err := tx.PutRegister(repository.RegisterEntry{Code: code, FY: fy, Num: n, Number: doc.Number, DocType: doc.Type,
+			Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark}); err != nil {
+			return err
+		}
+		if err := g.recheckSeries(tx, code, fy); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // onFork keeps a slot whose content differs from what the cloud holds: both versions stay, a

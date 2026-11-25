@@ -272,7 +272,7 @@ func (g *Gateway) discardIn(tx repository.Tx, ref sp.Ref) (before string, err er
 		return "", ErrNotFound
 	}
 	b, derr := sp.DecodeBody(rec.Body)
-	if derr != nil || b.Doc != nil || rec.Reason == ReasonForeignSeries {
+	if derr != nil || len(b.Documents()) > 0 || rec.Reason == ReasonForeignSeries {
 		return "", ErrDiscardNumbered
 	}
 	rec.Status, rec.Reason = repository.StVoided, ReasonDiscarded

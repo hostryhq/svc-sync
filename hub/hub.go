@@ -155,9 +155,11 @@ func (h *Hub) structural(_ repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	if h.cfg.Members != nil && (b.Actor == "" || !h.cfg.Members(b.Actor)) {
 		return held
 	}
-	if b.Doc != nil && h.cfg.SeriesOwner != nil {
-		if dev, found := h.cfg.SeriesOwner(b.Doc.SeriesCode()); !found || dev != b.Origin {
-			return held
+	if h.cfg.SeriesOwner != nil {
+		for _, doc := range b.Documents() {
+			if dev, found := h.cfg.SeriesOwner(doc.SeriesCode()); !found || dev != b.Origin {
+				return held
+			}
 		}
 	}
 	return ok

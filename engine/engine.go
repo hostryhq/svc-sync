@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +62,9 @@ type Parsed struct {
 	Item   sp.Item
 	Body   sp.Body
 	Opaque bool // body hashes correctly but is not a valid op body
+	// PIIDropped counts pii fields of the item that did not match their commitment (syncproto/piic.go);
+	// Item.PII holds only the verified fields once the node has opened it.
+	PIIDropped int
 }
 
 // Verdict is the outcome for one op (S11).
@@ -129,9 +134,11 @@ type SeriesSource interface {
 
 // Config builds an Engine.
 type Config struct {
-	Role   Role
-	Tenant string
-	Outlet string
+	// Entropy is the source of pii salts (default crypto/rand); the simulator injects a seeded one.
+	Entropy io.Reader
+	Role    Role
+	Tenant  string
+	Outlet  string
 	// Origin is this node's own origin id: the device id, or cloud-<epoch>. Empty for a hub that
 	// never records ops of its own.
 	Origin string
@@ -305,6 +312,14 @@ func (e *Engine) Record(ctx context.Context, in Input) (sp.Item, error) {
 	return item, nil
 }
 
+// InTxLocked runs fn in one transaction of this node's tenant while holding the engine's write lock,
+// so that cloud-origin ops recorded in it (emit, erasure) cannot race an ingest for the next seq.
+func (e *Engine) InTxLocked(ctx context.Context, fn func(tx repository.Tx) error) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.Store.InTx(ctx, e.cfg.Tenant, fn)
+}
+
 // RecordTx is Record inside an existing transaction (the gateway emits voids in the verdict
 // transaction). The caller applies nothing: the cloud keeps no state.
 func (e *Engine) RecordTx(tx repository.Tx, in Input) (sp.Item, error) {
@@ -377,8 +392,42 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	if in.MutsFn != nil {
 		b.Muts = in.MutsFn(number)
 	}
-	item, err := sp.NewItem(b, in.PII)
+	var piiWire json.RawMessage
+	if len(in.PII) > 0 {
+		var values sp.PII
+		dec := json.NewDecoder(bytes.NewReader(in.PII))
+		dec.UseNumber()
+		if err := dec.Decode(&values); err != nil {
+			return sp.Item{}, sp.Body{}, fmt.Errorf("engine: pii must be entity -> row id -> field -> value: %w", err)
+		}
+		for _, rows := range values {
+			for _, fields := range rows {
+				for k, v := range fields {
+					if n, ok := v.(json.Number); ok {
+						x, err := n.Int64()
+						if err != nil {
+							return sp.Item{}, sp.Body{}, fmt.Errorf("engine: pii field %q is not an integer", k)
+						}
+						fields[k] = x
+					}
+				}
+			}
+		}
+		var commits sp.PIICommit
+		piiWire, commits, err = sp.CommitPII(values, e.cfg.Entropy)
+		if err != nil {
+			return sp.Item{}, sp.Body{}, err
+		}
+		b.PIIC = commits
+		if err := sp.CheckSize(0, len(piiWire)); err != nil {
+			return sp.Item{}, sp.Body{}, err
+		}
+	}
+	item, err := sp.NewItem(b, piiWire)
 	if err != nil {
+		return sp.Item{}, sp.Body{}, err
+	}
+	if err := sp.CheckSize(len(item.Body), 0); err != nil {
 		return sp.Item{}, sp.Body{}, err
 	}
 	// Re-decode so the applied body is exactly what peers will derive from the bytes.
@@ -391,8 +440,8 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	if err := tx.PutOp(rec); err != nil {
 		return sp.Item{}, sp.Body{}, err
 	}
-	if len(in.PII) > 0 {
-		if err := tx.PutPII(in.Stream, origin, b.Seq, string(in.PII)); err != nil {
+	if len(piiWire) > 0 {
+		if err := tx.PutPII(in.Stream, origin, b.Seq, string(piiWire)); err != nil {
 			return sp.Item{}, sp.Body{}, err
 		}
 	}
@@ -594,7 +643,13 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 				if r.Body == "" || (!own && hasMarkS(r.Marks, MarkUnbound)) {
 					break // cannot offer a slot known only by hash; the body holder must. An unbound op is never relayed (A2.8 item 1.3).
 				}
-				req.Items = append(req.Items, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
+				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body}
+				if pii, ok, err := tx.GetPII(r.Stream, r.Origin, r.Seq); err != nil {
+					return err
+				} else if ok {
+					it.PII = json.RawMessage(pii) // the verified values with their salts; erased ones are gone
+				}
+				req.Items = append(req.Items, it)
 				n++
 			}
 			if n == 0 {
@@ -1358,6 +1413,11 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		if !p.Opaque {
 			rec.Intent, rec.HLC = p.Body.Intent, p.Body.HLC
 		}
+		if len(it.PII) > 0 {
+			if err := e.openPII(tx, p); err != nil {
+				return false, err
+			}
+		}
 		v := Verdict{Status: repository.StAccepted}
 		if e.cfg.Hooks.Verdict != nil {
 			v = e.cfg.Hooks.Verdict(tx, p, VerdictCtx{Caller: req.Caller, Own: own, Recovery: req.Recovery,
@@ -1387,11 +1447,6 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 		if err := e.storeOp(tx, &rec, &p.Body, v, res, apply, observed, p); err != nil {
 			return false, err
-		}
-		if len(it.PII) > 0 {
-			if err := tx.PutPII(it.Stream, it.Origin, it.Seq, string(it.PII)); err != nil {
-				return false, err
-			}
 		}
 	}
 	if req.FromUpstream && head > 0 && len(items) > 0 && !items[0].IsPlaceholder() {
@@ -1450,6 +1505,9 @@ func (e *Engine) storeOp(tx repository.Tx, rec *repository.OpRec, b *sp.Body, v 
 		}
 	}
 	if (v.Status == repository.StAccepted || v.Status == repository.StFlagged) && b != nil && !p.Opaque {
+		if err := ApplyErasure(tx, b); err != nil {
+			return err
+		}
 		*apply = append(*apply, *b)
 		if h, err := sp.ParseHLC(b.HLC); err == nil {
 			*observed = append(*observed, h)

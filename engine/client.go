@@ -85,9 +85,20 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 			return res, err
 		}
 	}
+	if c.UpstreamIsCloud {
+		// Acknowledge the erasures applied since the last direct cloud contact (syncproto/piic.go).
+		if hreq.PIIErased, err = c.E.PendingErasureAcks(ctx); err != nil {
+			return res, err
+		}
+	}
 	hello, err := c.T.Hello(ctx, hreq)
 	if err != nil {
 		return res, err
+	}
+	if len(hreq.PIIErased) > 0 {
+		if err := c.E.ClearErasureAcks(ctx, hreq.PIIErased); err != nil {
+			return res, err
+		}
 	}
 	if c.UpstreamIsCloud {
 		if err := c.E.NoteCloudHello(ctx); err != nil {

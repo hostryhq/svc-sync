@@ -1,5 +1,5 @@
 // Package double is the in-memory test double of the sync gateway (go-service-standard, test-strategy).
-// It implements the public contract in contract/sync-v1.openapi.yaml with deterministic time and ids,
+// It implements the public contract in api-specs openapi/sync/v1 (read through contract/specs) with deterministic time and ids,
 // an in-memory store, a permissive-but-real identity stub, and failure injection (5xx, slow
 // responses, dropped connections) so callers can test resilience. It runs the gateway service code
 // on an in-memory SQLite store; the shared contract suite (contract/suite) is what keeps it honest.
@@ -58,7 +58,7 @@ func New(ctx context.Context) (*Double, error) {
 		return nil, err
 	}
 	d.Issuer = authtest.NewTenantIssuer(clock.Func(d.Now))
-	d.Identity.SetMember(Tenant, "m1", "order.create", "payment.take", "bill.finalize", "bill.refund", "stock.adjust", "kds.update", "session.open", "menu.edit")
+	d.Identity.SetMember(Tenant, "m1", "order.create", "order.edit", "payment.record", "bill.finalize", "bill.credit_note.create", "kds.bump", "session.open", "menu.manage", "menu.price.edit")
 	if d.Store, err = repository.Open("file:double-" + fmt.Sprint(time.Now().UnixNano()) + "?mode=memory&cache=shared"); err != nil {
 		return nil, err
 	}
@@ -71,11 +71,20 @@ func New(ctx context.Context) (*Double, error) {
 	}
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: d.Issuer.Verifier(), Dir: d.Identity}, Backend: api.GatewayBackend{G: d.Gateway}})
-	d.Services = authtest.NewServiceRegistry(clock.Func(d.Now), "admin", "sync")
+	d.Services = authtest.NewServiceRegistry(clock.Func(d.Now), "admin", "sync", "catalog", "billing")
 	api.Admin(mux, d.Gateway, api.AdminAuth{Tenant: d.Issuer.Verifier(), Services: d.Services.Verifier("sync"),
 		Audit: &repository.AccessSink{S: d.Store.(*repository.SQL)}, Clock: clock.Func(d.Now)})
 	d.h = mux
 	return d, nil
+}
+
+// ServiceToken mints a service token of the calling service for a tenant (empty tenant: a token that carries none).
+func (d *Double) ServiceToken(caller, tenant string) string {
+	tok, err := d.Services.Signer(caller).Sign("sync", tenant)
+	if err != nil {
+		panic(err)
+	}
+	return tok
 }
 
 // Now is the deterministic clock.

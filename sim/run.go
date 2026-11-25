@@ -291,7 +291,7 @@ func (r *runner) record(ctx context.Context, step int) error {
 		}
 	case kind < 82:
 		it, err = d.StockOp(rng)
-	case kind < 90 && d.Kind != sp.KindKDS:
+	case kind < 90 && d.Kind == sp.KindPOS: // menu.price.set is a POS (or personal device) intent in the registry
 		it, err = d.PriceOp(rng)
 	default:
 		it, err = d.OrderOp(rng)
@@ -354,6 +354,9 @@ func (r *runner) inject(ctx context.Context, step int) error {
 			Muts: []sp.Mut{{E: "stock_level", ID: "item-2", K: sp.KDelta, F: map[string]any{"qty_milli": int64(-1000)}}}}, true)
 		add(it, err, repository.StFlagged, "")
 	case 3: // an invalid proof on a configuration change: voided
+		if d.Kind != sp.KindPOS {
+			return nil // menu.price.set is allowed for pos devices only
+		}
 		sid := r.sidOf(d, pManager)
 		var prev string
 		d.Eng.WithState(func(s *engine.State) { prev = s.FieldStamp("menu_item", "menu-9", "price_paise") })
@@ -375,6 +378,9 @@ func (r *runner) inject(ctx context.Context, step int) error {
 		it, err := d.BillOp(rng)
 		add(it, err, repository.StFlagged, "")
 	case 6: // a last-writer-wins edit stamped far ahead of the receiver: held for review
+		if d.Kind != sp.KindPOS {
+			return nil
+		}
 		d.Skew = 36 * time.Hour
 		it, err := d.PriceOp(rng)
 		d.Skew = 0

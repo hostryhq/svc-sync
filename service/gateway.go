@@ -7,7 +7,6 @@ package service
 import (
 	"context"
 	"crypto/ecdsa"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,9 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hostryhq/go-common/events"
 	"github.com/hostryhq/go-common/ids"
-	"github.com/hostryhq/go-common/outbox"
 	"github.com/hostryhq/go-common/restore"
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/engine"
@@ -39,6 +36,9 @@ type Config struct {
 	Outbox bool
 	// IDs generates event ids; defaults to a time-based generator.
 	IDs *ids.Generator
+	// ReconciledEvent publishes billing.series.reconciled from the gateway when a closed series is
+	// confirmed. Off by default: x-publisher is billing (see series.go).
+	ReconciledEvent bool
 	// MinSupportedVersion is returned by hello (S13).
 	MinSupportedVersion string
 }
@@ -165,12 +165,18 @@ func (g *Gateway) engineFor(tenant string) *engine.Engine {
 		Hooks: engine.Hooks{
 			Authorize: g.authorize(tenant),
 			Verdict: func(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx) engine.Verdict {
+				var v engine.Verdict
 				if vc.Endorsed {
 					// A re-offered released op (A2.1 item 5): taken as released, marked unsealed, without
 					// asking the owner again. The remaining checks still run.
-					return g.judge(tx, p, vc, &releaseCtx{Marks: []string{MarkUnsealed}})
+					v = g.judge(tx, p, vc, &releaseCtx{Marks: []string{MarkUnsealed}})
+				} else {
+					v = g.judge(tx, p, vc, nil)
 				}
-				return g.judge(tx, p, vc, nil)
+				if p.PIIDropped > 0 {
+					v.Marks = append(v.Marks, MarkPIIDropped) // personal data that did not match its commitment was discarded
+				}
+				return v
 			},
 			QuarantineOwnUnverified: true,
 			Stored:                  g.stored,
@@ -307,6 +313,9 @@ func (g *Gateway) Hello(ctx context.Context, tenant string, c engine.Caller, req
 		list = append(list, "brand:"+c.Brand)
 	}
 	if err := g.noteGaps(ctx, tenant, req.Vector, vec); err != nil {
+		return sp.HelloResponse{}, err
+	}
+	if err := g.noteErasureAcks(ctx, tenant, c, req.PIIErased); err != nil {
 		return sp.HelloResponse{}, err
 	}
 	unboundH, err := g.answerUnbound(ctx, tenant, c, req)
@@ -448,9 +457,10 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 	return snap, err
 }
 
-// Emit records a cloud-origin op (a cloud-side edit, S11): origin cloud-<epoch>, sealed by the
-// gateway. The op flows down to devices like any other.
-func (g *Gateway) Emit(ctx context.Context, tenant, stream, intent string, muts []sp.Mut) (sp.Item, error) {
+// RecordCloudOp records a cloud-origin op without the registry checks of Emit (tests, the simulator
+// and the key-rotation drills): origin cloud-<epoch>, sealed by the gateway. Services never call it;
+// they use POST /internal/v1/emit.
+func (g *Gateway) RecordCloudOp(ctx context.Context, tenant, stream, intent string, muts []sp.Mut) (sp.Item, error) {
 	e := g.engineFor(tenant)
 	var it sp.Item
 	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
@@ -470,23 +480,6 @@ func (g *Gateway) Emit(ctx context.Context, tenant, stream, intent string, muts 
 
 // EngineFor exposes the tenant engine to tests and the simulator (vectors, op log reads).
 func (g *Gateway) EngineFor(tenant string) *engine.Engine { return g.engineFor(tenant) }
-
-// publish writes the accepted-op event to the outbox in the storing transaction (ADR-0011 B4).
-func (g *Gateway) publish(tx repository.Tx, rec repository.OpRec) error {
-	if !g.cfg.Outbox || g.cfg.Store.Dialect() != "postgres" {
-		return nil
-	}
-	data, _ := json.Marshal(map[string]any{"origin": rec.Origin, "stream": rec.Stream, "seq": rec.Seq, "h": rec.H, "intent": rec.Intent, "status": rec.Status})
-	env := events.Envelope{
-		ID: g.cfg.IDs.New(), Type: "sync.op.stored", V: 1, Source: "sync", TenantID: ids.ID(tx.Tenant()),
-		Key: rec.Origin + "/" + rec.Stream, KeySeq: rec.Seq, OccurredAt: g.cfg.Now(), Actor: rec.Origin, Epoch: g.Epoch(), Data: data,
-	}
-	if _, err := ids.Parse(string(env.TenantID)); err != nil {
-		// Never drop an event silently (review L5): an accepted op that cannot be published must not be stored.
-		return fmt.Errorf("service: tenant id %q is not a UUID; refusing to store an op that cannot be published", tx.Tenant())
-	}
-	return outbox.Publish(context.Background(), tx.SQLTx(), env)
-}
 
 // ErrNotFound is returned for a slot the tenant does not hold (also for another tenant's).
 var ErrNotFound = errors.New("service: not found")

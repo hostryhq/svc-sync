@@ -42,6 +42,12 @@ type OpRec struct {
 	Arr                    int64
 }
 
+// EmitRec is the idempotency record of one emitted op: (tenant, caller, key) -> where it landed.
+type EmitRec struct {
+	Caller, Key, Content, Origin, Stream string
+	Seq                                  int64
+}
+
 // EndorsementRec is a stored gateway endorsement (ADR-0002 A2.1).
 type EndorsementRec struct {
 	Stream, Origin string
@@ -140,8 +146,11 @@ type Tx interface {
 	NextNumber(code, fy string) (int64, error)
 	PeekNumber(code, fy string) (int64, error)
 	GetMeta(k string) (string, bool, error)
+	// MetaPrefix lists the meta rows whose key starts with prefix.
+	MetaPrefix(prefix string) (map[string]string, error)
 	SetMeta(k, v string) error
 	PutPII(stream, origin string, seq int64, data string) error
+	GetPII(stream, origin string, seq int64) (string, bool, error)
 	ErasePII(stream, origin string, seq int64) error
 	PutSession(origin, sid, stype string) error
 	SessionType(origin, sid string) (string, bool, error)
@@ -158,6 +167,9 @@ type Tx interface {
 	Audit() ([]AuditRec, error)
 	AddAlert(audience, severity, kind, detail string) error
 	Alerts() ([]Alert, error)
+	// PutEmit and GetEmit are the idempotency record of the cloud emit (emit_dedup).
+	PutEmit(e EmitRec) error
+	GetEmit(caller, key string) (EmitRec, bool, error)
 	// Exec is for service-owned tables in the same transaction (the outbox).
 	Exec(query string, args ...any) error
 	SQLTx() *sql.Tx
@@ -502,6 +514,46 @@ func (t *sqlTx) SetMeta(k, v string) error {
 	return t.exec(`INSERT INTO meta (tenant_id, k, v) VALUES (?,?,?) ON CONFLICT (tenant_id, k) DO UPDATE SET v = excluded.v`, t.tenant, k, v)
 }
 
+func (t *sqlTx) MetaPrefix(prefix string) (map[string]string, error) {
+	rows, err := t.query(`SELECT k, v FROM meta WHERE tenant_id=? AND substr(k, 1, ?) = ? ORDER BY k`, t.tenant, len(prefix), prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
+func (t *sqlTx) GetPII(stream, origin string, seq int64) (string, bool, error) {
+	var v string
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT data FROM op_pii WHERE tenant_id=? AND stream=? AND origin=? AND seq=?`), t.tenant, stream, origin, seq).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return v, err == nil, err
+}
+
+func (t *sqlTx) PutEmit(e EmitRec) error {
+	return t.exec(`INSERT INTO emit_dedup (tenant_id, caller, key, content, origin, stream, seq) VALUES (?,?,?,?,?,?,?)`,
+		t.tenant, e.Caller, e.Key, e.Content, e.Origin, e.Stream, e.Seq)
+}
+
+func (t *sqlTx) GetEmit(caller, key string) (EmitRec, bool, error) {
+	e := EmitRec{Caller: caller, Key: key}
+	err := t.tx.QueryRowContext(t.ctx, t.s.rebind(`SELECT content, origin, stream, seq FROM emit_dedup WHERE tenant_id=? AND caller=? AND key=?`), t.tenant, caller, key).Scan(&e.Content, &e.Origin, &e.Stream, &e.Seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return e, false, nil
+	}
+	return e, err == nil, err
+}
+
 func (t *sqlTx) PutPII(stream, origin string, seq int64, data string) error {
 	return t.exec(`INSERT INTO op_pii (tenant_id, stream, origin, seq, data) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, stream, origin, seq, data)
 }
@@ -524,17 +576,17 @@ func (t *sqlTx) SessionType(origin, sid string) (string, bool, error) {
 }
 
 func (t *sqlTx) PutRegister(e RegisterEntry) error {
-	return t.exec(`INSERT INTO series_register (tenant_id, code, fy, num, number, doc_type, origin, stream, seq, state, mark) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT (tenant_id, origin, stream, seq) DO UPDATE SET state = excluded.state, mark = excluded.mark`,
+	return t.exec(`INSERT INTO series_numbers (tenant_id, code, fy, num, number, doc_type, origin, stream, seq, state, mark) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT (tenant_id, origin, stream, seq, number) DO UPDATE SET state = excluded.state, mark = excluded.mark`,
 		t.tenant, e.Code, e.FY, e.Num, e.Number, e.DocType, e.Origin, e.Stream, e.Seq, e.State, e.Mark)
 }
 
 func (t *sqlTx) SetRegisterState(origin, stream string, seq int64, state, mark string) error {
-	return t.exec(`UPDATE series_register SET state=?, mark=? WHERE tenant_id=? AND origin=? AND stream=? AND seq=?`, state, mark, t.tenant, origin, stream, seq)
+	return t.exec(`UPDATE series_numbers SET state=?, mark=? WHERE tenant_id=? AND origin=? AND stream=? AND seq=?`, state, mark, t.tenant, origin, stream, seq)
 }
 
 func (t *sqlTx) Register() ([]RegisterEntry, error) {
-	rows, err := t.query(`SELECT code, fy, num, number, doc_type, origin, stream, seq, state, mark FROM series_register WHERE tenant_id=? ORDER BY code, fy, num, origin, seq`, t.tenant)
+	rows, err := t.query(`SELECT code, fy, num, number, doc_type, origin, stream, seq, state, mark FROM series_numbers WHERE tenant_id=? ORDER BY code, fy, num, origin, seq`, t.tenant)
 	if err != nil {
 		return nil, err
 	}

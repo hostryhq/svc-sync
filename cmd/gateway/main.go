@@ -78,7 +78,7 @@ func run(log *slog.Logger) error {
 	}
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})
-	services := authtest.NewServiceRegistry(clock.Func(time.Now), "admin", "sync")
+	services := authtest.NewServiceRegistry(clock.Func(time.Now), "admin", "sync", "catalog", "billing")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: issuer.Verifier(), Services: services.Verifier("sync"), Audit: &repository.AccessSink{S: st}, Clock: clock.Func(time.Now)})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {

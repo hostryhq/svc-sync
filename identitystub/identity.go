@@ -317,7 +317,7 @@ const (
 )
 
 // CheckProof verifies a session or action proof and keeps the shared failure counter (A1.2 item 4).
-// configClass is true for configuration ops, for which a locked pair is answered without a check.
+// configClass is accepted for the interface; a locked pair is answered `locked` for every op kind.
 // A failure counts once per sid.
 func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configClass bool) ProofResult {
 	i.mu.Lock()
@@ -332,7 +332,9 @@ func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configCl
 		i.fail[pk] = f
 	}
 	i.refreshLock(f)
-	if configClass && f.locked { // answered without a check; trading facts stay verified (sim RB5)
+	if f.locked {
+		// Locked for every op kind, as real identity answers (security final verdict). Nothing is
+		// checked or counted any more: the counter is capped at the lock (RB5).
 		return ProofLocked
 	}
 	if proof == "" {
@@ -344,6 +346,8 @@ func (i *Identity) CheckProof(tenant, device, actor, sid, proof string, configCl
 		return ProofValid
 	}
 	// Each distinct wrong proof counts (key: sid plus proof digest); an identical retry does not.
+	// Invalid proofs of sales count too, so tampering on trading ops locks the pair and raises the
+	// alert (RB1).
 	ph := sha256.Sum256([]byte(proof))
 	fk := sid + "|" + hex.EncodeToString(ph[:12])
 	if _, seen := f.sids[fk]; !seen {

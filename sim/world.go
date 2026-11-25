@@ -77,8 +77,10 @@ const (
 	pLeaver  = "m3"
 )
 
-var cashierPerms = []string{"order.create", "payment.take", "bill.finalize", "bill.refund", "stock.adjust", "kds.update", "session.open"}
-var managerPerms = append(append([]string{}, cashierPerms...), "menu.edit", "series.activate", "approval.grant")
+func init() { sp.RegisterDemoIntents() } // stock.move exists only in the simulator
+
+var cashierPerms = []string{"order.create", "order.edit", "payment.record", "bill.finalize", "bill.credit_note.create", "demo.stock.move", "kds.bump", "session.open"}
+var managerPerms = append(append([]string{}, cashierPerms...), "menu.manage", "menu.price.edit", "series.activate", "approval.grant")
 
 // NewWorld builds the whole stack. Nothing is deployed anywhere: it is all in this process.
 func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) {
@@ -154,7 +156,7 @@ func (w *World) startGateway() error {
 	w.GW = gw
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: w.Issuer.Verifier(), Dir: w.Identity}, Backend: api.GatewayBackend{G: gw}})
-	w.Services = authtest.NewServiceRegistry(clock.Func(w.Clock.Now), "admin", "sync")
+	w.Services = authtest.NewServiceRegistry(clock.Func(w.Clock.Now), "admin", "sync", "catalog", "billing")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: w.Issuer.Verifier(), Services: w.Services.Verifier("sync"),
 		Audit: &repository.AccessSink{S: w.GWStore.(*repository.SQL)}, Clock: clock.Func(w.Clock.Now)})
 	w.CloudH = mux
