@@ -92,3 +92,32 @@ func (c *CredCache) CloudKey() (*ecdsa.PublicKey, bool) {
 	}
 	return nil, false
 }
+
+// RevokeCloudKey stops accepting seals and endorsements under an op-signing key (pack refresh
+// after an emergency rotation, A2.1 item 6).
+func (c *CredCache) RevokeCloudKey(kid string) {
+	c.mu.Lock()
+	delete(c.cloudKeys, kid)
+	c.mu.Unlock()
+}
+
+// OpKey implements RecoveryTrust: the current op-signing key named by kid.
+func (c *CredCache) OpKey(kid string) (*ecdsa.PublicKey, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k, ok := c.cloudKeys[kid]
+	return k, ok
+}
+
+// Recoverers implements RecoveryTrust: the stored credentials that carry `recovers: origin`.
+func (c *CredCache) Recoverers(origin string) []sp.CredentialEnvelope {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []sp.CredentialEnvelope
+	for _, e := range c.creds {
+		if e.Cred.Recovers == origin {
+			out = append(out, e)
+		}
+	}
+	return out
+}

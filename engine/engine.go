@@ -30,6 +30,18 @@ type Trust interface {
 	OriginKey(origin string) (*ecdsa.PublicKey, bool)
 }
 
+// RecoveryTrust is what a node needs to check seals of cloud origins and endorsements (A2.1).
+// CredCache (hub, device) and the gateway's trust implement it.
+type RecoveryTrust interface {
+	// OpKey returns the current gateway op-signing key named by kid; false if unknown or revoked.
+	OpKey(kid string) (*ecdsa.PublicKey, bool)
+	// Recoverers returns the identity-verified credentials that carry `recovers: origin`.
+	Recoverers(origin string) []sp.CredentialEnvelope
+}
+
+// MarkUnsealed is the audit mark of an op accepted without an origin seal (A1.3 item 6, A2.1 item 4).
+const MarkUnsealed = "unsealed"
+
 // Caller is the authenticated party of a request.
 type Caller struct {
 	ID     string
@@ -71,6 +83,9 @@ type VerdictCtx struct {
 	Recovery bool
 	// Sealed: a valid seal covers it.
 	Sealed bool
+	// Endorsed: no seal covers it, but a gateway endorsement with the recovery credential and the
+	// adopting device's attestation does (A2.1). The op is a released unsealed-tail op.
+	Endorsed bool
 }
 
 // RecordAndSealTx records an op of this node's own origin and seals it in the same transaction.
@@ -90,7 +105,8 @@ func (e *Engine) RecordAndSealTx(tx repository.Tx, in Input) (sp.Item, error) {
 // checks), a device sets none.
 type Hooks struct {
 	// Authorize returns a refusal reason, or "" to accept the group from the caller.
-	Authorize func(tx repository.Tx, c Caller, origin, stream string, recovery bool) string
+	// endorsed is true when the batch carries an endorsement for the group (A2.1 item 5).
+	Authorize func(tx repository.Tx, c Caller, origin, stream string, recovery, endorsed bool) string
 	// Verdict judges an op that passed chain and seal checks (or was stored as chain-broken).
 	Verdict func(tx repository.Tx, p *Parsed, vc VerdictCtx) Verdict
 	// QuarantineOwnUnverified stores an authenticated origin's own unverifiable ops in quarantine
@@ -100,6 +116,9 @@ type Hooks struct {
 	Stored func(tx repository.Tx, e *Engine, rec repository.OpRec, p *Parsed, v Verdict) error
 	// OnFork is told about a slot whose stored content differs from what arrived.
 	OnFork func(tx repository.Tx, c Caller, rec repository.OpRec, it sp.Item) error
+	// OnEndorsed is told about a quarantined slot that a node re-offers with a verified
+	// endorsement, credential and attestation: the cloud takes it as released (A2.1 item 5).
+	OnEndorsed func(tx repository.Tx, rec repository.OpRec, p *Parsed, en sp.Endorsement, att sp.Attestation) error
 }
 
 // SeriesSource gives a billing device its legal number series (S7).
@@ -500,6 +519,9 @@ type OutboundOpts struct {
 	Others bool
 	// Streams restricts the streams offered.
 	Streams []string
+	// Reoffer is set while the node's re-offer is open (A2.2): endorsed ops the upstream's vector
+	// counts are offered again with their endorsements.
+	Reoffer bool
 }
 
 // Outbound builds the push for an upstream whose vector is up: for each (origin, stream) the ops
@@ -544,8 +566,8 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 				}
 				seal = s
 			} else {
-				// A relay offers only what a seal covers.
-				seals, err := tx.SealSeqs(h.Stream, h.Origin, after)
+				// A relay offers only what a seal or an endorsement covers.
+				seals, err := boundaries(tx, h.Stream, h.Origin, after)
 				if err != nil {
 					return err
 				}
@@ -556,17 +578,12 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 					}
 				}
 				if cut == 0 && len(seals) > 0 && seals[0] > upto {
-					cut = seals[0] // exceed the soft cap to reach the first seal
+					cut = seals[0] // exceed the soft cap to reach the first boundary
 				}
 				if cut == 0 {
 					continue
 				}
 				upto = cut
-				kid, sig, sh, ok, err := tx.GetSeal(h.Stream, h.Origin, cut)
-				if err != nil || !ok {
-					return err
-				}
-				seal = sp.Seal{Origin: h.Origin, Stream: h.Stream, Seq: cut, H: sh, Kid: kid, Sig: sig}
 			}
 			recs, err := tx.Range(h.Stream, h.Origin, after, upto, int(upto-after))
 			if err != nil {
@@ -593,23 +610,173 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 					}
 					seal = s
 				} else {
-					kid, sig, sh, ok, err := tx.GetSeal(h.Stream, h.Origin, last)
-					if err != nil {
-						return err
-					}
-					if !ok {
-						req.Items = req.Items[:len(req.Items)-n]
-						continue
-					}
-					seal = sp.Seal{Origin: h.Origin, Stream: h.Stream, Seq: last, H: sh, Kid: kid, Sig: sig}
+					upto = last
 				}
 			}
-			req.Seals = append(req.Seals, seal)
+			if own {
+				req.Seals = append(req.Seals, seal)
+			} else {
+				b, err := boundAt(tx, h.Stream, h.Origin, after, upto)
+				if err != nil {
+					return err
+				}
+				if b == nil {
+					req.Items = req.Items[:len(req.Items)-n]
+					continue
+				}
+				req.Seals = append(req.Seals, b.Seals...)
+				req.Endorsements = append(req.Endorsements, b.Ends...)
+				req.Attestations = append(req.Attestations, b.Atts...)
+			}
 			budget -= n
+		}
+		if o.Reoffer {
+			return e.reofferEndorsed(tx, up, o, &req)
 		}
 		return nil
 	})
 	return req, err
+}
+
+// bound is what proves a served or pushed range: the seal at its end, or an endorsement at its end
+// with the last origin seal before it and the stored attestations.
+type bound struct {
+	Seals []sp.Seal
+	Ends  []sp.Endorsement
+	Atts  []sp.Attestation
+}
+
+// boundaries lists, ascending, the seqs above after where a seal or an endorsement exists: the
+// points where a relay may cut a batch (A2.1 item 3: an endorsement counts as a seal boundary).
+func boundaries(tx repository.Tx, stream, origin string, after int64) ([]int64, error) {
+	a, err := tx.SealSeqs(stream, origin, after)
+	if err != nil {
+		return nil, err
+	}
+	b, err := tx.EndorsementSeqs(stream, origin, after)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]int64, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case j >= len(b) || (i < len(a) && a[i] < b[j]):
+			out = append(out, a[i])
+			i++
+		case i >= len(a) || b[j] < a[i]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	return out, nil
+}
+
+// boundAt builds the proof for a range ending at cut (after < seq <= cut), or nil if no seal or
+// endorsement exists at cut.
+func boundAt(tx repository.Tx, stream, origin string, after, cut int64) (*bound, error) {
+	if kid, sig, h, ok, err := tx.GetSeal(stream, origin, cut); err != nil {
+		return nil, err
+	} else if ok {
+		return &bound{Seals: []sp.Seal{{Origin: origin, Stream: stream, Seq: cut, H: h, Kid: kid, Sig: sig}}}, nil
+	}
+	_, ok, err := tx.GetEndorsement(stream, origin, cut)
+	if err != nil || !ok {
+		return nil, err
+	}
+	// Every endorsement in the range travels, not only the one at the cut: a node re-offers
+	// per op after a cloud restore, and the cloud may have released only some of the tail.
+	b := &bound{}
+	eseqs, err := tx.EndorsementSeqs(stream, origin, after)
+	if err != nil {
+		return nil, err
+	}
+	for _, q := range eseqs {
+		if q > cut {
+			break
+		}
+		e, ok, err := tx.GetEndorsement(stream, origin, q)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			b.Ends = append(b.Ends, sp.Endorsement{Origin: origin, Stream: stream, Seq: q, H: e.H, Rec: e.Rec, Kid: e.Kid, Sig: e.Sig})
+		}
+	}
+	// The origin seal before the tail keeps the sealed part of the batch unmarked.
+	seals, err := tx.SealSeqs(stream, origin, after)
+	if err != nil {
+		return nil, err
+	}
+	var last int64
+	for _, s := range seals {
+		if s < cut {
+			last = s
+		}
+	}
+	if last > 0 {
+		if kid, sig, h, ok, err := tx.GetSeal(stream, origin, last); err != nil {
+			return nil, err
+		} else if ok {
+			b.Seals = append(b.Seals, sp.Seal{Origin: origin, Stream: stream, Seq: last, H: h, Kid: kid, Sig: sig})
+		}
+	}
+	atts, err := tx.Attestations(stream, origin)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range atts {
+		b.Atts = append(b.Atts, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
+	}
+	return b, nil
+}
+
+// reofferEndorsed adds, for a node whose re-offer is open (S16 item 4, A2.2), the endorsed ops the
+// upstream's vector already counts. The cloud may hold them only as quarantined after a restore;
+// the endorsement lets it take them as released without asking the owner again (A2.1 item 5).
+func (e *Engine) reofferEndorsed(tx repository.Tx, up sp.Vector, o OutboundOpts, req *sp.PushRequest) error {
+	ends, err := tx.Endorsements()
+	if err != nil {
+		return err
+	}
+	seenAtt := map[string]bool{}
+	var extra []sp.Item
+	var extraEnds []sp.Endorsement
+	n := 0
+	for _, en := range ends {
+		if (len(o.Streams) > 0 && !contains(o.Streams, en.Stream)) || en.Seq > up[sp.VKey(en.Origin, en.Stream)] || n >= o.Limit {
+			continue
+		}
+		r, ok, err := tx.GetOp(en.Stream, en.Origin, en.Seq)
+		if err != nil {
+			return err
+		}
+		if !ok || r.Body == "" || r.H != en.H || (r.Status != repository.StAccepted && r.Status != repository.StFlagged) {
+			continue
+		}
+		extra = append(extra, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
+		extraEnds = append(extraEnds, sp.Endorsement{Origin: en.Origin, Stream: en.Stream, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig})
+		n++
+		k := sp.VKey(en.Origin, en.Stream)
+		if !seenAtt[k] {
+			seenAtt[k] = true
+			atts, err := tx.Attestations(en.Stream, en.Origin)
+			if err != nil {
+				return err
+			}
+			for _, a := range atts {
+				req.Attestations = append(req.Attestations, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
+			}
+		}
+	}
+	// Extras sit below the upstream's head, so they go first: a group stays in ascending order.
+	req.Items = append(extra, req.Items...)
+	req.Endorsements = append(req.Endorsements, extraEnds...)
+	return nil
 }
 
 func contains(xs []string, x string) bool {
@@ -626,6 +793,7 @@ type IngestReq struct {
 	Items        []sp.Item
 	Seals        []sp.Seal
 	Attestations []sp.Attestation
+	Endorsements []sp.Endorsement
 	Caller       Caller
 	// FromUpstream marks a pull response: placeholders are allowed and trailing placeholders need no seal.
 	FromUpstream bool
@@ -646,6 +814,66 @@ type IngestRes struct {
 type group struct {
 	origin, stream string
 	items          []sp.Item
+	ends           map[string]sp.Endorsement // by origin/stream/seq
+}
+
+func endKey(origin, stream string, seq int64) string {
+	return origin + "/" + stream + "/" + fmt.Sprint(seq)
+}
+
+func putAtt(tx repository.Tx, a sp.Attestation) error {
+	return tx.PutAttestation(repository.AttestationRec{Stream: a.Stream, Origin: a.Origin, Rec: a.Rec, Seq: a.Seq, H: a.H, By: a.By, Kid: a.Kid, Sig: a.Sig})
+}
+
+// endorsedOK applies the verifier rule of A2.1 item 3 to one op: the endorsement verifies under a
+// current op-signing key and matches (origin, stream, seq, h); the node holds the identity-signed
+// credential of a device Y with `recovers: origin`; and an attestation for (origin, stream) with the
+// same rec verifies under Y's key, covers the seq, and agrees with the op held at the attested seq
+// (once held). held returns the hash held or in the batch at a seq. It returns the attestation used.
+func (e *Engine) endorsedOK(tx repository.Tx, en sp.Endorsement, h string, batchAtts []sp.Attestation, held func(seq int64) (string, bool)) (sp.Attestation, bool) {
+	rt, ok := e.cfg.Trust.(RecoveryTrust)
+	if !ok || en.H != h || strings.HasPrefix(en.Origin, CloudOriginPrefix) {
+		return sp.Attestation{}, false
+	}
+	key, ok := rt.OpKey(en.Kid)
+	if !ok || !en.Verify(key) {
+		return sp.Attestation{}, false
+	}
+	cands := append([]sp.Attestation(nil), batchAtts...)
+	if stored, err := tx.Attestations(en.Stream, en.Origin); err == nil {
+		for _, a := range stored {
+			cands = append(cands, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
+		}
+	}
+	for _, y := range rt.Recoverers(en.Origin) {
+		pub, err := y.Cred.PubKey()
+		if err != nil {
+			continue
+		}
+		for _, a := range cands {
+			if a.Origin != en.Origin || a.Stream != en.Stream || a.Rec != en.Rec || a.By != y.Cred.DeviceID || en.Seq > a.Seq || !a.Verify(pub) {
+				continue
+			}
+			if hh, have := held(a.Seq); have && hh != a.H {
+				continue
+			}
+			return a, true
+		}
+	}
+	return sp.Attestation{}, false
+}
+
+// heldHash returns the hash this node holds, or has in the batch, at a seq of (origin, stream).
+func heldHash(tx repository.Tx, g *group, seq int64) (string, bool) {
+	for _, it := range g.items {
+		if it.Seq == seq {
+			return it.H, true
+		}
+	}
+	if r, ok, err := tx.GetOp(g.stream, g.origin, seq); err == nil && ok {
+		return r.H, true
+	}
+	return "", false
 }
 
 func groupItems(items []sp.Item) []*group {
@@ -694,8 +922,13 @@ func (e *Engine) Ingest(ctx context.Context, req IngestReq) (IngestRes, error) {
 		for _, a := range req.Attestations {
 			attIdx[sp.VKey(a.Origin, a.Stream)] = a
 		}
+		endIdx := map[string]sp.Endorsement{}
+		for _, en := range req.Endorsements {
+			endIdx[en.Origin+"/"+en.Stream+"/"+fmt.Sprint(en.Seq)] = en
+		}
 		allDrained := req.Recovery
 		for _, g := range groupItems(req.Items) {
+			g.ends = endIdx
 			drained, err := e.ingestGroup(tx, req, g, sealIdx, attIdx, &res, &applyList, &observed)
 			if err != nil {
 				return err
@@ -728,7 +961,14 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 	}
 	if h := e.cfg.Hooks.Authorize; h != nil {
-		if reason := h(tx, req.Caller, g.origin, g.stream, req.Recovery); reason != "" {
+		endorsed := false
+		for _, it := range g.items {
+			if _, ok := g.ends[endKey(it.Origin, it.Stream, it.Seq)]; ok {
+				endorsed = true
+				break
+			}
+		}
+		if reason := h(tx, req.Caller, g.origin, g.stream, req.Recovery, endorsed); reason != "" {
 			refuse(0, reason)
 			return false, nil
 		}
@@ -753,6 +993,34 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			continue
 		}
 		switch {
+		case rec.H == it.H && !it.IsPlaceholder() && rec.Status == repository.StQuarantined && e.cfg.Hooks.OnEndorsed != nil:
+			// A node re-offers a released unsealed-tail op the cloud holds as quarantined (A2.1 item 5).
+			if en, ok := g.ends[endKey(it.Origin, it.Stream, it.Seq)]; ok && sp.Hash(it.Body) == rec.H {
+				if att, ok := e.endorsedOK(tx, en, rec.H, req.Attestations, func(q int64) (string, bool) { return heldHash(tx, g, q) }); ok {
+					if b, err := sp.DecodeBody(it.Body); err == nil {
+						if err := e.cfg.Hooks.OnEndorsed(tx, rec, &Parsed{Item: it, Body: b}, en, att); err != nil {
+							return false, err
+						}
+						res.New = append(res.New, rec)
+					}
+				}
+			}
+		case rec.H == it.H && !it.IsPlaceholder() && req.FromUpstream && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) && g.ends[endKey(it.Origin, it.Stream, it.Seq)].Sig != "":
+			// A refreshed endorsement for an op held already (re-issued after a key rotation, A2.1
+			// item 6): replace the stored one if the new one passes the whole rule.
+			en := g.ends[endKey(it.Origin, it.Stream, it.Seq)]
+			if old, ok, err := tx.GetEndorsement(it.Stream, it.Origin, it.Seq); err != nil {
+				return false, err
+			} else if ok && old.Sig != en.Sig {
+				if att, ok := e.endorsedOK(tx, en, rec.H, req.Attestations, func(q int64) (string, bool) { return heldHash(tx, g, q) }); ok {
+					if err := tx.ReplaceEndorsement(repository.EndorsementRec{Stream: en.Stream, Origin: en.Origin, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig}); err != nil {
+						return false, err
+					}
+					if err := putAtt(tx, att); err != nil {
+						return false, err
+					}
+				}
+			}
 		case rec.H != it.H:
 			if !it.IsPlaceholder() && e.cfg.Hooks.OnFork != nil {
 				if err := e.cfg.Hooks.OnFork(tx, req.Caller, rec, it); err != nil {
@@ -763,9 +1031,29 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 				res.Refused = append(res.Refused, sp.Refusal{Origin: it.Origin, Stream: it.Stream, Seq: it.Seq, Reason: sp.ReasonFork})
 			}
 		case rec.Status == repository.StPlaceholder && !it.IsPlaceholder() && req.FromUpstream:
-			// A released op reaching a node that held only its slot (RB3).
+			// A released op reaching a node that held only its slot (RB3). Beyond the last seal of the
+			// origin it must carry an endorsement that passes the rule of A2.1 (the unsealed tail).
 			if sp.Hash(it.Body) != rec.H {
 				continue
+			}
+			if maxSeal, err := tx.MaxSealSeq(g.stream, g.origin); err != nil {
+				return false, err
+			} else if rt, isRT := e.cfg.Trust.(RecoveryTrust); isRT && rec.Seq > maxSeal && len(rt.Recoverers(g.origin)) > 0 && !e.sealedLater(tx, g, req.Seals, rec.Seq) {
+				en, ok := g.ends[endKey(it.Origin, it.Stream, it.Seq)]
+				if !ok {
+					continue
+				}
+				att, ok := e.endorsedOK(tx, en, rec.H, req.Attestations, func(q int64) (string, bool) { return heldHash(tx, g, q) })
+				if !ok {
+					continue
+				}
+				if err := tx.PutEndorsement(repository.EndorsementRec{Stream: en.Stream, Origin: en.Origin, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig}); err != nil {
+					return false, err
+				}
+				if err := putAtt(tx, att); err != nil {
+					return false, err
+				}
+				rec.Marks = MarkUnsealed
 			}
 			b, err := sp.DecodeBody(it.Body)
 			if err != nil {
@@ -829,7 +1117,7 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			}
 			steps = append(steps, step{p: &Parsed{Item: it}})
 			prevH = it.H
-			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && chainOK && sl.H == it.H && e.sealOK(sl, pub) {
+			if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && chainOK && sl.H == it.H && e.sealOK(sl, g.origin, pub) {
 				covered = i + 1
 				steps[i].sealed = true
 			}
@@ -851,9 +1139,41 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 		steps = append(steps, step{p: &Parsed{Item: it, Body: b}, ph: b.PH})
 		prevH = it.H
-		if s, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && s.H == it.H && e.sealOK(s, pub) {
+		if s, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && s.H == it.H && e.sealOK(s, g.origin, pub) {
 			covered = i + 1
 			steps[i].sealed = true
+		}
+	}
+	// The released unsealed tail of a key-lost origin: no seal covers it, an endorsement may
+	// (A2.1 item 3). The highest verified endorsement covers the chain below it.
+	sealCovered := covered
+	endTo := 0
+	endOK := map[int]sp.Endorsement{}
+	var endAtts []sp.Attestation
+	if !req.Recovery && len(g.ends) > 0 {
+		held := func(q int64) (string, bool) { return heldHash(tx, g, q) }
+		for i := len(steps) - 1; i >= sealCovered; i-- {
+			en, ok := g.ends[endKey(items[i].Origin, items[i].Stream, items[i].Seq)]
+			if !ok {
+				continue
+			}
+			att, ok := e.endorsedOK(tx, en, items[i].H, req.Attestations, held)
+			if !ok {
+				continue
+			}
+			endTo = i + 1
+			endAtts = append(endAtts, att)
+			for j := sealCovered; j <= i; j++ {
+				if ej, ok := g.ends[endKey(items[j].Origin, items[j].Stream, items[j].Seq)]; ok {
+					if _, ok := e.endorsedOK(tx, ej, items[j].H, req.Attestations, held); ok {
+						endOK[j] = ej
+					}
+				}
+			}
+			break
+		}
+		if endTo > covered {
+			covered = endTo
 		}
 	}
 	// Trailing placeholders from the cloud need no seal.
@@ -929,7 +1249,23 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		v := Verdict{Status: repository.StAccepted}
 		if e.cfg.Hooks.Verdict != nil {
 			v = e.cfg.Hooks.Verdict(tx, p, VerdictCtx{Caller: req.Caller, Own: own, Recovery: req.Recovery,
-				Sealed: i < covered, Unsealed: i >= covered && i < good, ChainBroken: i >= good})
+				Sealed: i < sealCovered, Endorsed: i >= sealCovered && i < endTo, Unsealed: i >= covered && i < good, ChainBroken: i >= good})
+		}
+		if i >= sealCovered && i < endTo {
+			// Every node marks an op accepted under an endorsement `unsealed` in its audit views (A2.1 item 4).
+			if !contains(v.Marks, MarkUnsealed) {
+				v.Marks = append(v.Marks, MarkUnsealed)
+			}
+			if en, ok := endOK[i]; ok {
+				if err := tx.PutEndorsement(repository.EndorsementRec{Stream: en.Stream, Origin: en.Origin, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig}); err != nil {
+					return false, err
+				}
+			}
+			for _, a := range endAtts {
+				if err := putAtt(tx, a); err != nil {
+					return false, err
+				}
+			}
 		}
 		// Seals that verified are kept and served with the ops.
 		if sl, ok := seals[it.Origin+"/"+it.Stream+"/"+fmt.Sprint(it.Seq)]; ok && sealed {
@@ -1005,6 +1341,9 @@ type ServeOpts struct {
 	Streams []string
 	// IsHub: the caller relays others' origins and gets RelayHeld.
 	IsHub bool
+	// Recoverers returns the identity-signed credentials that carry `recovers: origin`; they are
+	// served with an endorsed tail (A2.1 item 3).
+	Recoverers func(origin string) []sp.CredentialEnvelope
 }
 
 // Serve answers a pull: slots above the caller's vector, up to a seal boundary, quarantined and
@@ -1043,7 +1382,7 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				resp.More = true
 				continue
 			}
-			recs, boundSeal, more, err := e.serveRange(tx, h, after, budget)
+			recs, bnd, more, err := e.serveRange(tx, h, after, budget)
 			if err != nil {
 				return err
 			}
@@ -1059,8 +1398,13 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				budget--
 			}
 			if len(recs) > 0 {
-				if boundSeal != nil {
-					resp.Seals = append(resp.Seals, *boundSeal)
+				if bnd != nil {
+					resp.Seals = append(resp.Seals, bnd.Seals...)
+					resp.Endorsements = append(resp.Endorsements, bnd.Ends...)
+					resp.Attestations = append(resp.Attestations, bnd.Atts...)
+					if len(bnd.Ends) > 0 && o.Recoverers != nil {
+						resp.Creds = append(resp.Creds, o.Recoverers(h.Origin)...)
+					}
 				}
 				if !seen[h.Origin] {
 					seen[h.Origin] = true
@@ -1078,6 +1422,32 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 			}
 			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) {
 				resp.Items = append(resp.Items, sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body})
+				// The nearest origin seal at or above the slot: an ordinary released op lies under it.
+				if later, err := tx.SealSeqs(rec.Stream, rec.Origin, rec.Seq-1); err != nil {
+					return err
+				} else if len(later) > 0 {
+					if kid, sig, h, ok, err := tx.GetSeal(rec.Stream, rec.Origin, later[0]); err != nil {
+						return err
+					} else if ok {
+						resp.Seals = append(resp.Seals, sp.Seal{Origin: rec.Origin, Stream: rec.Stream, Seq: later[0], H: h, Kid: kid, Sig: sig})
+					}
+				}
+				if en, ok, err := tx.GetEndorsement(rec.Stream, rec.Origin, rec.Seq); err != nil {
+					return err
+				} else if ok {
+					// A released unsealed-tail op reaching a placeholder holder carries its endorsement (RB3, A2.1).
+					resp.Endorsements = append(resp.Endorsements, sp.Endorsement{Origin: en.Origin, Stream: en.Stream, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig})
+					atts, err := tx.Attestations(rec.Stream, rec.Origin)
+					if err != nil {
+						return err
+					}
+					for _, a := range atts {
+						resp.Attestations = append(resp.Attestations, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
+					}
+					if o.Recoverers != nil {
+						resp.Creds = append(resp.Creds, o.Recoverers(rec.Origin)...)
+					}
+				}
 				if !seen[rec.Origin] {
 					seen[rec.Origin] = true
 					if c, ok := creds(rec.Origin); ok {
@@ -1105,43 +1475,39 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 	return resp, err
 }
 
-// serveRange picks the slots of one (stream, origin) to serve: up to a seal boundary (so every
-// full op is covered by a seal the puller can check), plus trailing placeholders.
-func (e *Engine) serveRange(tx repository.Tx, h repository.HeadRow, after int64, budget int) ([]repository.OpRec, *sp.Seal, bool, error) {
-	seals, err := tx.SealSeqs(h.Stream, h.Origin, after)
+// serveRange picks the slots of one (stream, origin) to serve: up to a seal or endorsement boundary
+// (so every full op is covered by proof the puller can check), plus trailing placeholders.
+func (e *Engine) serveRange(tx repository.Tx, h repository.HeadRow, after int64, budget int) ([]repository.OpRec, *bound, bool, error) {
+	bounds, err := boundaries(tx, h.Stream, h.Origin, after)
 	if err != nil {
 		return nil, nil, false, err
 	}
 	var cut int64
-	for _, s := range seals {
+	for _, s := range bounds {
 		if s-after <= int64(budget) {
 			cut = s
 		}
 	}
-	if cut == 0 && len(seals) > 0 {
-		cut = seals[0] // exceed the soft cap to reach the first seal: a batch is never unverifiable
+	if cut == 0 && len(bounds) > 0 {
+		cut = bounds[0] // exceed the soft cap to reach the first boundary: a batch is never unverifiable
 	}
 	var recs []repository.OpRec
-	var seal *sp.Seal
+	var bnd *bound
 	more := false
 	if cut > 0 {
 		recs, err = tx.Range(h.Stream, h.Origin, after, cut, int(cut-after))
 		if err != nil {
 			return nil, nil, false, err
 		}
-		kid, sig, sh, ok, err := tx.GetSeal(h.Stream, h.Origin, cut)
-		if err != nil {
+		if bnd, err = boundAt(tx, h.Stream, h.Origin, after, cut); err != nil {
 			return nil, nil, false, err
-		}
-		if ok {
-			seal = &sp.Seal{Origin: h.Origin, Stream: h.Stream, Seq: cut, H: sh, Kid: kid, Sig: sig}
 		}
 		if cut < h.Seq {
 			more = true
 		}
 	}
 	// Trailing slots with no body served (quarantined / voided) need no seal.
-	if cut == 0 || cut == seals[len(seals)-1] {
+	if cut == 0 || cut == bounds[len(bounds)-1] {
 		start := cut
 		if start == 0 {
 			start = after
@@ -1157,7 +1523,7 @@ func (e *Engine) serveRange(tx repository.Tx, h repository.HeadRow, after int64,
 			recs = append(recs, r)
 		}
 	}
-	return recs, seal, more, nil
+	return recs, bnd, more, nil
 }
 
 // Held lists the quarantined slots of one origin.
@@ -1285,19 +1651,39 @@ func (e *Engine) RecoveryUpload(ctx context.Context, old string, up sp.Vector, l
 	return req, err
 }
 
-// sealOK accepts a seal made by the origin, or an endorsement by the gateway op-signing key. The
-// gateway endorses the released unsealed tail of a key-lost origin (A1.3 item 6) so that peers may
-// take the ops after an owner released them; the endorsement is what the seal-less tail lacks.
-func (e *Engine) sealOK(s sp.Seal, originPub *ecdsa.PublicKey) bool {
-	if s.Verify(originPub) {
-		return true
-	}
-	if ck, ok := e.cfg.Trust.(interface {
-		CloudKey() (*ecdsa.PublicKey, bool)
-	}); ok {
-		if pub, ok := ck.CloudKey(); ok && pub != nil {
-			return s.Verify(pub)
+// sealOK verifies a seal. A device origin's seal verifies under the origin's credential key only.
+// A cloud-<epoch> origin's seal verifies under the op-signing key its kid names, if that key is
+// current. An op-signing key never seals another origin: the released tail of a key-lost origin
+// is covered by an endorsement instead (A2.1).
+func (e *Engine) sealOK(s sp.Seal, origin string, originPub *ecdsa.PublicKey) bool {
+	if strings.HasPrefix(origin, CloudOriginPrefix) {
+		if rt, ok := e.cfg.Trust.(RecoveryTrust); ok {
+			k, ok := rt.OpKey(s.Kid)
+			return ok && s.Verify(k)
 		}
+	}
+	return s.Verify(originPub)
+}
+
+// sealedLater reports whether a verified origin seal at or above seq, matching the hash this node
+// holds at the sealed slot, accompanies the batch: the released op then lies under the origin's own
+// signature (an ordinary released slot, not the unsealed tail). A seal that qualifies is stored.
+func (e *Engine) sealedLater(tx repository.Tx, g *group, seals []sp.Seal, seq int64) bool {
+	pub, ok := e.cfg.Trust.OriginKey(g.origin)
+	if !ok {
+		return false
+	}
+	for _, sl := range seals {
+		if sl.Origin != g.origin || sl.Stream != g.stream || sl.Seq < seq || !e.sealOK(sl, g.origin, pub) {
+			continue
+		}
+		if h, have := heldHash(tx, g, sl.Seq); !have || h != sl.H {
+			continue
+		}
+		if err := tx.PutSeal(sl.Stream, sl.Origin, sl.Seq, sl.H, sl.Kid, sl.Sig); err != nil {
+			return false
+		}
+		return true
 	}
 	return false
 }

@@ -26,8 +26,10 @@ inconsistent, the conservative choice is listed under "Choices".
    contract: after an epoch change the origin also syncs with the cloud directly until its re-offer is complete.
    ADR-0002 S16 item 4 says devices re-offer to "the cloud"; it did not say a device with a hub must reach past it.
 2. **Released unsealed tail cannot travel (KL1).** A released recovered tail has no origin seal, so nodes would never accept it
-   and peers would never converge. Chosen: the gateway endorses each released op with its op-signing key; verifiers
-   accept a seal under the origin key or the op-signing key. Needs an ADR line (A1.3 item 6); clients must implement it.
+   and peers would never converge. The first PoC let the gateway op-signing key sign the ordinary seal message for any origin;
+   ADR-0002 A2.1 replaced that (it would let the cloud key seal invented ops of any device). Now: a separate gateway
+   `endorsement` (tag `hostry-endorse-v1`, carries the recovery id), accepted only with the identity-signed `recovers`
+   credential and the adopting device's attestation (verifier rule in `contract/README.md`, cases KL12 to KL15).
 3. **Hub must not refuse pulled ops of a revoked origin** (S17: revocation is enforced where ops are first accepted).
 4. **LAN signature covers the bytes on the wire** (gzip body), found by the first hub run; recorded in the contract.
 5. A mutation check: removing void application, re-offer after epoch change, or seal verification each makes the simulator or
@@ -58,6 +60,30 @@ inconsistent, the conservative choice is listed under "Choices".
   its schema should be added to `api-specs/events/sync/`. Not relayed to NATS here (no NATS needed for the PoC).
 - Library for mDNS: `github.com/enbility/zeroconf/v2` (maintained fork of grandcat/zeroconf, API-compatible). Loopback browse works
   on this machine; a real two-router test is the hardware checklist.
+
+## A2 follow-up (2026-11-25, provisional, ADR-0002 Amendment A2 Proposed)
+
+- **A2.1** endorsement object, `endorsements` / `attestations` on the wire, verifier rule in `engine` (`endorsedOK`), nodes store and
+  re-serve every endorsement with the tail; a released op over a placeholder needs an endorsement when the origin has a known
+  recoverer, or a verified origin seal at or above it (`sealedLater`, found by simulator seed 1 after the first cut). After a
+  cloud restore a node re-offers endorsed ops below the cloud's vector and the gateway takes quarantined `unsealed_tail`
+  slots as released (`OnEndorsed`). `Gateway.RotateOpKey` re-signs cloud seals and endorsements; nodes refresh stale
+  endorsements by listing them in `placeholders`.
+- **A2.2** `reoffered_epoch` (persisted) next to `epoch`; a hub's word opens, only a direct cloud hello with nothing left to push
+  closes; ops the cloud keeps refusing do not count as left to push. The gateway clears the "unrecoverable origin gap" alert
+  when the node's vector is no longer above the cloud's.
+- **A2.4** the gateway uses `go-common/restore` (Reader once at start, `restore_state` table, `Guard` with a hook for the new
+  cloud origin, `/readyz` through `Guard().Check`); `platform_meta` and `gateway_state` are no longer read. Development and
+  the simulator stamp an epoch through `devepoch` (wraps `restoretest`).
+- Residuals and open items: a node that does not yet know the recovery credential of a key-lost origin takes a released
+  placeholder by hash alone (as before A2); hubs refresh stale endorsements only through `placeholders`, and stale cloud seals
+  of a hub after a rotation are not refreshed (a node with only the new key reads from the cloud); `go.mod` still pins
+  go-common by pseudo-version (`go.work` supplies the local copy) and must be bumped to the merged `restore` commit.
+- **Intent registry mapping (follow-up, not done in this pass):** the canonical registry is now
+  `api-specs-p2/sync/intents/` (README maps the PoC names). `syncproto/intents.go` still uses PoC names and the permissions
+  `bill.refund`, `payment.take`, `kds.update`, `menu.edit`, `stock.adjust`, which are not catalogue keys. The mapping touches the
+  simulator's device ops and the contract suite as well, so it is a separate change: replace the table by one generated
+  from the YAML files and map the demo names the TypeScript client uses.
 
 ## Not built (out of scope or later)
 

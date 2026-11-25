@@ -63,8 +63,12 @@ func appDSN(t *testing.T, admin string) string {
 
 func clean(t *testing.T, st repository.Store) {
 	t.Helper()
-	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, platform_meta, gateway_state`)
+	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state`)
 	if err != nil {
+		t.Fatal(err)
+	}
+	// The epoch the dev world stamps into its platform database (the same instance here).
+	if _, err := st.DB().ExecContext(bg, `DROP TABLE IF EXISTS restore_epoch`); err != nil {
 		t.Fatal(err)
 	}
 }

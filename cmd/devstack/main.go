@@ -25,6 +25,7 @@ import (
 	"github.com/hostryhq/go-common/clock"
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/svc-sync/api"
+	"github.com/hostryhq/svc-sync/devepoch"
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/hub"
@@ -52,7 +53,9 @@ func main() {
 
 	st, err := repository.Open(*dsn)
 	check(err)
-	gw, err := service.New(ctx, service.Config{Store: st, Dir: id, OpKey: id.CloudKey, Now: now})
+	ep, err := devepoch.Reader(ctx, *dsn)
+	check(err)
+	gw, err := service.New(ctx, service.Config{Store: st, Epoch: ep, Dir: id, OpKey: id.CloudKey, Now: now})
 	check(err)
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})

@@ -42,6 +42,28 @@ type OpRec struct {
 	Arr                    int64
 }
 
+// EndorsementRec is a stored gateway endorsement (ADR-0002 A2.1).
+type EndorsementRec struct {
+	Stream, Origin string
+	Seq            int64
+	H, Rec, Kid    string
+	Sig            string
+}
+
+// AttestationRec is a stored attestation of an adopting device.
+type AttestationRec struct {
+	Stream, Origin, Rec string
+	Seq                 int64
+	H, By, Kid, Sig     string
+}
+
+// SealRec is a stored seal.
+type SealRec struct {
+	Stream, Origin string
+	Seq            int64
+	H, Kid, Sig    string
+}
+
 // HasBody reports whether the slot holds the op body (not a placeholder).
 func (o OpRec) HasBody() bool { return o.Body != "" }
 
@@ -98,6 +120,20 @@ type Tx interface {
 	SealSeqs(stream, origin string, after int64) ([]int64, error)
 	GetSeal(stream, origin string, seq int64) (kid, sig, h string, ok bool, err error)
 	MaxSealSeq(stream, origin string) (int64, error)
+	// ReplaceSeal overwrites the seal at a slot (re-sealing after an op-signing key rotation).
+	ReplaceSeal(stream, origin string, seq int64, h, kid, sig string) error
+	// SealsOfOrigins lists the seals of origins starting with prefix (cloud-).
+	SealsOfOrigins(prefix string) ([]SealRec, error)
+	PutEndorsement(e EndorsementRec) error
+	ReplaceEndorsement(e EndorsementRec) error
+	GetEndorsement(stream, origin string, seq int64) (EndorsementRec, bool, error)
+	EndorsementSeqs(stream, origin string, after int64) ([]int64, error)
+	Endorsements() ([]EndorsementRec, error)
+	PutAttestation(a AttestationRec) error
+	Attestations(stream, origin string) ([]AttestationRec, error)
+	DeleteMeta(k string) error
+	// ResolveAlerts removes the open alerts of a kind and detail.
+	ResolveAlerts(kind, detail string) error
 	NextCounter(name string) (int64, error)
 	NextNumber(code, fy string) (int64, error)
 	PeekNumber(code, fy string) (int64, error)
@@ -582,53 +618,4 @@ func (t *sqlTx) Alerts() ([]Alert, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
-}
-
-// PlatformMeta reads a platform-level value (restore epoch stamped by hostry-restore).
-func PlatformMeta(ctx context.Context, s Store, k string) (string, bool, error) {
-	var v string
-	q := `SELECT v FROM platform_meta WHERE k = ?`
-	if s.Dialect() == "postgres" {
-		q = `SELECT v FROM platform_meta WHERE k = $1`
-	}
-	err := s.DB().QueryRowContext(ctx, q, k).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	return v, err == nil, err
-}
-
-// SetPlatformMeta is the test hook that stamps a restore epoch (ADR-0002 Data needed 6): in
-// production only hostry-restore writes platform_meta.
-func SetPlatformMeta(ctx context.Context, s Store, k, v string) error {
-	q := `INSERT INTO platform_meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-	if s.Dialect() == "postgres" {
-		q = `INSERT INTO platform_meta (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-	}
-	_, err := s.DB().ExecContext(ctx, q, k, v)
-	return err
-}
-
-// GatewayState reads the gateway's own epoch record.
-func GatewayState(ctx context.Context, s Store, k string) (string, bool, error) {
-	var v string
-	q := `SELECT v FROM gateway_state WHERE k = ?`
-	if s.Dialect() == "postgres" {
-		q = `SELECT v FROM gateway_state WHERE k = $1`
-	}
-	err := s.DB().QueryRowContext(ctx, q, k).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	return v, err == nil, err
-}
-
-// SetGatewayState writes the gateway's own epoch record.
-func SetGatewayState(ctx context.Context, s Store, k, v string) error {
-	q := `INSERT INTO gateway_state (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-	if s.Dialect() == "postgres" {
-		q = `INSERT INTO gateway_state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = excluded.v`
-	}
-	_, err := s.DB().ExecContext(ctx, q, k, v)
-	return err
 }

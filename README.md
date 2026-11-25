@@ -3,7 +3,7 @@
 Sync gateway service: operation log, hub protocol, restore epoch, with its test double. Also holds the LAN hub
 (`hub/`) and the deterministic simulator (`sim/`) of the Phase 1 offline-sync proof of concept (ADR-0002).
 
-- Wire contract: `contract/sync-v1.openapi.yaml` and `contract/README.md` (normative rules), golden vectors in `contract/vectors/`.
+- Wire contract: `contract/sync-v1.openapi.yaml` and `contract/README.md` (normative rules, incl. endorsement and re-offer), golden vectors in `contract/vectors/`.
 - Notes, findings and choices: `docs/poc-notes.md`.
 - Layering: `api` -> `service` -> `repository`; `engine` and `syncproto` are the shared sync core (meant for `go-common/sync`).
 - Test double: `double/`; shared contract suite: `contract/suite`.

@@ -54,7 +54,10 @@ type SyncResult struct {
 	EpochChanged            bool
 }
 
-const metaEpoch, metaReoffer = "epoch", "reoffer"
+// Persisted re-offer state (A2.2): metaEpoch is the newest cloud epoch heard from any upstream,
+// metaReoffered the epoch for which this node last finished re-offering. The re-offer is open while
+// they differ. A hub's word may open it; only a direct cloud hello may close it.
+const metaEpoch, metaReoffered = "epoch", "reoffered_epoch"
 
 // SyncOnce does hello, push until the upstream has everything offerable, then pull until caught
 // up. Every step is idempotent; an error leaves the node ready to run it again.
@@ -65,10 +68,10 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 	if err != nil {
 		return res, err
 	}
-	var lastEpoch, reoffer string
+	var lastEpoch, reoffered string
 	_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error {
 		lastEpoch, _, _ = tx.GetMeta(metaEpoch)
-		reoffer, _, _ = tx.GetMeta(metaReoffer)
+		reoffered, _, _ = tx.GetMeta(metaReoffered)
 		return nil
 	})
 	sent := cfg.Clock.Time()
@@ -83,28 +86,38 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 			cfg.Clock.SetOffset(cfg.Clock.Offset() + skew)
 		}
 	}
-	if hello.Epoch != "" && hello.Epoch != lastEpoch {
+	// A hub reporting the epoch this node already finished re-offering for is stale, not news: a
+	// hub's word never closes a re-offer, and never reopens a closed one with an old epoch.
+	if hello.Epoch != "" && hello.Epoch != lastEpoch && (c.UpstreamIsCloud || hello.Epoch != reoffered) {
 		if lastEpoch != "" {
-			reoffer = "1"
 			res.EpochChanged = true
 		}
+		first := reoffered == "" && lastEpoch == ""
 		_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error {
 			if err := tx.SetMeta(metaEpoch, hello.Epoch); err != nil {
 				return err
 			}
-			return tx.SetMeta(metaReoffer, reoffer)
+			if first {
+				return tx.SetMeta(metaReoffered, hello.Epoch) // a new store has nothing to re-offer
+			}
+			return nil
 		})
 		lastEpoch = hello.Epoch
+		if first {
+			reoffered = hello.Epoch
+		}
 	}
 	c.Epoch = lastEpoch
+	open := lastEpoch != "" && reoffered != lastEpoch
 	up := hello.Vector
 	if up == nil {
 		up = sp.Vector{}
 	}
-	others := c.IsHub || (c.UpstreamIsCloud && reoffer == "1")
+	others := c.IsHub || (c.UpstreamIsCloud && open)
+	refused := map[string]bool{}
 	// Push.
 	for round := 0; round < 200; round++ {
-		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams})
+		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams, Reoffer: open && c.UpstreamIsCloud && round == 0})
 		if err != nil {
 			return res, err
 		}
@@ -125,14 +138,26 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		res.Pushed += len(req.Items)
 		res.Refused += len(pr.Refused)
 		c.LastRefused = pr.Refused
+		for _, rf := range pr.Refused {
+			refused[endKey(rf.Origin, rf.Stream, rf.Seq)] = true
+		}
 		if !progress {
 			break
 		}
 	}
-	if c.UpstreamIsCloud && reoffer == "1" {
+	// Only a direct cloud hello under the newest epoch, with nothing left to push, closes the
+	// re-offer. An op the cloud refused (and refuses again on every push) is not "left to push":
+	// otherwise one refused op would keep the re-offer open for ever.
+	if c.UpstreamIsCloud && open && hello.Epoch == lastEpoch {
 		req, _ := c.E.Outbound(ctx, up, OutboundOpts{Others: true, Streams: c.Streams})
-		if len(req.Items) == 0 {
-			_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error { return tx.SetMeta(metaReoffer, "0") })
+		left := 0
+		for _, it := range req.Items {
+			if !refused[endKey(it.Origin, it.Stream, it.Seq)] {
+				left++
+			}
+		}
+		if left == 0 {
+			_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error { return tx.SetMeta(metaReoffered, lastEpoch) })
 		}
 	}
 	c.Upstream = up
@@ -159,7 +184,7 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		if len(pr.Items) == 0 {
 			break
 		}
-		ir, err := c.E.Ingest(ctx, IngestReq{Items: pr.Items, Seals: pr.Seals, FromUpstream: true, Caller: Caller{ID: "upstream"}})
+		ir, err := c.E.Ingest(ctx, IngestReq{Items: pr.Items, Seals: pr.Seals, Endorsements: pr.Endorsements, Attestations: pr.Attestations, FromUpstream: true, Caller: Caller{ID: "upstream"}})
 		if err != nil {
 			return res, err
 		}
@@ -180,9 +205,13 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 // restored cloud lost, and then the origin is the only node that can deliver it.
 func (c *Client) ReofferPending(ctx context.Context) bool {
 	cfg := c.E.Config()
-	var v string
-	_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error { v, _, _ = tx.GetMeta(metaReoffer); return nil })
-	return v == "1"
+	var epoch, done string
+	_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error {
+		epoch, _, _ = tx.GetMeta(metaEpoch)
+		done, _, _ = tx.GetMeta(metaReoffered)
+		return nil
+	})
+	return epoch != "" && epoch != done
 }
 
 func (c *Client) placeholders(ctx context.Context) ([]sp.Ref, error) {
@@ -197,6 +226,19 @@ func (c *Client) placeholders(ctx context.Context) ([]sp.Ref, error) {
 			out = append(out, sp.Ref{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq})
 			if len(out) >= 200 {
 				break
+			}
+		}
+		// Endorsements signed by a key this node no longer accepts (rotation, A2.1 item 6): ask
+		// for the op again, the answer carries the re-issued endorsement.
+		if c.Cache != nil {
+			ends, err := tx.Endorsements()
+			if err != nil {
+				return err
+			}
+			for _, en := range ends {
+				if _, ok := c.Cache.OpKey(en.Kid); !ok && len(out) < 200 {
+					out = append(out, sp.Ref{Origin: en.Origin, Stream: en.Stream, Seq: en.Seq})
+				}
 			}
 		}
 		return nil

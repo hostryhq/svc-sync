@@ -17,6 +17,7 @@ import (
 	"github.com/hostryhq/go-common/clock"
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/svc-sync/api"
+	"github.com/hostryhq/svc-sync/devepoch"
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/identitystub"
 	"github.com/hostryhq/svc-sync/repository"
@@ -60,7 +61,11 @@ func New(ctx context.Context) (*Double, error) {
 	if d.Store, err = repository.Open("file:double-" + fmt.Sprint(time.Now().UnixNano()) + "?mode=memory&cache=shared"); err != nil {
 		return nil, err
 	}
-	if d.Gateway, err = service.New(ctx, service.Config{Store: d.Store, Dir: d.Identity, OpKey: d.Identity.CloudKey, Now: d.Now}); err != nil {
+	ep, err := devepoch.Reader(ctx, "file:double-platform-"+fmt.Sprint(time.Now().UnixNano())+"?mode=memory&cache=shared")
+	if err != nil {
+		return nil, err
+	}
+	if d.Gateway, err = service.New(ctx, service.Config{Store: d.Store, Epoch: ep, Dir: d.Identity, OpKey: d.Identity.CloudKey, Now: d.Now}); err != nil {
 		return nil, err
 	}
 	mux := http.NewServeMux()

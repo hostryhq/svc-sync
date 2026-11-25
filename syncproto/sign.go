@@ -109,6 +109,45 @@ func (s Seal) Verify(pub *ecdsa.PublicKey) bool {
 	return VerifySig(pub, SealMessage(s.Origin, s.Stream, s.Seq, s.H), s.Sig)
 }
 
+// DomainEndorse is the domain tag of the gateway endorsement (ADR-0002 A2.1). It is not the seal
+// tag: an op-signing key signs seals only for cloud-<epoch> origins, and an endorsement only
+// together with the identity-signed recovery credential and the adopting device's attestation.
+const DomainEndorse = "hostry-endorse-v1"
+
+// Endorsement is the gateway's statement that a holder of device.recover released an op of a
+// key-lost origin (A2.1). It is valid only with the credential of the adopting device (which
+// carries `recovers: origin`) and that device's attestation with the same Rec.
+type Endorsement struct {
+	Origin string `json:"origin"`
+	Stream string `json:"stream"`
+	Seq    int64  `json:"seq"`
+	H      string `json:"h"`
+	// Rec is the recovery id.
+	Rec string `json:"rec"`
+	// Kid names the gateway op-signing key.
+	Kid string `json:"kid"`
+	Sig string `json:"sig"`
+}
+
+// EndorseMessage is the signed text: the domain tag, then origin, stream, seq, h and rec.
+func EndorseMessage(origin, stream string, seq int64, h, rec string) string {
+	return DomainEndorse + "\n" + origin + "\n" + stream + "\n" + strconv.FormatInt(seq, 10) + "\n" + h + "\n" + rec
+}
+
+// MakeEndorsement signs an endorsement with the gateway op-signing key.
+func MakeEndorsement(k *KeyPair, origin, stream string, seq int64, h, rec string) (Endorsement, error) {
+	sig, err := k.Sign(EndorseMessage(origin, stream, seq, h, rec))
+	if err != nil {
+		return Endorsement{}, err
+	}
+	return Endorsement{Origin: origin, Stream: stream, Seq: seq, H: h, Rec: rec, Kid: k.Kid, Sig: sig}, nil
+}
+
+// Verify checks the endorsement against an op-signing public key.
+func (e Endorsement) Verify(pub *ecdsa.PublicKey) bool {
+	return VerifySig(pub, EndorseMessage(e.Origin, e.Stream, e.Seq, e.H, e.Rec), e.Sig)
+}
+
 // Attestation fixes the tail of a key-lost origin (A1.3 item 4), signed with the adopting
 // device's new key.
 type Attestation struct {

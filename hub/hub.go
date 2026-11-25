@@ -113,7 +113,7 @@ func (h *Hub) streamOK(stream string) bool {
 
 // authorize: the hub stores ops only of unrevoked devices of its own outlet (and cloud origins
 // re-offered by a device), in streams inside the outlet's binding.
-func (h *Hub) authorize(_ repository.Tx, c engine.Caller, origin, stream string, _ bool) string {
+func (h *Hub) authorize(_ repository.Tx, c engine.Caller, origin, stream string, _, endorsed bool) string {
 	if !h.streamOK(stream) {
 		return sp.ReasonStream
 	}
@@ -125,7 +125,9 @@ func (h *Hub) authorize(_ repository.Tx, c engine.Caller, origin, stream string,
 	}
 	// Revocation is enforced where ops are first accepted, not on pull, so the history of a
 	// since-revoked device stays readable (S17).
-	if c.ID != "upstream" && h.IsRevoked(origin) {
+	// An endorsed batch may name a revoked (key-lost) origin: the engine takes the ops only with the
+	// endorsement, the recovery credential and the attestation (A2.1).
+	if c.ID != "upstream" && h.IsRevoked(origin) && !endorsed {
 		return sp.ReasonRevoked
 	}
 	return ""
@@ -189,7 +191,7 @@ func (h *Hub) Hello(ctx context.Context, p api.Principal, req sp.HelloRequest) (
 
 // Push implements api.Backend.
 func (h *Hub) Push(ctx context.Context, p api.Principal, req sp.PushRequest) (sp.PushResponse, error) {
-	res, err := h.eng.Ingest(ctx, engine.IngestReq{Items: req.Items, Seals: req.Seals, Caller: p.Caller})
+	res, err := h.eng.Ingest(ctx, engine.IngestReq{Items: req.Items, Seals: req.Seals, Endorsements: req.Endorsements, Attestations: req.Attestations, Caller: p.Caller})
 	if err != nil {
 		return sp.PushResponse{}, err
 	}
@@ -202,7 +204,7 @@ func (h *Hub) Push(ctx context.Context, p api.Principal, req sp.PushRequest) (sp
 // Pull implements api.Backend. The hub returns each device's own held list from what the cloud
 // last told it; the device's next direct cloud contact corrects any mistake (A1.2 item 3).
 func (h *Hub) Pull(ctx context.Context, p api.Principal, req sp.PullRequest) (sp.PullResponse, error) {
-	resp, err := h.eng.Serve(ctx, req, engine.ServeOpts{Caller: p.Caller, Streams: h.streams()}, func(origin string) (sp.CredentialEnvelope, bool) {
+	resp, err := h.eng.Serve(ctx, req, engine.ServeOpts{Caller: p.Caller, Streams: h.streams(), Recoverers: h.cache.Recoverers}, func(origin string) (sp.CredentialEnvelope, bool) {
 		return h.cache.Get(origin)
 	})
 	if err != nil {

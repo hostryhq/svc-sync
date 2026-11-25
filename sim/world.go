@@ -14,6 +14,7 @@ import (
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/go-common/testkit"
 	"github.com/hostryhq/svc-sync/api"
+	"github.com/hostryhq/svc-sync/devepoch"
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/hub"
 	"github.com/hostryhq/svc-sync/identitystub"
@@ -51,15 +52,17 @@ type World struct {
 	Brand    string
 
 	GWStore repository.Store
-	GW      *service.Gateway
-	CloudH  http.Handler
-	Hub     *hub.Hub
-	HubKey  *sp.KeyPair
-	HubCred sp.CredentialEnvelope
-	HubDB   string
-	hubGen  int
-	HubUp   *engine.Client
-	HubH    http.Handler
+	// PlatformDSN is the platform_meta database (the restore epoch), stamped like hostry-restore does.
+	PlatformDSN string
+	GW          *service.Gateway
+	CloudH      http.Handler
+	Hub         *hub.Hub
+	HubKey      *sp.KeyPair
+	HubCred     sp.CredentialEnvelope
+	HubDB       string
+	hubGen      int
+	HubUp       *engine.Client
+	HubH        http.Handler
 
 	// Via counts which upstream device syncs used.
 	Via     struct{ HubOK, HubFail, CloudDirect int }
@@ -102,6 +105,10 @@ func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) 
 	if w.GWStore, err = repository.Open(dsn); err != nil {
 		return nil, err
 	}
+	w.PlatformDSN = "file:" + filepath.Join(opt.Dir, "platform.db")
+	if opt.CloudDSN != "" {
+		w.PlatformDSN = opt.CloudDSN
+	}
 	if err := w.startGateway(); err != nil {
 		return nil, err
 	}
@@ -135,7 +142,11 @@ func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) 
 }
 
 func (w *World) startGateway() error {
-	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox})
+	ep, err := devepoch.Reader(w.Ctx, w.PlatformDSN)
+	if err != nil {
+		return err
+	}
+	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Epoch: ep, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox})
 	if err != nil {
 		return err
 	}
@@ -199,7 +210,7 @@ func (w *World) newHub(first bool) error {
 func (w *World) openHub(st repository.Store) {
 	h, err := hub.New(w.Ctx, hub.Config{
 		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, Key: w.HubKey,
-		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{"gateway-op-1": &w.Identity.CloudKey.Priv.PublicKey},
+		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{w.Identity.CloudKey.Kid: &w.Identity.CloudKey.Priv.PublicKey},
 		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet),
 		Members: func(actor string) bool { return w.Identity.InAnyPackOf(w.Tenant, w.Outlet, actor) },
 		SeriesOwner: func(code string) (string, bool) {
@@ -288,7 +299,7 @@ func (w *World) RestoreCloud(name, epoch string) error {
 	if w.GWStore, err = repository.Open("file:" + live); err != nil {
 		return err
 	}
-	if err := repository.SetPlatformMeta(w.Ctx, w.GWStore, service.MetaEpochID, epoch); err != nil {
+	if err := devepoch.Stamp(w.Ctx, w.PlatformDSN, epoch); err != nil {
 		return err
 	}
 	return w.startGateway()

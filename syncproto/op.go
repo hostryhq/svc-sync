@@ -289,9 +289,15 @@ type HelloResponse struct {
 // PushRequest delivers ops. Items must be in origin-sequence order per (origin, stream);
 // each (origin, stream) group ends with an op covered by a seal in Seals.
 type PushRequest struct {
-	Items        []Item        `json:"items"`
-	Seals        []Seal        `json:"seals,omitempty"`
+	Items []Item `json:"items"`
+	Seals []Seal `json:"seals,omitempty"`
+	// Attestations: in a quarantine-upload, the adopting device's attestation of a key-lost origin's
+	// tail; in a push, the attestations that go with Endorsements (a re-offer, A2.1 item 5).
 	Attestations []Attestation `json:"attestations,omitempty"`
+	// Endorsements covers released unsealed-tail ops (A2.1). Items and endorsements are independent:
+	// a node re-offering after a cloud restore also sends endorsed ops the cloud already holds
+	// as quarantined, so that the cloud can take them as released.
+	Endorsements []Endorsement `json:"endorsements,omitempty"`
 }
 
 // PushResponse reports what the upstream now holds.
@@ -319,7 +325,11 @@ type PullResponse struct {
 	Items []Item               `json:"items"`
 	Seals []Seal               `json:"seals,omitempty"`
 	Creds []CredentialEnvelope `json:"creds,omitempty"`
-	More  bool                 `json:"more"`
+	// Endorsements, Attestations and the credentials of the adopting devices (in Creds) travel with
+	// the ops of a released unsealed tail, as seals and credentials do (A2.1 item 3).
+	Endorsements []Endorsement `json:"endorsements,omitempty"`
+	Attestations []Attestation `json:"attestations,omitempty"`
+	More         bool          `json:"more"`
 	// OwnHeld is the complete current list of the caller's own held slots (A1.2).
 	OwnHeld []HeldSlot `json:"own_held"`
 	// RelayHeld is given to nodes with role hub: held slots of the origins it relays.

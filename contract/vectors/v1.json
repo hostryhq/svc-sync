@@ -47,6 +47,77 @@
       "Message": "hostry-seal-v1\ndev-a\noutlet:o1\n7\n2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
     }
   ],
+  "endorse_message": [
+    {
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 7,
+      "H": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "Rec": "rec-1",
+      "Message": "hostry-endorse-v1\ndev-a\noutlet:o1\n7\n2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881\nrec-1"
+    }
+  ],
+  "attest_message": [
+    {
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 9,
+      "H": "a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa",
+      "By": "dev-a-r1",
+      "Rec": "rec-1",
+      "Message": "hostry-attest-v1\ndev-a\noutlet:o1\n9\na1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa\ndev-a-r1\nrec-1"
+    }
+  ],
+  "endorse_verify": [
+    {
+      "Case": "valid endorsement",
+      "Pub": "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck",
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 7,
+      "H": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "Rec": "rec-1",
+      "Kid": "gateway-op-1",
+      "Sig": "SDnPSTTpcZEnKfi60KnAKUgEhrBOvoWG4n-jQVOMGHuT6IPDFXl-JNmSbTSbi7KFho4wE3U2OfZRpbRY9XDvKw",
+      "Valid": true
+    },
+    {
+      "Case": "different rec",
+      "Pub": "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck",
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 7,
+      "H": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "Rec": "rec-2",
+      "Kid": "gateway-op-1",
+      "Sig": "SDnPSTTpcZEnKfi60KnAKUgEhrBOvoWG4n-jQVOMGHuT6IPDFXl-JNmSbTSbi7KFho4wE3U2OfZRpbRY9XDvKw",
+      "Valid": false
+    },
+    {
+      "Case": "different seq",
+      "Pub": "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck",
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 8,
+      "H": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "Rec": "rec-1",
+      "Kid": "gateway-op-1",
+      "Sig": "SDnPSTTpcZEnKfi60KnAKUgEhrBOvoWG4n-jQVOMGHuT6IPDFXl-JNmSbTSbi7KFho4wE3U2OfZRpbRY9XDvKw",
+      "Valid": false
+    },
+    {
+      "Case": "seal-tag signature over the same fields is not an endorsement",
+      "Pub": "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck",
+      "Origin": "dev-a",
+      "Stream": "outlet:o1",
+      "Seq": 7,
+      "H": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "Rec": "rec-1",
+      "Kid": "gateway-op-1",
+      "Sig": "ScPMPCEs8sh6fUtAmfwofFU7Ydwh0rHC5uN1Dxf2up-Mj84Ty6YuI49uiecVG55fSPeweb39t0fStaW73SrYjg",
+      "Valid": false
+    }
+  ],
   "hlc": [
     {
       "Ms": 1795000000000,

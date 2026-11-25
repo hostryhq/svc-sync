@@ -112,44 +112,131 @@ func (g *Gateway) Release(ctx context.Context, tenant string, ref sp.Ref, o Rele
 		case ReasonOpaque:
 			return ErrCannotRelease
 		}
-		b, derr := sp.DecodeBody(rec.Body)
-		if derr != nil {
-			return ErrCannotRelease
-		}
-		p := &engine.Parsed{Item: sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body}, Body: b}
-		var rel *releaseCtx
-		if rec.Reason != ReasonConfigPending {
-			rel = &releaseCtx{Marks: splitMarks(rec.Marks)}
-		}
-		v := g.judge(tx, p, engine.VerdictCtx{Own: false}, rel)
-		if v.Status == repository.StQuarantined {
-			return nil // still held (identity still down); nothing changes
-		}
-		rec.Status, rec.Reason, rec.Marks = v.Status, v.Reason, strings.Join(v.Marks, ",")
-		if err := tx.UpdateOp(rec); err != nil {
-			return err
-		}
-		status = v.Status
-		if (v.Status == repository.StAccepted || v.Status == repository.StFlagged) && hasMark(v.Marks, MarkUnsealed) {
-			// The tail has no origin seal: the gateway endorses the released op so that peers can take it.
-			if _, _, _, have, err := tx.GetSeal(rec.Stream, rec.Origin, rec.Seq); err != nil {
-				return err
-			} else if !have {
-				sl, err := sp.MakeSeal(g.cfg.OpKey, rec.Origin, rec.Stream, rec.Seq, rec.H)
-				if err != nil {
-					return err
-				}
-				if err := tx.PutSeal(rec.Stream, rec.Origin, rec.Seq, rec.H, sl.Kid, sl.Sig); err != nil {
-					return err
-				}
-			}
-		}
-		return g.stored(tx, e, rec, p, v)
+		status, err = g.releaseTx(tx, e, rec, nil)
+		return err
 	})
 	if err == nil && status != "" {
 		g.poker(tenant).bump()
 	}
 	return status, err
+}
+
+// releaseTx judges a held slot as released. An op accepted without an origin seal gets a gateway
+// endorsement in the same transaction (A2.1 item 2): a new one signed now, or, when a node
+// re-offered the op after a restore, the endorsement it presented (A2.1 item 5).
+func (g *Gateway) releaseTx(tx repository.Tx, e *engine.Engine, rec repository.OpRec, presented *sp.Endorsement) (string, error) {
+	b, derr := sp.DecodeBody(rec.Body)
+	if derr != nil {
+		return "", ErrCannotRelease
+	}
+	p := &engine.Parsed{Item: sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body}, Body: b}
+	var rel *releaseCtx
+	if rec.Reason != ReasonConfigPending {
+		rel = &releaseCtx{Marks: splitMarks(rec.Marks)}
+	}
+	v := g.judge(tx, p, engine.VerdictCtx{Own: false}, rel)
+	if v.Status == repository.StQuarantined {
+		return "", nil // still held (identity still down); nothing changes
+	}
+	rec.Status, rec.Reason, rec.Marks = v.Status, v.Reason, strings.Join(v.Marks, ",")
+	if err := tx.UpdateOp(rec); err != nil {
+		return "", err
+	}
+	if (v.Status == repository.StAccepted || v.Status == repository.StFlagged) && hasMark(v.Marks, MarkUnsealed) {
+		if _, _, _, sealed, err := tx.GetSeal(rec.Stream, rec.Origin, rec.Seq); err != nil {
+			return "", err
+		} else if !sealed {
+			// The tail has no origin seal: the gateway endorses the released op so that peers can take it.
+			if err := g.endorse(tx, rec, presented); err != nil {
+				return "", err
+			}
+		}
+	}
+	return v.Status, g.stored(tx, e, rec, p, v)
+}
+
+// endorse stores the endorsement of a released unsealed op: the presented one, or a new one under
+// the current op-signing key with the recovery id of identity's record (A2.1 item 1).
+func (g *Gateway) endorse(tx repository.Tx, rec repository.OpRec, presented *sp.Endorsement) error {
+	if presented != nil {
+		return tx.PutEndorsement(repository.EndorsementRec{Stream: presented.Stream, Origin: presented.Origin, Seq: presented.Seq, H: presented.H, Rec: presented.Rec, Kid: presented.Kid, Sig: presented.Sig})
+	}
+	r, ok := g.cfg.Dir.RecoveryFor(tx.Tenant(), rec.Origin)
+	if !ok {
+		return ErrCannotRelease // no recovery record: nothing to endorse under
+	}
+	en, err := sp.MakeEndorsement(g.opKey(), rec.Origin, rec.Stream, rec.Seq, rec.H, r.ID)
+	if err != nil {
+		return err
+	}
+	return tx.PutEndorsement(repository.EndorsementRec{Stream: en.Stream, Origin: en.Origin, Seq: en.Seq, H: en.H, Rec: en.Rec, Kid: en.Kid, Sig: en.Sig})
+}
+
+// onEndorsed takes a quarantined unsealed-tail op as released when a node re-offers it with a
+// verified endorsement, recovery credential and attestation (A2.1 item 5): peers have already
+// applied it, so the cloud must not stay behind its own devices.
+func (g *Gateway) onEndorsed(tx repository.Tx, rec repository.OpRec, p *engine.Parsed, en sp.Endorsement, att sp.Attestation) error {
+	if rec.Reason != ReasonUnsealedTail {
+		return nil // only the unsealed tail is released this way; everything else keeps its hold
+	}
+	if err := tx.PutAttestation(repository.AttestationRec{Stream: att.Stream, Origin: att.Origin, Rec: att.Rec, Seq: att.Seq, H: att.H, By: att.By, Kid: att.Kid, Sig: att.Sig}); err != nil {
+		return err
+	}
+	_, err := g.releaseTx(tx, g.engineFor(tx.Tenant()), rec, &en)
+	return err
+}
+
+// RotateOpKey is the emergency rotation of the op-signing key (ADR-0005 section 2, A2.1 item 6).
+// The old key is refused from now on; the cloud-origin seals and the endorsements of the given
+// tenants are re-signed under the new key, so that a node holding only the new pack converges.
+func (g *Gateway) RotateOpKey(ctx context.Context, next *sp.KeyPair, tenants ...string) error {
+	g.mu.Lock()
+	g.revokedKids[g.cfg.OpKey.Kid] = true
+	g.cfg.OpKey = next
+	g.eng = map[string]*engine.Engine{}
+	g.mu.Unlock()
+	for _, tenant := range tenants {
+		err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
+			seals, err := tx.SealsOfOrigins(engine.CloudOriginPrefix)
+			if err != nil {
+				return err
+			}
+			for _, sl := range seals {
+				if sl.Kid == next.Kid {
+					continue
+				}
+				n, err := sp.MakeSeal(next, sl.Origin, sl.Stream, sl.Seq, sl.H)
+				if err != nil {
+					return err
+				}
+				if err := tx.ReplaceSeal(sl.Stream, sl.Origin, sl.Seq, sl.H, n.Kid, n.Sig); err != nil {
+					return err
+				}
+			}
+			ends, err := tx.Endorsements()
+			if err != nil {
+				return err
+			}
+			for _, en := range ends {
+				if en.Kid == next.Kid {
+					continue
+				}
+				n, err := sp.MakeEndorsement(next, en.Origin, en.Stream, en.Seq, en.H, en.Rec)
+				if err != nil {
+					return err
+				}
+				if err := tx.ReplaceEndorsement(repository.EndorsementRec{Stream: n.Stream, Origin: n.Origin, Seq: n.Seq, H: n.H, Rec: n.Rec, Kid: n.Kid, Sig: n.Sig}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		g.poker(tenant).bump()
+	}
+	return nil
 }
 
 // Discard removes a held slot's effect: allowed only for an op with no legal document number. It
@@ -288,9 +375,6 @@ func (g *Gateway) QuarantineUpload(ctx context.Context, tenant string, c engine.
 	if !c.Drain {
 		return sp.PushResponse{}, ErrForbidden
 	}
-	if err := g.refreshEpoch(ctx); err != nil {
-		return sp.PushResponse{}, err
-	}
 	e := g.engineFor(tenant)
 	var valid []sp.Attestation
 	var refused []sp.Refusal
@@ -328,6 +412,9 @@ func (g *Gateway) QuarantineUpload(ctx context.Context, tenant string, c engine.
 				if _, ok := fixed[k]; !ok {
 					fixed[k] = attested{a.Seq, a.H}
 					changed = true
+				}
+				if err := tx.PutAttestation(repository.AttestationRec{Stream: a.Stream, Origin: a.Origin, Rec: a.Rec, Seq: a.Seq, H: a.H, By: a.By, Kid: a.Kid, Sig: a.Sig}); err != nil {
+					return err
 				}
 				valid = append(valid, a)
 			}

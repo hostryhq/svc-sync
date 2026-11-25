@@ -212,7 +212,7 @@ components:
         - {e: sync_void, id: "outlet:o1|dev-a|7", k: insert, f: {origin: dev-a, stream: "outlet:o1", seq: 7, reason: refused}}
     Seal:
       type: object
-      description: Origin signature over the hash of its op at `seq`; covers the whole chain up to it. May also be a gateway endorsement (kid of the op-signing key) for the released unsealed tail of a key-lost origin.
+      description: Signature over the hash of an op at `seq`; covers the whole chain up to it. Made by the origin (a device key) or, for a `cloud-<epoch>` origin only, by the gateway op-signing key. An op-signing key never seals a device origin; the released tail of a key-lost origin is covered by an Endorsement.
       required: [origin, stream, seq, h, kid, sig]
       properties:
         origin: {type: string, description: Origin.}
@@ -221,6 +221,18 @@ components:
         h: {type: string, description: Hash of the op at seq.}
         kid: {type: string, description: Key id.}
         sig: {type: string, description: "ES256 raw r||s, base64url, over sha256(\"hostry-seal-v1\\n\" + origin + \"\\n\" + stream + \"\\n\" + seq + \"\\n\" + h)."}
+    Endorsement:
+      type: object
+      description: The gateway's statement that a holder of device.recover released an op of a key-lost origin (ADR-0002 A2.1). Valid only together with the identity-signed credential of the adopting device (carrying `recovers` = origin) and that device's Attestation with the same `rec`; the op's seq must be at or below the attested seq, and the op held at the attested seq must have the attested h.
+      required: [origin, stream, seq, h, rec, kid, sig]
+      properties:
+        origin: {type: string, description: Key-lost origin.}
+        stream: {type: string, description: Stream.}
+        seq: {type: integer, format: int64, description: Sequence of the released op.}
+        h: {type: string, description: Hash of the op at seq.}
+        rec: {type: string, description: Recovery id.}
+        kid: {type: string, description: Key id of the gateway op-signing key (a current key of the pack).}
+        sig: {type: string, description: "ES256 raw r||s, base64url, over sha256(\"hostry-endorse-v1\\n\" + origin + \"\\n\" + stream + \"\\n\" + seq + \"\\n\" + h + \"\\n\" + rec)."}
     Attestation:
       type: object
       description: Fixes the tail of a key-lost origin (A1.3), signed with the adopting device's new key.
@@ -303,7 +315,8 @@ components:
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Item'}, description: Ops, no placeholders.}
         seals: {type: array, items: {$ref: '#/components/schemas/Seal'}}
-        attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}}
+        attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}, description: "Quarantine upload: the tail attestation. Push: the attestations that go with `endorsements`."}
+        endorsements: {type: array, items: {$ref: '#/components/schemas/Endorsement'}, description: "Re-offer of released unsealed-tail ops (A2.1 item 5), independent of `items`: the cloud takes a quarantined slot as released when the endorsement, the recovery credential and the attestation verify."}
     PushResponse:
       type: object
       required: [vector]
@@ -328,7 +341,9 @@ components:
         epoch: {type: string, description: Cloud epoch.}
         items: {type: array, items: {$ref: '#/components/schemas/Item'}}
         seals: {type: array, items: {$ref: '#/components/schemas/Seal'}}
-        creds: {type: array, items: {$ref: '#/components/schemas/CredentialEnvelope'}, description: Credentials of the origins in items.}
+        creds: {type: array, items: {$ref: '#/components/schemas/CredentialEnvelope'}, description: Credentials of the origins in items, and of the adopting devices (`recovers`) when endorsements are present.}
+        endorsements: {type: array, items: {$ref: '#/components/schemas/Endorsement'}, description: Every endorsement of the ops in this batch, and of released ops answered for `placeholders`. A hub re-serves what it stored.}
+        attestations: {type: array, items: {$ref: '#/components/schemas/Attestation'}, description: The attestations that go with the endorsements.}
         more: {type: boolean, description: More slots are available.}
         own_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: Complete current list of the caller's own held slots; replace the local list.}
         relay_held: {type: array, items: {$ref: '#/components/schemas/HeldSlot'}, description: For role hub only.}

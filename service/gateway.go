@@ -18,24 +18,18 @@ import (
 	"github.com/hostryhq/go-common/events"
 	"github.com/hostryhq/go-common/ids"
 	"github.com/hostryhq/go-common/outbox"
+	"github.com/hostryhq/go-common/restore"
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
-// Genesis is the cloud epoch before the first restore (ADR-0002 S16).
-const Genesis = "genesis"
-
-// Platform meta keys written by hostry-restore (ADR-0006 H6).
-const (
-	MetaEpochID     = "epoch_id"
-	MetaRecoveredTo = "recovered_to"
-)
-
 // Config builds a Gateway.
 type Config struct {
 	Store repository.Store
+	// Epoch gives the restore epoch (go-common restore.Reader): read once at start (A2.4).
+	Epoch restore.EpochSource
 	Dir   directory.Directory
 	// OpKey is the gateway op-signing key (public half in every pack).
 	OpKey *sp.KeyPair
@@ -54,8 +48,11 @@ type Gateway struct {
 	cfg   Config
 	mu    sync.Mutex
 	epoch string
-	eng   map[string]*engine.Engine
-	pokes map[string]*poker
+	guard *restore.Guard
+	// revoked op-signing keys: never accepted again (A2.1 item 6).
+	revokedKids map[string]bool
+	eng         map[string]*engine.Engine
+	pokes       map[string]*poker
 }
 
 type poker struct {
@@ -78,61 +75,45 @@ func New(ctx context.Context, cfg Config) (*Gateway, error) {
 	if cfg.MinSupportedVersion == "" {
 		cfg.MinSupportedVersion = "0.0.0"
 	}
-	g := &Gateway{cfg: cfg, eng: map[string]*engine.Engine{}, pokes: map[string]*poker{}}
-	if err := g.refreshEpoch(ctx); err != nil {
+	g := &Gateway{cfg: cfg, eng: map[string]*engine.Engine{}, pokes: map[string]*poker{}, revokedKids: map[string]bool{}}
+	g.guard = restore.NewGuard(cfg.Epoch, restore.NewSQLState(cfg.Store.DB(), cfg.Store.Dialect() == "postgres"), cfg.Log)
+	// S16 item 2: after a restore the gateway opens a new cloud origin cloud-<epoch>. Its seq starts at 1,
+	// so no op identity is reused; the origin is opened by the first op it records, which makes the
+	// hook idempotent. The hook only reports it.
+	g.guard.OnRestore("sync-new-cloud-origin", func(_ context.Context, from string, to restore.Epoch) error {
+		cfg.Log.Info("restore epoch changed: opening new cloud origin", "from", from, "to", to.EpochID)
+		return nil
+	})
+	if err := g.guard.Run(ctx); err != nil {
 		return nil, err
 	}
+	g.epoch = g.guard.Epoch().EpochID
 	return g, nil
 }
 
-// Epoch returns the epoch the gateway currently serves under.
+// Guard exposes the restore guard: add Guard().Check to /readyz and start the outbox relay after
+// Guard().Done().
+func (g *Gateway) Guard() *restore.Guard { return g.guard }
+
+// Epoch returns the epoch the gateway serves under.
 func (g *Gateway) Epoch() string { g.mu.Lock(); defer g.mu.Unlock(); return g.epoch }
 
-// refreshEpoch compares the stamped restore epoch with the one this database last served under.
-// The second value is rolled back with the database, so after a restore they differ: the gateway
-// then opens a new cloud origin cloud-<epoch> (its seq starts at 1, so no op identity is reused)
-// and records the new epoch.
-func (g *Gateway) refreshEpoch(ctx context.Context) error {
-	stamped, ok, err := repository.PlatformMeta(ctx, g.cfg.Store, MetaEpochID)
-	if err != nil {
-		return err
-	}
-	if !ok || stamped == "" {
-		stamped = Genesis
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.epoch == stamped {
-		return nil
-	}
-	stored, _, err := repository.GatewayState(ctx, g.cfg.Store, "epoch")
-	if err != nil {
-		return err
-	}
-	if stored != stamped {
-		if err := repository.SetGatewayState(ctx, g.cfg.Store, "epoch", stamped); err != nil {
-			return err
-		}
-		if stored != "" {
-			g.cfg.Log.Info("restore epoch changed: opened new cloud origin", "from", stored, "to", stamped)
-		}
-	}
-	g.epoch = stamped
-	g.eng = map[string]*engine.Engine{} // engines are rebuilt with origin cloud-<epoch>
-	return nil
-}
+// opKey is the current op-signing key.
+func (g *Gateway) opKey() *sp.KeyPair { g.mu.Lock(); defer g.mu.Unlock(); return g.cfg.OpKey }
 
-// tenantTrust resolves origin keys for one tenant: device keys from the directory, and the
-// gateway op-signing key for cloud origins (retired epochs included, S16 item 4).
+// tenantTrust resolves keys for one tenant: device keys from the directory, the current gateway
+// op-signing key for cloud origins and endorsements, and the recovery credentials of key-lost
+// origins (A2.1).
 type tenantTrust struct {
 	tenant string
 	dir    directory.Directory
-	op     *ecdsa.PublicKey
+	g      *Gateway
 }
 
 func (t tenantTrust) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	if strings.HasPrefix(origin, engine.CloudOriginPrefix) {
-		return t.op, t.op != nil
+		k := t.g.opKey()
+		return &k.Priv.PublicKey, true
 	}
 	c, ok := t.dir.Credential(t.tenant, origin)
 	if !ok {
@@ -142,7 +123,33 @@ func (t tenantTrust) OriginKey(origin string) (*ecdsa.PublicKey, bool) {
 	return pub, err == nil
 }
 
-func (t tenantTrust) CloudKey() (*ecdsa.PublicKey, bool) { return t.op, t.op != nil }
+// OpKey implements engine.RecoveryTrust: only the current key; a rotated-out key is refused.
+func (t tenantTrust) OpKey(kid string) (*ecdsa.PublicKey, bool) {
+	k := t.g.opKey()
+	if k.Kid != kid || t.g.isRevoked(kid) {
+		return nil, false
+	}
+	return &k.Priv.PublicKey, true
+}
+
+// Recoverers implements engine.RecoveryTrust.
+func (t tenantTrust) Recoverers(origin string) []sp.CredentialEnvelope {
+	rec, ok := t.dir.RecoveryFor(t.tenant, origin)
+	if !ok {
+		return nil
+	}
+	c, ok := t.dir.Credential(t.tenant, rec.New)
+	if !ok || c.Cred.Recovers != origin {
+		return nil
+	}
+	return []sp.CredentialEnvelope{c}
+}
+
+func (g *Gateway) isRevoked(kid string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.revokedKids[kid]
+}
 
 // engineFor returns the tenant's engine.
 func (g *Gateway) engineFor(tenant string) *engine.Engine {
@@ -153,16 +160,22 @@ func (g *Gateway) engineFor(tenant string) *engine.Engine {
 	}
 	e := engine.New(engine.Config{
 		Role: engine.RoleCloud, Tenant: tenant, Origin: engine.CloudOriginPrefix + g.epoch, Key: g.cfg.OpKey,
-		Store: g.cfg.Store, Trust: tenantTrust{tenant: tenant, dir: g.cfg.Dir, op: &g.cfg.OpKey.Priv.PublicKey},
+		Store: g.cfg.Store, Trust: tenantTrust{tenant: tenant, dir: g.cfg.Dir, g: g},
 		Clock: sp.NewClock(g.cfg.Now), NoState: true,
 		Hooks: engine.Hooks{
 			Authorize: g.authorize(tenant),
 			Verdict: func(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx) engine.Verdict {
+				if vc.Endorsed {
+					// A re-offered released op (A2.1 item 5): taken as released, marked unsealed, without
+					// asking the owner again. The remaining checks still run.
+					return g.judge(tx, p, vc, &releaseCtx{Marks: []string{MarkUnsealed}})
+				}
 				return g.judge(tx, p, vc, nil)
 			},
 			QuarantineOwnUnverified: true,
 			Stored:                  g.stored,
 			OnFork:                  g.onFork,
+			OnEndorsed:              g.onEndorsed,
 		},
 	})
 	g.eng[tenant] = e
@@ -238,8 +251,8 @@ func allowedStreams(c engine.Caller, tenant string, all []string) []string {
 
 // authorize decides whether the caller may deliver ops of origin in stream (S11 first table row,
 // ADR-0005 section 4, A1.3 items 4 and 5).
-func (g *Gateway) authorize(tenant string) func(repository.Tx, engine.Caller, string, string, bool) string {
-	return func(_ repository.Tx, c engine.Caller, origin, stream string, recovery bool) string {
+func (g *Gateway) authorize(tenant string) func(repository.Tx, engine.Caller, string, string, bool, bool) string {
+	return func(_ repository.Tx, c engine.Caller, origin, stream string, recovery, endorsed bool) string {
 		if !streamAllowed(c, tenant, stream) {
 			return sp.ReasonStream
 		}
@@ -266,7 +279,7 @@ func (g *Gateway) authorize(tenant string) func(repository.Tx, engine.Caller, st
 		if !ok || cred.Cred.OutletID != c.Outlet {
 			return sp.ReasonOrigin
 		}
-		if revoked, reason := g.cfg.Dir.Revoked(tenant, origin); revoked && reason == "key_lost" && c.Kind != sp.KindHub && c.ID != origin {
+		if revoked, reason := g.cfg.Dir.Revoked(tenant, origin); revoked && reason == "key_lost" && c.Kind != sp.KindHub && c.ID != origin && !endorsed {
 			return sp.ReasonRecovery // KL2: the tail of a key-lost origin comes only through the recovery upload
 		}
 		return ""
@@ -275,9 +288,6 @@ func (g *Gateway) authorize(tenant string) func(repository.Tx, engine.Caller, st
 
 // Hello answers the handshake (S10): epoch, the cloud's vector for the caller's streams, time.
 func (g *Gateway) Hello(ctx context.Context, tenant string, c engine.Caller, req sp.HelloRequest) (sp.HelloResponse, error) {
-	if err := g.refreshEpoch(ctx); err != nil {
-		return sp.HelloResponse{}, err
-	}
 	e := g.engineFor(tenant)
 	vec, err := e.Vector(ctx)
 	if err != nil {
@@ -312,6 +322,19 @@ func (g *Gateway) noteGaps(ctx context.Context, tenant string, node, cloud sp.Ve
 		for k, s := range node {
 			key := "gap:" + k
 			if s <= cloud[k] {
+				// The gap closed (a re-offer arrived, A2.2): the alert clears.
+				if _, ok, err := tx.GetMeta(key); err != nil {
+					return err
+				} else if ok {
+					for _, m := range []string{key, "gap-alerted:" + k} {
+						if err := tx.DeleteMeta(m); err != nil {
+							return err
+						}
+					}
+					if err := tx.ResolveAlerts("unrecoverable_origin_gap", k); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			first, ok, err := tx.GetMeta(key)
@@ -342,10 +365,7 @@ func (g *Gateway) noteGaps(ctx context.Context, tenant string, node, cloud sp.Ve
 
 // Push stores a batch from an authenticated node and returns what the cloud now holds.
 func (g *Gateway) Push(ctx context.Context, tenant string, c engine.Caller, req sp.PushRequest) (sp.PushResponse, error) {
-	if err := g.refreshEpoch(ctx); err != nil {
-		return sp.PushResponse{}, err
-	}
-	res, err := g.engineFor(tenant).Ingest(ctx, engine.IngestReq{Items: req.Items, Seals: req.Seals, Caller: c})
+	res, err := g.engineFor(tenant).Ingest(ctx, engine.IngestReq{Items: req.Items, Seals: req.Seals, Endorsements: req.Endorsements, Attestations: req.Attestations, Caller: c})
 	if err != nil {
 		return sp.PushResponse{}, err
 	}
@@ -371,7 +391,10 @@ func (g *Gateway) Pull(ctx context.Context, tenant string, c engine.Caller, req 
 			all = append(all, s)
 		}
 	}
-	resp, err := e.Serve(ctx, req, engine.ServeOpts{Caller: c, Streams: allowedStreams(c, tenant, all), IsHub: c.Kind == sp.KindHub},
+	resp, err := e.Serve(ctx, req, engine.ServeOpts{Caller: c, Streams: allowedStreams(c, tenant, all), IsHub: c.Kind == sp.KindHub,
+		Recoverers: func(origin string) []sp.CredentialEnvelope {
+			return tenantTrust{tenant: tenant, dir: g.cfg.Dir, g: g}.Recoverers(origin)
+		}},
 		func(origin string) (sp.CredentialEnvelope, bool) { return g.cfg.Dir.Credential(tenant, origin) })
 	resp.Epoch = g.Epoch()
 	return resp, err
@@ -424,9 +447,6 @@ func (g *Gateway) Snapshot(ctx context.Context, tenant string, c engine.Caller) 
 // Emit records a cloud-origin op (a cloud-side edit, S11): origin cloud-<epoch>, sealed by the
 // gateway. The op flows down to devices like any other.
 func (g *Gateway) Emit(ctx context.Context, tenant, stream, intent string, muts []sp.Mut) (sp.Item, error) {
-	if err := g.refreshEpoch(ctx); err != nil {
-		return sp.Item{}, err
-	}
 	e := g.engineFor(tenant)
 	var it sp.Item
 	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {

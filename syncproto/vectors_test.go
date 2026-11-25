@@ -23,12 +23,37 @@ type vectorFile struct {
 		Seq            int64
 		H, Message     string
 	} `json:"seal_message"`
+	EndorseMessage []struct {
+		Origin, Stream  string
+		Seq             int64
+		H, Rec, Message string
+	} `json:"endorse_message"`
+	AttestMessage []struct {
+		Origin, Stream      string
+		Seq                 int64
+		H, By, Rec, Message string
+	} `json:"attest_message"`
+	// EndorseVerify: Valid is what a conforming verifier answers for the endorsement under Pub.
+	EndorseVerify []struct {
+		Case, Pub, Origin, Stream string
+		Seq                       int64
+		H, Rec, Kid, Sig          string
+		Valid                     bool
+	} `json:"endorse_verify"`
 	HLC []struct {
 		Ms      int64
 		Counter uint16
 		Hex     string
 	} `json:"hlc"`
 }
+
+// Fixed signed examples (ES256 is randomised, so they are constants): an op-signing key, its
+// signature over EndorseMessage and over the seal message of the same fields.
+const (
+	vecOpPub      = "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck"
+	vecEndorseSig = "SDnPSTTpcZEnKfi60KnAKUgEhrBOvoWG4n-jQVOMGHuT6IPDFXl-JNmSbTSbi7KFho4wE3U2OfZRpbRY9XDvKw"
+	vecSealSig    = "ScPMPCEs8sh6fUtAmfwofFU7Ydwh0rHC5uN1Dxf2up-Mj84Ty6YuI49uiecVG55fSPeweb39t0fStaW73SrYjg"
+)
 
 const vectorPath = "../contract/vectors/v1.json"
 
@@ -56,6 +81,35 @@ func buildVectors() vectorFile {
 		Seq            int64
 		H, Message     string
 	}{"dev-a", "outlet:o1", 7, Hash("x"), SealMessage("dev-a", "outlet:o1", 7, Hash("x"))})
+	v.EndorseMessage = append(v.EndorseMessage, struct {
+		Origin, Stream  string
+		Seq             int64
+		H, Rec, Message string
+	}{"dev-a", "outlet:o1", 7, Hash("x"), "rec-1", EndorseMessage("dev-a", "outlet:o1", 7, Hash("x"), "rec-1")})
+	at := Attestation{Origin: "dev-a", Stream: "outlet:o1", Seq: 9, H: Hash("y"), By: "dev-a-r1", Rec: "rec-1"}
+	v.AttestMessage = append(v.AttestMessage, struct {
+		Origin, Stream      string
+		Seq                 int64
+		H, By, Rec, Message string
+	}{at.Origin, at.Stream, at.Seq, at.H, at.By, at.Rec, AttestationMessage(at)})
+	pub, _ := DecodePub(vecOpPub)
+	for _, c := range []struct {
+		name, rec, sig string
+		seq            int64
+	}{
+		{"valid endorsement", "rec-1", vecEndorseSig, 7},
+		{"different rec", "rec-2", vecEndorseSig, 7},
+		{"different seq", "rec-1", vecEndorseSig, 8},
+		{"seal-tag signature over the same fields is not an endorsement", "rec-1", vecSealSig, 7},
+	} {
+		e := Endorsement{Origin: "dev-a", Stream: "outlet:o1", Seq: c.seq, H: Hash("x"), Rec: c.rec, Kid: "gateway-op-1", Sig: c.sig}
+		v.EndorseVerify = append(v.EndorseVerify, struct {
+			Case, Pub, Origin, Stream string
+			Seq                       int64
+			H, Rec, Kid, Sig          string
+			Valid                     bool
+		}{c.name, vecOpPub, e.Origin, e.Stream, e.Seq, e.H, e.Rec, e.Kid, e.Sig, e.Verify(pub)})
+	}
 	for _, c := range []struct {
 		ms int64
 		c  uint16
@@ -103,6 +157,15 @@ func TestCanonicalRejectsFractionsAndExponents(t *testing.T) {
 	for _, in := range []string{`{"a":1.5}`, `{"a":1e3}`, `{"a":9007199254740993}`} {
 		if _, err := Canonicalize([]byte(in)); err == nil {
 			t.Fatalf("%s must be refused (integer-only subset)", in)
+		}
+	}
+}
+
+func TestEndorsementVectorsHaveTheExpectedVerdicts(t *testing.T) {
+	want := []bool{true, false, false, false}
+	for i, c := range buildVectors().EndorseVerify {
+		if c.Valid != want[i] {
+			t.Fatalf("%s: valid=%v want %v", c.Case, c.Valid, want[i])
 		}
 	}
 }

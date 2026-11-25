@@ -115,7 +115,7 @@ func (d *Device) open() error {
 	d.Store = st
 	if d.Cache == nil {
 		d.Cache = engine.NewCredCache(w.Identity.IdentityPub(), w.Tenant, w.Outlet, w.Clock.Now)
-		d.Cache.AddCloudKey("gateway-op-1", &w.Identity.CloudKey.Priv.PublicKey)
+		d.Cache.AddCloudKey(w.Identity.CloudKey.Kid, &w.Identity.CloudKey.Priv.PublicKey)
 		_ = d.Cache.Add(d.Cred)
 	}
 	d.Eng = engine.New(engine.Config{

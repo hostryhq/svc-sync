@@ -22,6 +22,7 @@ import (
 	"github.com/hostryhq/go-auth/authtest"
 	"github.com/hostryhq/go-common/clock"
 	"github.com/hostryhq/svc-sync/api"
+	"github.com/hostryhq/svc-sync/devepoch"
 	"github.com/hostryhq/svc-sync/identitystub"
 	"github.com/hostryhq/svc-sync/repository"
 	"github.com/hostryhq/svc-sync/service"
@@ -59,7 +60,13 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	issuer := authtest.NewTenantIssuer(clock.Func(time.Now))
-	gw, err := service.New(ctx, service.Config{Store: st, Dir: id, OpKey: id.CloudKey, Now: time.Now, Log: log, Outbox: st.Dialect() == "postgres"})
+	// Development only: a platform_meta of its own in the service database. Production reads the real
+	// one with restore.NewReader(SYNC_PLATFORM_DSN) once identity and tenancy clients exist.
+	ep, err := devepoch.Reader(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	gw, err := service.New(ctx, service.Config{Store: st, Epoch: ep, Dir: id, OpKey: id.CloudKey, Now: time.Now, Log: log, Outbox: st.Dialect() == "postgres"})
 	if err != nil {
 		return err
 	}
@@ -68,7 +75,7 @@ func run(log *slog.Logger) error {
 	api.Admin(mux, gw, issuer.Verifier())
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if err := st.DB().PingContext(r.Context()); err != nil {
+		if err := st.DB().PingContext(r.Context()); err != nil || gw.Guard().Check(r.Context()) != nil {
 			http.Error(w, `{"status":"fail"}`, http.StatusServiceUnavailable)
 			return
 		}
