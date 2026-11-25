@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hostryhq/svc-sync/engine"
+	"github.com/hostryhq/svc-sync/identitystub"
 	"github.com/hostryhq/svc-sync/repository"
 	"github.com/hostryhq/svc-sync/service"
 	sp "github.com/hostryhq/svc-sync/syncproto"
@@ -516,5 +517,22 @@ func TestRestore_NewEpochNoIdentityReuseAndLostWindowOpsComeBack(t *testing.T) {
 	w.Quiesce(bg, 40)
 	for _, p := range w.CheckAll(bg, nil) {
 		t.Error(p)
+	}
+}
+
+// A1.3 (security ruling 2 (a)): only an active device can be recovered. A device revoked for any
+// reason cannot get a recovery code, and a code issued before a revocation is dead.
+func TestKL_RevokedDeviceCannotBeRecovered(t *testing.T) {
+	w, _ := newTestWorld(t, 44, WorldOptions{Pos: 2})
+	a, b := w.Devices[0], w.Devices[1]
+	w.Identity.Revoke(a.ID, "stolen")
+	if _, err := w.Identity.CreateRecovery(w.Tenant, a.ID, true); !errors.Is(err, identitystub.ErrRecoveryRevoked) {
+		t.Fatalf("a revoked device must not get a recovery code, got %v", err)
+	}
+	code := must(w.Identity.CreateRecovery(w.Tenant, b.ID, true))
+	w.Identity.Revoke(b.ID, "stolen") // revoked after the code was issued
+	kp := must(sp.NewKeyPair("k-new", nil))
+	if _, _, err := w.Identity.ActivateRecovery(code, "dev-new", kp); !errors.Is(err, identitystub.ErrRecoveryRevoked) {
+		t.Fatalf("a code for a since-revoked device must be refused, got %v", err)
 	}
 }

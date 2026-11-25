@@ -394,6 +394,11 @@ func (i *Identity) CreateRecovery(tenant, old string, byOwner bool) (string, err
 	if d == nil || d.Env.Cred.TenantID != tenant {
 		return "", errors.New("identitystub: unknown device")
 	}
+	if d.Revoked {
+		// Only an active device can be recovered: a thief holding a revoked PC's disk must not be able to
+		// get it re-admitted by phishing the owner (security review ruling 2 (a), ADR-0002 A1.3).
+		return "", ErrRecoveryRevoked
+	}
 	for _, r := range i.recs {
 		if r.Old == old && r.Used {
 			return "", errors.New("identitystub: device already recovered")
@@ -409,6 +414,9 @@ func (i *Identity) CreateRecovery(tenant, old string, byOwner bool) (string, err
 // ErrRecoveryCode is returned for a used, expired or unknown recovery code.
 var ErrRecoveryCode = errors.New("identitystub: recovery code not valid")
 
+// ErrRecoveryRevoked is returned when the device to recover is already revoked, for any reason.
+var ErrRecoveryRevoked = errors.New("identitystub: a revoked device cannot be recovered")
+
 // ActivateRecovery turns an installation into a new device (A1.3 item 3), in one step: the old
 // device is revoked with reason key_lost, the new one registered with new series codes for the
 // same document types, and a single-use record written.
@@ -420,6 +428,11 @@ func (i *Identity) ActivateRecovery(code, newID string, kp *sp.KeyPair) (sp.Cred
 		return sp.CredentialEnvelope{}, RecoveryRec{}, ErrRecoveryCode
 	}
 	old := i.devices[r.Old]
+	if old.Revoked {
+		// Revoked after the code was issued (a stolen or retired device): the code is dead.
+		i.mu.Unlock()
+		return sp.CredentialEnvelope{}, RecoveryRec{}, ErrRecoveryRevoked
+	}
 	oc := old.Env.Cred
 	r.Used, r.New = true, newID
 	old.Revoked, old.Reason = true, "key_lost"
