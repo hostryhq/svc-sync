@@ -85,6 +85,9 @@ func run(log *slog.Logger) error {
 		if os.Getenv("SYNC_DEV_STUB") != "1" {
 			return errors.New("set SYNC_DIRECTORY=identity, or SYNC_DEV_STUB=1 for the stub directory (local development)")
 		}
+		if err := checkStub(os.Getenv("HOSTRY_ENV")); err != nil {
+			return err
+		}
 		w, err = stubWiring(ctx, dsn)
 	default:
 		return fmt.Errorf("SYNC_DIRECTORY must be identity or stub, not %q", d)
@@ -109,7 +112,7 @@ func run(log *slog.Logger) error {
 	}
 	defer st.Close()
 	if err := st.CheckAppRole(ctx); err != nil {
-		if devOnly(os.Getenv("HOSTRY_ENV")) || os.Getenv("SYNC_DEV_STUB") == "1" {
+		if privilegedRoleAllowed(os.Getenv("HOSTRY_ENV")) {
 			log.Warn("development only: " + err.Error())
 		} else {
 			return err // outside development a privileged role is refused
@@ -157,6 +160,19 @@ func run(log *slog.Logger) error {
 }
 
 func devOnly(env string) bool { return env == "dev" || env == "test" || env == "ci" }
+
+// checkStub refuses SYNC_DEV_STUB (the stub directory with its in-process test issuer) outside dev, test and ci: whoever can set
+// the variable must not be able to mint tokens the gateway trusts in a real environment (P2-M6).
+func checkStub(env string) error {
+	if !devOnly(env) {
+		return fmt.Errorf("SYNC_DEV_STUB needs HOSTRY_ENV in dev, test or ci (got %q)", env)
+	}
+	return nil
+}
+
+// privilegedRoleAllowed says whether the gateway may start on a superuser or BYPASSRLS database role, which would void the
+// row-level isolation of tenants: in dev, test and ci only, whatever SYNC_DEV_STUB says (P2-M6).
+func privilegedRoleAllowed(env string) bool { return devOnly(env) }
 
 func stubWiring(ctx context.Context, dsn string) (wiring, error) {
 	id, err := identitystub.New(time.Now, nil)

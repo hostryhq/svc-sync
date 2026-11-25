@@ -15,7 +15,7 @@ go vet ./... && go test -race ./...
 go run ./cmd/simulate -runs 100 -steps 500            # simulator; -soak 30m for a wall-clock soak
 go run ./cmd/devstack -out /tmp/sync-fixture.json     # gateway + hub on real ports for client-core e2e
 SYNC_HUB_PACK=<pack> SYNC_HUB_DB=hub.db go run ./cmd/hub
-SYNC_DB_DSN=<dsn> SYNC_DEV_STUB=1 go run ./cmd/gateway   # stub directory, local development only
+SYNC_DB_DSN=<dsn> HOSTRY_ENV=dev SYNC_DEV_STUB=1 go run ./cmd/gateway   # stub directory, local development only
 SYNC_DB_DSN=<dsn> SYNC_DIRECTORY=identity ... go run ./cmd/gateway   # the real directory (below)
 ```
 
@@ -26,7 +26,7 @@ own), `SYNC_IDENTITY_PG_DSN` (real identity over Postgres) and `SYNC_LIVE_IDENTI
 
 ## Configuration (environment only)
 
-Gateway: `SYNC_DB_DSN`, `SYNC_ADDR`, `SYNC_DIRECTORY` (`identity`, or `stub` with `SYNC_DEV_STUB=1`), `SYNC_DEV_REGISTER=1` with `HOSTRY_ENV` in dev, test or ci
+Gateway: `SYNC_DB_DSN`, `SYNC_ADDR`, `SYNC_DIRECTORY` (`identity`, or `stub` with `SYNC_DEV_STUB=1`; refused unless `HOSTRY_ENV` is dev, test or ci), `SYNC_DEV_REGISTER=1` with `HOSTRY_ENV` in dev, test or ci
 (stub only: `/dev/v1` device registration, token minting and the hub pack), `SYNC_NATS_URL` + `SYNC_NATS_SEED_FILE` (outbox relay, and the
 consumer of `tenancy.manual_book.registered`).
 Identity directory (ADR-0005 A3.2; `cmd/gateway/main.go` lists every variable): `SYNC_IDENTITY_URL`, `SYNC_TENANCY_URL`,
