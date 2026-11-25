@@ -77,7 +77,7 @@ func TestRoutesFollowTheContract(t *testing.T) {
 		for _, p := range api.SyncPermissions() {
 			known = known || p.Name == op.Permission
 		}
-		if !known && op.Permission != "sync.push" && op.Permission != "sync.drain" && op.Permission != "sync.emit" {
+		if !known && op.Permission != "sync.push" && op.Permission != "sync.drain" && op.Permission != "sync.emit" && op.Permission != api.PermPIIErase {
 			t.Errorf("operation %s needs %q, which the guard's catalogue does not list", op.ID, op.Permission)
 		}
 	}

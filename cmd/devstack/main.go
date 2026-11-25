@@ -59,7 +59,7 @@ func main() {
 	check(err)
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: issuer.Verifier(), Dir: id}, Backend: api.GatewayBackend{G: gw}})
-	services := authtest.NewServiceRegistry(clock.Func(now), "admin", "sync", "catalog", "billing")
+	services := authtest.NewServiceRegistry(clock.Func(now), "admin", "sync", "catalog", "billing", "orders")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: issuer.Verifier(), Services: services.Verifier("sync"), Audit: &repository.AccessSink{S: st}, Clock: clock.Func(now)})
 	cloudURL := serve(ctx, *cloudAddr, mux)
 

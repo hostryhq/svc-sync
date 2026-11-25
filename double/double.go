@@ -71,7 +71,7 @@ func New(ctx context.Context) (*Double, error) {
 	}
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: d.Issuer.Verifier(), Dir: d.Identity}, Backend: api.GatewayBackend{G: d.Gateway}})
-	d.Services = authtest.NewServiceRegistry(clock.Func(d.Now), "admin", "sync", "catalog", "billing")
+	d.Services = authtest.NewServiceRegistry(clock.Func(d.Now), "admin", "sync", "catalog", "billing", "orders")
 	api.Admin(mux, d.Gateway, api.AdminAuth{Tenant: d.Issuer.Verifier(), Services: d.Services.Verifier("sync"),
 		Audit: &repository.AccessSink{S: d.Store.(*repository.SQL)}, Clock: clock.Func(d.Now)})
 	d.h = mux

@@ -226,6 +226,7 @@ func Run(t *testing.T, tg Target) {
 	})
 
 	tg.runEmit(t)
+	tg.runErase(t)
 
 	t.Run("token rules: drain tokens only at the upload, device tokens not there, admin needs a member", func(t *testing.T) {
 		a := tg.node(t)

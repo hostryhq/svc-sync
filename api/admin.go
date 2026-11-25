@@ -216,7 +216,8 @@ func Admin(mux *http.ServeMux, g *service.Gateway, a AdminAuth) {
 	post("POST /sync/v1/quarantine/confirm", "confirmSyncQuarantine", service.PermQuarantineConfirm, func(ctx context.Context, d Decision) (any, error) {
 		return d.Ref, g.ConfirmAs(ctx, d.Ref, d.Reason, d.H)
 	})
-	Emit(mux, g, a) // POST /internal/v1/emit, behind the same guard (service tokens)
+	Emit(mux, g, a)  // POST /internal/v1/emit, behind the same guard (service tokens)
+	Erase(mux, g, a) // POST /internal/v1/pii/erase, the same
 }
 
 func adminErr(err error) error {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -25,8 +26,75 @@ const metaErasureAck = "pii-ack-recv:"
 // stay in the sealed body of the original op. It returns the erasure op. Erasing twice is a no-op
 // that returns the first erasure op's identity.
 func (g *Gateway) ErasePII(ctx context.Context, tenant string, ref sp.Ref) (sp.Ref, error) {
+	out, _, err := g.erasePII(ctx, tenant, ref)
+	return out, err
+}
+
+// Erase refusals (openapi/sync/v1 erasePii, 422).
+const (
+	EraseTargetUnknown = "erase.target_unknown"
+	EraseBatchSize     = "erase.batch_size"
+	// MaxEraseTargets is the most targets of one erasePii request.
+	MaxEraseTargets = 200
+)
+
+// EraseError is a refusal of the erase operation; nothing was written for any target.
+type EraseError struct{ Code string }
+
+func (e *EraseError) Error() string { return "service: erase refused: " + e.Code }
+
+// EraseResult is one target's erasure: the target, the cloud erasure op that carries it and whether an
+// earlier request had already erased it.
+type EraseResult struct {
+	Target, Erase sp.Ref
+	Replayed      bool
+}
+
+// ErasePIIBatch is the operation behind erasePii: one to 200 targets, all of the tenant. The batch is atomic
+// in what it refuses: every target is checked first, and one the gateway does not hold refuses the whole
+// request (EraseError erase.target_unknown) before anything is written. Each target is then erased in its own
+// transaction; erasing twice answers the first erasure op with Replayed.
+func (g *Gateway) ErasePIIBatch(ctx context.Context, tenant string, targets []sp.Ref) ([]EraseResult, error) {
+	if len(targets) < 1 || len(targets) > MaxEraseTargets {
+		return nil, &EraseError{Code: EraseBatchSize}
+	}
+	if err := g.guard.Check(ctx); err != nil {
+		return nil, ErrEmitUnavailable
+	}
+	err := g.cfg.Store.InTx(ctx, tenant, func(tx repository.Tx) error {
+		for _, t := range targets {
+			if _, ok, err := tx.GetOp(t.Stream, t.Origin, t.Seq); err != nil {
+				return err
+			} else if !ok {
+				return &EraseError{Code: EraseTargetUnknown}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		var ee *EraseError
+		if errors.As(err, &ee) {
+			return nil, err
+		}
+		g.cfg.Log.Error("erase check failed", "err", err.Error())
+		return nil, ErrEmitUnavailable
+	}
+	out := make([]EraseResult, 0, len(targets))
+	for _, t := range targets {
+		er, replayed, err := g.erasePII(ctx, tenant, t)
+		if err != nil {
+			g.cfg.Log.Error("erase failed", "err", err.Error())
+			return nil, ErrEmitUnavailable // targets are idempotent: the caller retries the request
+		}
+		out = append(out, EraseResult{Target: t, Erase: er, Replayed: replayed})
+	}
+	return out, nil
+}
+
+func (g *Gateway) erasePII(ctx context.Context, tenant string, ref sp.Ref) (sp.Ref, bool, error) {
 	e := g.engineFor(tenant)
 	var out sp.Ref
+	var replayed bool
 	err := e.InTxLocked(ctx, func(tx repository.Tx) error {
 		if _, ok, err := tx.GetOp(ref.Stream, ref.Origin, ref.Seq); err != nil {
 			return err
@@ -39,6 +107,7 @@ func (g *Gateway) ErasePII(ctx context.Context, tenant string, ref sp.Ref) (sp.R
 			parts := strings.Split(prev, "|") // origin|seq of the erasure op
 			seq, _ := strconv.ParseInt(parts[1], 10, 64)
 			out = sp.Ref{Origin: parts[0], Stream: ref.Stream, Seq: seq}
+			replayed = true
 			return nil
 		}
 		it, err := e.RecordAndSealTx(tx, engine.Input{Stream: ref.Stream, Intent: sp.IntentPIIErase, Muts: []sp.Mut{{
@@ -67,7 +136,7 @@ func (g *Gateway) ErasePII(ctx context.Context, tenant string, ref sp.Ref) (sp.R
 	if err == nil {
 		g.poker(tenant).bump()
 	}
-	return out, err
+	return out, replayed, err
 }
 
 func (g *Gateway) publishErased(tx repository.Tx, ref sp.Ref) error {
