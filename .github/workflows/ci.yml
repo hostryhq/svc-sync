@@ -62,6 +62,7 @@ jobs:
           go-version-file: go.mod
       - name: Postgres integration tests (fail if they were skipped)
         run: |
+          set -o pipefail
           go test -race -count=1 -v ./integration/... | tee "$RUNNER_TEMP/it.log"
           if grep -q -e '--- SKIP' "$RUNNER_TEMP/it.log"; then echo "integration tests were skipped" >&2; exit 1; fi
 
