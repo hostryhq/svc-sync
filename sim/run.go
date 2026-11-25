@@ -293,6 +293,8 @@ func (r *runner) record(ctx context.Context, step int) error {
 		it, err = d.StockOp(rng)
 	case kind < 90 && d.Kind == sp.KindPOS: // menu.price.set is a POS (or personal device) intent in the registry
 		it, err = d.PriceOp(rng)
+	case kind >= 90 && kind < 96: // a check with the customer's details beside it (ADR-0014 A3.1)
+		it, err = d.CheckOp(rng)
 	default:
 		it, err = d.OrderOp(rng)
 	}

@@ -189,6 +189,7 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 		}
 	}
 
+	ps = append(ps, w.CheckPII(ctx)...)
 	return ps
 }
 

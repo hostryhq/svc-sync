@@ -69,6 +69,8 @@ type World struct {
 	Via     struct{ HubOK, HubFail, CloudDirect int }
 	Devices []*Device
 	byID    map[string]*Device
+	// PIIOps are the checks recorded with customer details beside them (CheckOp), for the placement check.
+	PIIOps []sp.Ref
 }
 
 const (

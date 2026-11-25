@@ -11,7 +11,7 @@ svc-sync keeps no copy of the contract. It reads the **api-specs** repository (A
 | Entity registry (owners, policies, `doc_number`, `replicated_to`) | `entities/` |
 | Bus events | `events/sync/*` |
 
-Pinned version: branch `feat/phase2-specs` at `6e63014` (round 4b: ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
+Pinned version: branch `feat/phase2-specs` at `14c76fd` (round 5: ADR-0014 A3; before it `6e63014`, round 4b, ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
 `feat/phase2-libs` @ `92884d6`, go-auth `feat/phase2-auth` @ `94f1970`); svc-identity `feat/phase2-identity` @ `2ba5adc` and svc-tenancy
 `feat/phase2-tenancy` @ `3792f07` in `identityreal/go.mod`. The checkout is found through `API_SPECS_DIR`, or as a sibling directory
 `../api-specs-p2`, then `../api-specs` (`contract/specs`). Tests fail, not skip, without it.
@@ -69,3 +69,21 @@ Implemented here and in `client-core-sync`; `protocol-v1.md` still says "no sett
   `approver`, `action_hash`, `reason`); the gateway reads those names for `verifyProof` (`ProofVerification` kind approval). The entity file does not
   name them yet.
 - `cmd/gateway` series events: `tenancy.series.issued` and `.closed` do not list `sync` as subscriber, so a series is seen within the 60-second cache time.
+
+## ADR-0014 A3 on this side (round 5, `14c76fd`)
+- **Vectors.** `syncproto/a3_vectors_test.go` runs `pii_placement` (`ServesPII`), `digest_row` (`RowText`), `action_hash` (`ActionHash`,
+  including the OV2 mismatch case) and `approval_proof` (`SessionProofMessage`, `ApprovalProofMessage`, `ProofMAC`) from the checkout.
+- **A3.1 placement.** `engine.Serve` and `Gateway.Snapshot`/`Hub.Snapshot` give `pii` (values with their salts) to a puller of kind `pos`,
+  `waiter`, `personal` or `hub` and never to a `kds`; the commitments (`pii_c`, in the body and on every snapshot row) reach every kind.
+  A node of those kinds keeps `pii-need:<op>` for an op whose commitments have no value (`pii_incomplete`) and lists it in the `placeholders`
+  of its next pull; the answer carries the op with its values, and a held op that arrives again with values is completed (verified, merged).
+  The cloud restore re-offer (and a day after it) offers the pii-bearing ops again, so an op the cloud took first from a relay that held no
+  values is completed (`engine.reofferPII`). The recovery upload carries the adopter's values.
+- **A3.2 hash.** `State.ApplyPII` adds the commitment of each `pii` field (`entities_gen.go` marks them) as the candidate `~c:<field>`,
+  merged by the field's own rule; `State.Hash` therefore covers commitments and no value, equal on every kind and unchanged by erasure.
+- **A3.3 approval citation.** `service/approval.go`; table `approval_verdicts` holds the record (migration 0015). Wire addition read from the
+  contract: intent `approval.self_confirm`; `Exception.reason` (`approval_flag`). Marks: `approval_flag` + `approval_reason:<reason>`,
+  `approval_pending`, `approved_by:<member>`. An approval cited from another origin is not found and stays `pending` (it is keyed by origin).
+- **Device sessions.** `deviceSessionExpired`: 26 hours, no PIN-session limit; the opening time is kept by `PutSession`.
+- **A3.4.** A credential answer without `brand_id` is a fault (`identityclient`, `realdir`); stream binding uses the credential only.
+  Dev routes: `brand_id` is required at registration and answered with `kid` (also in `device`), the hub pack carries `kid`.

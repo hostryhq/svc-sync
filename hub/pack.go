@@ -20,6 +20,7 @@ type Pack struct {
 	Tenant      string                  `json:"tenant_id"`
 	Outlet      string                  `json:"outlet_id"`
 	Brand       string                  `json:"brand_id"`
+	Kid         string                  `json:"kid"`
 	Cred        sp.CredentialEnvelope   `json:"cred"`
 	PKCS8       string                  `json:"pkcs8"`
 	IdentityPub string                  `json:"identity_pub"`

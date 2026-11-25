@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hostryhq/svc-sync/directory"
+	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -227,4 +229,62 @@ func ApprovalReason(marks []string) (reason string, rest []string) {
 		rest = append(rest, m)
 	}
 	return reason, rest
+}
+
+// resolveApproval asks identity again about an approval proof it could not answer. A verdict clears the pending mark of the
+// approving op (a failure flags it, as for a session) and lets the ops that cite the approval be judged again.
+func (g *Gateway) resolveApproval(tx repository.Tx, ap repository.ApprovalRow) (int, error) {
+	recs, err := tx.OpsByOrigin(ap.Origin)
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range recs {
+		if (r.Intent != sp.IntentApprovalGrant && r.Intent != sp.IntentApprovalSelfConfirm) || r.Body == "" {
+			continue
+		}
+		b, err := sp.DecodeBody(r.Body)
+		if err != nil || !carriesApproval(b, ap.ID) {
+			continue
+		}
+		res := g.approvalProof(tx, &engine.Parsed{Item: sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body}, Body: b})
+		if res == directory.ProofUnavailable {
+			return 0, nil
+		}
+		marks := splitMarks(r.Marks)
+		if hasMark(marks, MarkProofPending) {
+			kept := dropMarks(marks, MarkProofPending)
+			if res == directory.ProofInvalid || res == directory.ProofLocked || res == directory.ProofMissing {
+				kept = append(kept, MarkAttributionUnverified)
+				if r.Status == repository.StAccepted {
+					r.Status = repository.StFlagged
+				}
+				if err := g.alert(tx, "owner", "medium", "attribution_unverified", r); err != nil {
+					return 0, err
+				}
+				r.Marks = strings.Join(kept, ",")
+				if err := tx.UpdateOp(r); err != nil {
+					return 0, err
+				}
+				if err := g.publishFlagged(tx, r, kept); err != nil {
+					return 0, err
+				}
+			} else {
+				r.Marks = strings.Join(kept, ",")
+				if err := tx.UpdateOp(r); err != nil {
+					return 0, err
+				}
+			}
+		}
+		return 1, g.resolveApprovalWaiters(tx, ap.Origin, ap.ID)
+	}
+	return 0, nil
+}
+
+func carriesApproval(b sp.Body, id string) bool {
+	for _, m := range b.Muts {
+		if m.E == "approval" && m.ID == id {
+			return true
+		}
+	}
+	return false
 }

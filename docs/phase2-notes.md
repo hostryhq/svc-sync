@@ -1,6 +1,6 @@
 # Phase 2 notes (svc-sync on feat/phase2-sync)
 
-Contract: api-specs `feat/phase2-specs` @ b153c62; go-common `feat/phase2-libs` @ 92884d6 and go-auth `feat/phase2-auth` @ 94f1970 (pinned by pseudo-version in `go.mod`;
+Contract: api-specs `feat/phase2-specs` @ 14c76fd (was b153c62); go-common `feat/phase2-libs` @ 92884d6 and go-auth `feat/phase2-auth` @ 94f1970 (pinned by pseudo-version in `go.mod`;
 `GOWORK=off go build ./...` works); svc-identity `feat/phase2-identity` @ ebebd4c (`identityreal/go.mod`).
 
 ## Built
@@ -74,3 +74,19 @@ Contract api-specs `6e63014`, svc-identity `2ba5adc`, svc-tenancy `3792f07`. Ite
 7. **A2.8 wire fields** (`unbound`, `chain_conflicts`, `unbound_h`, `stale_seals`, `seal_refresh`, refusal `chain_conflict`) are listed in
    `contract/README.md` for the spec owner.
 8. Simulator: `menu.price.set` is a `pos` (and `personal`) intent in the registry, so waiters no longer record it.
+
+## ADR-0014 Amendment A3 (feat/phase2-sync, contract api-specs `14c76fd`)
+Built: A3.1/A3.2 (pii by credential kind, commitments in every hash, refetch of `pii_incomplete`, erasure unchanged), A3.3 (approval citation with
+`approval_flag` reasons, `pending`, single citer, `approval.self_confirm`), device-session lifetime (26 hours), A3.4 (credential without `brand_id`
+is a fault; dev routes and hub pack carry `kid` and `brand_id`). Tests: vectors (`syncproto/a3_vectors_test.go`), PA1 to PA5
+(`engine/pii_a3_test.go`, `sim/pii_a3_test.go`, `sim/pii_gateway_test.go`), OV1 to OV5 (`service/approval_test.go`), device session
+(`sim/devicesession_test.go`), and the simulator: checks with customer details are recorded in every run and `CheckPII` asserts placement
+(staff devices, hub and cloud hold the values, no kds does, nothing left `pii_incomplete`).
+Open and judgement calls:
+- An approval is keyed by `(origin, approval id)`: citing an approval of another device stays `pending` and is never flagged.
+- The wire has no way for the cloud to ask a node for values it lacks (the contract has no field for it). The gap is closed by the node
+  re-offering its pii-bearing ops for a day after it hears of a restore epoch; a relay that held no values and pushed an op before the origin
+  outside that window is not completed. Needs a contract field (`pii_need` in the hello answer) if it matters; not decided here.
+- Random erasure is not in the simulator (a cloud rollback loses the erasure record at the cloud, so a node that missed it would re-offer the
+  value); erasure is covered by PA2/X2, PA3 and PA5.
+- `identityreal/` (own module) still pins svc-identity at the ADR-0005 A3 head; its live test needs svc-identity and svc-tenancy at round 5.

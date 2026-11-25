@@ -191,6 +191,8 @@ type Tx interface {
 	// MetaPrefix lists the meta rows whose key starts with prefix.
 	MetaPrefix(prefix string) (map[string]string, error)
 	SetMeta(k, v string) error
+	// PIIRefs lists the ops this node holds pii values for.
+	PIIRefs() ([][3]string, error)
 	PutPII(stream, origin string, seq int64, data string) error
 	GetPII(stream, origin string, seq int64) (string, bool, error)
 	ErasePII(stream, origin string, seq int64) error
@@ -207,6 +209,8 @@ type Tx interface {
 	// PutApprovalRecord stores the record of an approval.grant or approval.self_confirm beside its verdict (the row exists).
 	PutApprovalRecord(r ApprovalRow) error
 	GetApproval(origin, approvalID string) (ApprovalRow, bool, error)
+	// PendingApprovals lists the approvals whose proof identity has not answered.
+	PendingApprovals() ([]ApprovalRow, error)
 	// ClaimApproval sets the one op that cites the approval.
 	ClaimApproval(origin, approvalID, citer, citerHLC string) error
 	PutDrain(d DrainRec) error
@@ -614,6 +618,24 @@ func (t *sqlTx) GetEmit(caller, key string) (EmitRec, bool, error) {
 	return e, err == nil, err
 }
 
+func (t *sqlTx) PIIRefs() ([][3]string, error) {
+	rows, err := t.query(`SELECT stream, origin, seq FROM op_pii WHERE tenant_id=? ORDER BY stream, origin, seq`, t.tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][3]string
+	for rows.Next() {
+		var s, o string
+		var q int64
+		if err := rows.Scan(&s, &o, &q); err != nil {
+			return nil, err
+		}
+		out = append(out, [3]string{s, o, strconv.FormatInt(q, 10)})
+	}
+	return out, rows.Err()
+}
+
 func (t *sqlTx) PutPII(stream, origin string, seq int64, data string) error {
 	return t.exec(`INSERT INTO op_pii (tenant_id, stream, origin, seq, data) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`, t.tenant, stream, origin, seq, data)
 }
@@ -703,6 +725,23 @@ func (t *sqlTx) GetApproval(origin, approvalID string) (ApprovalRow, bool, error
 		return ApprovalRow{}, false, nil
 	}
 	return r, err == nil, err
+}
+
+func (t *sqlTx) PendingApprovals() ([]ApprovalRow, error) {
+	rows, err := t.query(`SELECT `+approvalCols+` FROM approval_verdicts WHERE tenant_id=? AND verdict='pending' ORDER BY origin, approval_id`, t.tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ApprovalRow
+	for rows.Next() {
+		var r ApprovalRow
+		if err := rows.Scan(&r.Origin, &r.ID, &r.Verdict, &r.Kind, &r.SID, &r.Intent, &r.Permission, &r.Target, &r.ActionHash, &r.Requester, &r.Approver, &r.Reason, &r.ApprovedAt, &r.Citer, &r.CiterHLC); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (t *sqlTx) ClaimApproval(origin, approvalID, citer, citerHLC string) error {

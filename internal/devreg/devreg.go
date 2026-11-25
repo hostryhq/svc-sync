@@ -76,7 +76,7 @@ func (r *Registry) hubPack(tenant, device string) (hub.Pack, bool) {
 	if !ok || !cok {
 		return hub.Pack{}, false
 	}
-	p := hub.Pack{Tenant: tenant, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID, Cred: cred, PKCS8: pkcs8,
+	p := hub.Pack{Tenant: tenant, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID, Kid: cred.Cred.Kid, Cred: cred, PKCS8: pkcs8,
 		IdentityPub: sp.EncodePub(r.ID.IdentityPub()), CloudKeys: map[string]string{r.ID.CloudKey.Kid: r.ID.CloudKey.PublicB64()},
 		Members: r.ID.MembersOfOutlet(tenant, cred.Cred.OutletID), SeriesOwner: map[string]string{}, CloudURL: r.CloudURL}
 	for _, c := range r.ID.Devices(tenant, cred.Cred.OutletID) {
@@ -148,15 +148,29 @@ type RegisterRequest struct {
 	TTLSeconds int `json:"ttl_seconds"`
 }
 
+// PackDevice is the `device` object of the offline pack: the device's own credential facts.
+type PackDevice struct {
+	DeviceID string `json:"device_id"`
+	OutletID string `json:"outlet_id"`
+	BrandID  string `json:"brand_id"`
+	Kind     string `json:"kind"`
+	Kid      string `json:"kid"`
+}
+
 // RegisterResponse is what a device needs to start: its credential, the keys it verifies with and a token.
 type RegisterResponse struct {
-	DeviceID    string                  `json:"device_id"`
-	Credential  sp.CredentialEnvelope   `json:"credential"`
-	IdentityPub string                  `json:"identity_pub"`
-	CloudKeys   map[string]string       `json:"cloud_keys"`
-	Token       string                  `json:"token"`
-	PKCS8       string                  `json:"pkcs8,omitempty"`
-	Series      []map[string]string     `json:"series"`
+	DeviceID    string                `json:"device_id"`
+	Credential  sp.CredentialEnvelope `json:"credential"`
+	IdentityPub string                `json:"identity_pub"`
+	CloudKeys   map[string]string     `json:"cloud_keys"`
+	Token       string                `json:"token"`
+	PKCS8       string                `json:"pkcs8,omitempty"`
+	Series      []map[string]string   `json:"series"`
+	// BrandID and Kid are the credential's brand and key id, also in Device as identity's offline pack carries them
+	// (ADR-0014 A3.4; ADR-0005 A3.2 row 1).
+	BrandID     string                  `json:"brand_id"`
+	Kid         string                  `json:"kid"`
+	Device      PackDevice              `json:"device"`
 	Peers       []sp.CredentialEnvelope `json:"peers,omitempty"`
 	PackVersion int                     `json:"pack_version"`
 	// HubPack is the file cmd/hub reads (SYNC_HUB_PACK), present for a hub registered with a generated key.
@@ -169,6 +183,10 @@ func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	kind, ok := map[string]string{"pos": sp.KindPOS, "waiter": sp.KindWaiter, "kds": sp.KindKDS, "hub": sp.KindHub, "personal": sp.KindPersonal}[in.Kind]
+	if in.BrandID == "" {
+		problem(w, http.StatusBadRequest, "brand_id is required: no credential is issued without a brand (ADR-0014 A3.4)")
+		return
+	}
 	if in.TenantID == "" || in.OutletID == "" || in.DeviceID == "" || !ok {
 		problem(w, http.StatusBadRequest, "tenant_id, outlet_id, device_id and a kind of pos, waiter, kds or hub are required")
 		return
@@ -237,7 +255,8 @@ func (r *Registry) registerDevice(w http.ResponseWriter, req *http.Request) {
 	if kind == sp.KindHub && pkcs8 != "" {
 		r.keep(in.TenantID, in.DeviceID, pkcs8)
 	}
-	out := RegisterResponse{DeviceID: in.DeviceID, PackVersion: pv, Credential: cred, IdentityPub: sp.EncodePub(r.ID.IdentityPub()),
+	out := RegisterResponse{DeviceID: in.DeviceID, PackVersion: pv, Credential: cred, BrandID: cred.Cred.BrandID, Kid: cred.Cred.Kid,
+		Device: PackDevice{DeviceID: in.DeviceID, OutletID: cred.Cred.OutletID, BrandID: cred.Cred.BrandID, Kind: cred.Cred.Kind, Kid: cred.Cred.Kid}, IdentityPub: sp.EncodePub(r.ID.IdentityPub()),
 		CloudKeys: map[string]string{r.ID.CloudKey.Kid: r.ID.CloudKey.PublicB64()}, Token: r.token(in.TenantID, in.DeviceID, in.TTLSeconds), PKCS8: pkcs8,
 		Series: []map[string]string{}, Peers: r.ID.Devices(in.TenantID, in.OutletID)}
 	for _, s := range r.ID.SeriesOf(in.TenantID, in.DeviceID) {

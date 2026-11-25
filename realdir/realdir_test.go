@@ -32,6 +32,8 @@ type fake struct {
 	status map[string]int // forced status per route
 	books  string         // JSON items of listOutletManualBookSeries
 	feed   string         // JSON of the revocation page
+	// noBrand makes the credential answer lack brand_id, as identity never should (ADR-0014 A3.4).
+	noBrand bool
 }
 
 func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +41,7 @@ func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.hits[route]++
 	st := f.status[route]
-	books, feed := f.books, f.feed
+	books, feed, noBrand := f.books, f.feed, f.noBrand
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/problem+json")
 	if st != 0 {
@@ -50,7 +52,11 @@ func (f *fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/credential") && strings.Contains(r.URL.Path, device):
-		_, _ = w.Write([]byte(`{"device_id":"` + device + `","tenant_id":"` + tenant + `","outlet_id":"` + outlet + `","brand_id":"brand-1","kind":"pos","kid":"k1","pub":"BAAA"}`))
+		brand := `"brand_id":"brand-1",`
+		if noBrand {
+			brand = ""
+		}
+		_, _ = w.Write([]byte(`{"device_id":"` + device + `","tenant_id":"` + tenant + `","outlet_id":"` + outlet + `",` + brand + `"kind":"pos","kid":"k1","pub":"BAAA"}`))
 	case strings.HasSuffix(r.URL.Path, "/series") && strings.Contains(r.URL.Path, device):
 		_, _ = w.Write([]byte(`{"items":[{"id":"s1","tax_registration_id":"r1","code":"A7K","doc_type":"tax_invoice","outlet_id":"` + outlet + `","device_id":"` + device + `","status":"closed_unreconciled","issued_at":"2026-11-24T13:15:11.120Z"}]}`))
 	case strings.HasSuffix(r.URL.Path, "/manual-book-series"):
@@ -245,4 +251,23 @@ func TestStreamInTenantAsksTenancyOnce(t *testing.T) {
 	if n := f.count("GET /internal/v1/stream-owners/" + outlet); n != 1 {
 		t.Fatalf("asked %d times", n)
 	}
+}
+
+// A3.4: the credential carries the brand identity signed at activation, and the gateway judges the stream binding from it
+// alone. An answer without brand_id is a fault, never a credential, so no brand stream is judged on a guess.
+func TestCredentialCarriesBrandAndAnAnswerWithoutOneIsAFault(t *testing.T) {
+	d, f, _ := newDir(t)
+	c, ok := d.Credential(tenant, device)
+	if !ok || c.Cred.BrandID != "brand-1" || c.Cred.Kind != "pos" {
+		t.Fatalf("credential: %+v %v", c.Cred, ok)
+	}
+	d2, f2, _ := newDir(t)
+	f2.mu.Lock()
+	f2.noBrand = true
+	f2.mu.Unlock()
+	before := d2.Faults()
+	if _, ok := d2.Credential(tenant, device); ok || d2.Faults() == before {
+		t.Fatalf("a credential without brand_id must be a fault, not an answer (ok=%v)", ok)
+	}
+	_ = f
 }

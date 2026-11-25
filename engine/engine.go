@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -142,7 +143,7 @@ type Config struct {
 	// node expects the pii values of ops that carry commitments (ADR-0014 A3.1 item 4).
 	Kind   string
 	Tenant string
-	Outlet  string
+	Outlet string
 	// Origin is this node's own origin id: the device id, or cloud-<epoch>. Empty for a hub that
 	// never records ops of its own.
 	Origin string
@@ -577,6 +578,9 @@ type OutboundOpts struct {
 	// Reoffer is set while the node's re-offer is open (A2.2): endorsed ops the upstream's vector
 	// counts are offered again with their endorsements.
 	Reoffer bool
+	// ResendPII offers the ops this node holds pii values for again to the cloud, for a day after a cloud restore: a relay
+	// that held no values may have given the cloud an op first (ADR-0014 A3.1 item 2).
+	ResendPII bool
 }
 
 // Outbound builds the push for an upstream whose vector is up: for each (origin, stream) the ops
@@ -691,6 +695,11 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 			}
 			budget -= n
 		}
+		if o.ResendPII || o.Reoffer {
+			if err := e.reofferPII(tx, up, o, &req); err != nil {
+				return err
+			}
+		}
 		if o.Reoffer {
 			return e.reofferEndorsed(tx, up, o, &req)
 		}
@@ -794,6 +803,44 @@ func boundAt(tx repository.Tx, stream, origin string, after, cut int64) (*bound,
 		b.Atts = append(b.Atts, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
 	}
 	return b, nil
+}
+
+// reofferPII adds, for a node whose re-offer is open, the ops this node holds pii values for that the upstream's vector already
+// counts. After a cloud restore the cloud may have taken such an op from a relay that held no values (a kds, a hub that was
+// wiped); only a node that holds them can complete it, and the upstream cannot ask. Ingest merges the verified fields into the
+// slot it holds (ADR-0014 A3.1 item 2, item 4).
+func (e *Engine) reofferPII(tx repository.Tx, up sp.Vector, o OutboundOpts, req *sp.PushRequest) error {
+	refs, err := tx.PIIRefs()
+	if err != nil {
+		return err
+	}
+	var extra []sp.Item
+	for _, k := range refs {
+		seq, _ := strconv.ParseInt(k[2], 10, 64)
+		stream, origin := k[0], k[1]
+		if (len(o.Streams) > 0 && !contains(o.Streams, stream)) || seq > up[sp.VKey(origin, stream)] || len(extra) >= o.Limit {
+			continue
+		}
+		if origin != e.cfg.Origin && !o.Others {
+			continue
+		}
+		r, ok, err := tx.GetOp(stream, origin, seq)
+		if err != nil {
+			return err
+		}
+		if !ok || r.Body == "" || (r.Status != repository.StAccepted && r.Status != repository.StFlagged) {
+			continue
+		}
+		it := sp.Item{Origin: origin, Stream: stream, Seq: seq, H: r.H, Body: r.Body}
+		if pii, ok, err := tx.GetPII(stream, origin, seq); err != nil {
+			return err
+		} else if ok {
+			it.PII = json.RawMessage(pii)
+		}
+		extra = append(extra, it)
+	}
+	req.Items = append(extra, req.Items...)
+	return nil
 }
 
 // reofferEndorsed adds, for a node whose re-offer is open (S16 item 4, A2.2), the endorsed ops the
@@ -1206,6 +1253,16 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			}
 			res.New = append(res.New, rec)
 			*apply = append(*apply, b)
+			// The values that come with a filled slot are verified and kept like those of any new op (ADR-0014 A3.1 item 2).
+			pf := &Parsed{Item: it, Body: b}
+			if len(it.PII) > 0 {
+				if err := e.openPII(tx, pf); err != nil {
+					return false, err
+				}
+			}
+			if err := e.notePIINeed(tx, it, pf); err != nil {
+				return false, err
+			}
 		}
 	}
 	if len(items) == 0 {
@@ -1866,7 +1923,13 @@ func (e *Engine) RecoveryUpload(ctx context.Context, old string, up sp.Vector, l
 			}
 			last := after
 			for _, r := range recs {
-				req.Items = append(req.Items, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
+				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body}
+				if pii, ok, err := tx.GetPII(r.Stream, r.Origin, r.Seq); err != nil {
+					return err
+				} else if ok {
+					it.PII = json.RawMessage(pii) // the adopter's copy of the values goes with the op (ADR-0014 A3.1 item 2)
+				}
+				req.Items = append(req.Items, it)
 				last = r.Seq
 			}
 			seals, err := tx.SealSeqs(h.Stream, old, after)

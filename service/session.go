@@ -212,6 +212,17 @@ func (g *Gateway) ResolveSessions(ctx context.Context, tenant string) (int, erro
 				return err
 			}
 		}
+		apps, err := tx.PendingApprovals()
+		if err != nil {
+			return err
+		}
+		for _, ap := range apps {
+			n, err := g.resolveApproval(tx, ap)
+			if err != nil {
+				return err
+			}
+			resolved += n
+		}
 		return nil
 	})
 	if err != nil {

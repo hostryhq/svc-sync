@@ -59,6 +59,11 @@ type SyncResult struct {
 // they differ. A hub's word may open it; only a direct cloud hello may close it.
 const metaEpoch, metaReoffered = "epoch", "reoffered_epoch"
 
+// metaPIIResend is the time until which this node offers its pii values to the cloud again (a day after it hears of a restore).
+const metaPIIResend = "pii_resend_until"
+
+const piiResendWindow = 24 * time.Hour
+
 // SyncOnce does hello, push until the upstream has everything offerable, then pull until caught
 // up. Every step is idempotent; an error leaves the node ready to run it again.
 func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
@@ -131,6 +136,11 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 			if err := tx.SetMeta(metaEpoch, hello.Epoch); err != nil {
 				return err
 			}
+			if lastEpoch != "" {
+				if err := tx.SetMeta(metaPIIResend, cfg.Clock.Time().Add(piiResendWindow).UTC().Format(time.RFC3339)); err != nil {
+					return err
+				}
+			}
 			if first {
 				return tx.SetMeta(metaReoffered, hello.Epoch) // a new store has nothing to re-offer
 			}
@@ -148,10 +158,21 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		up = sp.Vector{}
 	}
 	others := c.IsHub || (c.UpstreamIsCloud && open)
+	resendPII := false
+	if c.UpstreamIsCloud {
+		_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error {
+			if v, ok, _ := tx.GetMeta(metaPIIResend); ok {
+				if until, err := time.Parse(time.RFC3339, v); err == nil && cfg.Clock.Time().Before(until) {
+					resendPII = true
+				}
+			}
+			return nil
+		})
+	}
 	refused := map[string]bool{}
 	// Push.
 	for round := 0; round < 200; round++ {
-		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams, Reoffer: open && c.UpstreamIsCloud && round == 0})
+		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams, Reoffer: open && c.UpstreamIsCloud && round == 0, ResendPII: resendPII && round == 0})
 		if err != nil {
 			return res, err
 		}

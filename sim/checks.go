@@ -61,7 +61,7 @@ func (w *World) CloudState(ctx context.Context) (*engine.State, sp.Vector, error
 				continue
 			}
 			h, _ := sp.ParseHLC(b.HLC)
-			st.Apply(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts)
+			st.ApplyPII(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts, b.PIIC)
 		}
 		return nil
 	})
