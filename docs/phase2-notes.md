@@ -90,3 +90,22 @@ Open and judgement calls:
 - Random erasure is not in the simulator (a cloud rollback loses the erasure record at the cloud, so a node that missed it would re-offer the
   value); erasure is covered by PA2/X2, PA3 and PA5.
 - `identityreal/` (own module) still pins svc-identity at the ADR-0005 A3 head; its live test needs svc-identity and svc-tenancy at round 5.
+
+## ADR-0002 A3 (LAN transport, hub at rest, hub pack source, placement)
+Contract api-specs-p2 `010e6b1`; identity `418c61c` (hub packs). `docs/poc-notes.md` lines 42 and 136 (per-request LAN assertion, plain pack file) no longer apply.
+- **Credential `store`** is in `syncproto.Credential` (always present), the identity client and the stub. **Placement:** `syncproto.PIIPlacement`
+  (kds never; another origin's pii only to `store: protected`; own pii unaffected), used by pull, released placeholders and snapshots in both
+  roles. `PIIToUnprotected` (gateway, hub engine) is the dev, test and ci switch; `cmd/hub` refuses it outside those environments.
+- **LAN:** `hub/tlscert.go` (in-memory P-256 certificate, lazy 7-day rotation), `hub/lan.go` (helloLan, openLanSession, session token in memory,
+  `lan_session_expired`), `hub/lanclient.go` (Go device side: spki measured from the TLS connection, pinned for later connections, retry after a
+  hub restart). Vectors: `syncproto/lan_vectors_test.go`. The per-request assertion is gone.
+- **At rest:** `keyprotect/` (DPAPI user scope for Windows, build-tagged, no CGO; `dev` provider for Linux CI, refuses outside dev, test, ci),
+  `repository/crypt.go` (AES-256-GCM on `ops.body`, `op_pii.data`, `meta.v`, `forks.body`, AAD = table, key, column, key id; 90-day data key;
+  `secure_delete` and a WAL truncate after an erasure). `alerts.detail` stays clear: it is matched by value and holds ids, not field values.
+- **Pack source:** `hub/identitysource.go` (activateDevice, createDeviceToken, getDeviceOfflinePack), `hub/applypack.go`, `cmd/hub` (`hub activate`,
+  `hub`). The `file` source and the plain listener exist only in a binary built with `-tags devlan`.
+- **Open:** the pack JWS is signed by identity's pack-signing key, which no published document carries, so the hub cannot verify the pack
+  signature itself; it verifies the hub credential under the pack's `identity_public_keys` and relies on HTTPS (activation, refresh) and the
+  encrypted store. A hub pack lists no peer credentials, so a hub relays a tablet's ops only after the cloud has served that tablet's
+  `hostry-cred-v1` envelope upstream; until then it verifies the tablet's seals from its LAN credential but a third device cannot verify them.
+  `alerts`, `approval_verdicts.reason` are not encrypted. HS1 needs a Windows PC (pilot gate).

@@ -22,6 +22,7 @@ type Pack struct {
 	Brand       string                  `json:"brand_id"`
 	Kid         string                  `json:"kid"`
 	Cred        sp.CredentialEnvelope   `json:"cred"`
+	CredJWS     string                  `json:"cred_jws"`
 	PKCS8       string                  `json:"pkcs8"`
 	IdentityPub string                  `json:"identity_pub"`
 	CloudKeys   map[string]string       `json:"cloud_keys"`
@@ -64,7 +65,7 @@ func LoadPack(path string) (Config, Pack, error) {
 	for _, m := range p.Members {
 		members[m] = true
 	}
-	cfg := Config{Tenant: p.Tenant, Outlet: p.Outlet, Brand: p.Brand, Cred: p.Cred, Key: &sp.KeyPair{Kid: p.Cred.Cred.Kid, Priv: ec},
+	cfg := Config{Tenant: p.Tenant, Outlet: p.Outlet, Brand: p.Brand, Cred: p.Cred, CredJWS: p.CredJWS, Key: &sp.KeyPair{Kid: p.Cred.Cred.Kid, Priv: ec},
 		IdentityPub: idPub, CloudKeys: keys, Peers: p.Peers,
 		Members:     func(a string) bool { return members[a] },
 		SeriesOwner: func(c string) (string, bool) { d, ok := p.SeriesOwner[c]; return d, ok }}

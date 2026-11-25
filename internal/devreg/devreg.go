@@ -76,7 +76,8 @@ func (r *Registry) hubPack(tenant, device string) (hub.Pack, bool) {
 	if !ok || !cok {
 		return hub.Pack{}, false
 	}
-	p := hub.Pack{Tenant: tenant, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID, Kid: cred.Cred.Kid, Cred: cred, PKCS8: pkcs8,
+	jws, _ := r.ID.LANCredential(device)
+	p := hub.Pack{Tenant: tenant, Outlet: cred.Cred.OutletID, Brand: cred.Cred.BrandID, Kid: cred.Cred.Kid, Cred: cred, CredJWS: jws, PKCS8: pkcs8,
 		IdentityPub: sp.EncodePub(r.ID.IdentityPub()), CloudKeys: map[string]string{r.ID.CloudKey.Kid: r.ID.CloudKey.PublicB64()},
 		Members: r.ID.MembersOfOutlet(tenant, cred.Cred.OutletID), SeriesOwner: map[string]string{}, CloudURL: r.CloudURL}
 	for _, c := range r.ID.Devices(tenant, cred.Cred.OutletID) {

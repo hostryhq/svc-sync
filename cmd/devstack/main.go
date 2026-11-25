@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -64,8 +65,8 @@ func main() {
 	cloudURL := serve(ctx, *cloudAddr, mux)
 
 	fx := map[string]any{"cloud_url": cloudURL, "tenant_id": tenant, "outlet_id": outlet,
-		"identity_pub": sp.EncodePub(id.IdentityPub()),
-		"cloud_keys":   map[string]string{id.CloudKey.Kid: id.CloudKey.PublicB64()}}
+		"identity_pub": sp.EncodePub(id.IdentityPub()), "identity_kid": id.Key.Kid,
+		"cloud_keys": map[string]string{id.CloudKey.Kid: id.CloudKey.PublicB64()}}
 
 	var devices []map[string]any
 	var peers []sp.CredentialEnvelope
@@ -80,8 +81,12 @@ func main() {
 		id.IssuePack(tenant, name, 1, 30*24*time.Hour)
 		pk, err := x509.MarshalPKCS8PrivateKey(kp.Priv)
 		check(err)
+		jws, ok := id.LANCredential(name)
+		if !ok {
+			log.Fatal("no LAN credential for " + name)
+		}
 		devices = append(devices, map[string]any{"device_id": name, "kid": kp.Kid, "pub": kp.PublicB64(),
-			"pkcs8": base64.RawURLEncoding.EncodeToString(pk), "cred": cred,
+			"pkcs8": base64.RawURLEncoding.EncodeToString(pk), "cred": cred, "cred_jws": jws,
 			"token":  issuer.Mint(authtest.Spec{Type: auth.TypeDevice, Tenant: ids.ID(tenant), Device: name, TTL: 14 * time.Minute}),
 			"series": []map[string]string{{"code": sale, "docType": "tax_invoice", "state": "active"}, {"code": cn, "docType": "credit_note", "state": "active"}}})
 	}
@@ -91,10 +96,14 @@ func main() {
 	check(err)
 	hubCred, err := id.Activate(tenant, outlet, brand, "hub-01", sp.KindHub, hubKey, "")
 	check(err)
-	fx["hub"] = map[string]any{"cred": hubCred}
+	hubJWS, ok := id.LANCredential("hub-01")
+	if !ok {
+		log.Fatal("no LAN credential for the hub")
+	}
+	fx["hub"] = map[string]any{"cred": hubCred, "cred_jws": hubJWS}
 	hst, err := repository.Open(":memory:")
 	check(err)
-	h, err := hub.New(ctx, hub.Config{Tenant: tenant, Outlet: outlet, Brand: brand, Cred: hubCred, Key: hubKey, IdentityPub: id.IdentityPub(),
+	h, err := hub.New(ctx, hub.Config{Tenant: tenant, Outlet: outlet, Brand: brand, Cred: hubCred, CredJWS: hubJWS, Key: hubKey, IdentityPub: id.IdentityPub(),
 		CloudKeys: map[string]*hub.PubKey{id.CloudKey.Kid: &id.CloudKey.Priv.PublicKey}, Store: hst, Now: now, Peers: peers,
 		Members:     func(a string) bool { return id.InAnyPackOf(tenant, outlet, a) },
 		SeriesOwner: func(c string) (string, bool) { s, ok := id.Series(tenant, c); return s.Device, ok }})
@@ -105,7 +114,7 @@ func main() {
 	}}
 	h.SetUpstream(up)
 	go h.RunUpstream(ctx, 500*time.Millisecond)
-	fx["hub_url"] = serve(ctx, *hubAddr, h.Handler())
+	fx["hub_url"] = serveTLS(ctx, *hubAddr, h)
 
 	hpk, err := x509.MarshalPKCS8PrivateKey(hubKey.Priv)
 	check(err)
@@ -132,6 +141,16 @@ func serve(ctx context.Context, addr string, h http.Handler) string {
 	go func() { _ = srv.Serve(ln) }()
 	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
 	return "http://" + ln.Addr().String()
+}
+
+// serveTLS serves the hub over TLS 1.3 with its in-memory self-signed certificate (ADR-0002 A3.1); devices prove it by hello.
+func serveTLS(ctx context.Context, addr string, h *hub.Hub) string {
+	ln, err := net.Listen("tcp", addr)
+	check(err)
+	srv := &http.Server{Handler: h.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(tls.NewListener(ln, h.TLSConfig())) }()
+	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
+	return "https://" + ln.Addr().String()
 }
 
 func check(err error) {
