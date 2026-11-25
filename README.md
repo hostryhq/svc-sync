@@ -25,5 +25,5 @@ Hub: `SYNC_HUB_PACK`, `SYNC_HUB_DB`, `SYNC_HUB_ADDR`, `SYNC_HUB_CLOUD_TOKEN_FILE
 
 ## Local development
 
-`go.work` is uncommitted (git-ignored) and lists `.`, `../go-common`, `../go-auth`. `go.mod` pins both by pseudo-version.
+`go.work` is uncommitted (git-ignored) and lists `.`, `../go-common`, `../go-auth` for local development; the build does not need it (`GOWORK=off go build ./...`): `go.mod` pins both by pseudo-version.
 No deployment exists (ADR-0001 AM12).

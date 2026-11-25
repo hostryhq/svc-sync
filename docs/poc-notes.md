@@ -76,14 +76,59 @@ inconsistent, the conservative choice is listed under "Choices".
 - **A2.4** the gateway uses `go-common/restore` (Reader once at start, `restore_state` table, `Guard` with a hook for the new
   cloud origin, `/readyz` through `Guard().Check`); `platform_meta` and `gateway_state` are no longer read. Development and
   the simulator stamp an epoch through `devepoch` (wraps `restoretest`).
-- Residuals and open items: a released placeholder that arrives without an endorsement is taken by hash alone (as before A2); hubs refresh stale endorsements only through `placeholders`, and stale cloud seals
-  of a hub after a rotation are not refreshed (a node with only the new key reads from the cloud); `go.mod` still pins
-  go-common by pseudo-version (`go.work` supplies the local copy) and must be bumped to the merged `restore` commit.
+- Residuals and open items: see "Fix wave" below (the by-hash residual and the stale-seal gap are now bound by the A2.8 rules).
 - **Intent registry mapping (follow-up, not done in this pass):** the canonical registry is now
   `api-specs-p2/sync/intents/` (README maps the PoC names). `syncproto/intents.go` still uses PoC names and the permissions
   `bill.refund`, `payment.take`, `kds.update`, `menu.edit`, `stock.adjust`, which are not catalogue keys. The mapping touches the
   simulator's device ops and the contract suite as well, so it is a separate change: replace the table by one generated
   from the YAML files and map the demo names the TypeScript client uses.
+
+## Fix wave after the Phase 1 reviews (2026-11-25)
+
+Build: `go.mod` pins go-common 732c3b1 and go-auth b19b540; `GOWORK=off go build ./...` works (review M4, L6 pin).
+
+**Manager and vendor endpoints (code review H2).** Every route is registered through `go-auth` `Guard` with a policy
+(`api/admin.go`), on a catalogue that holds the permissions below until `api-specs/common/permissions.yaml` does. Support
+tokens need the `admin` service token and never carry `*`, sensitive, strong-only or owner-grant permissions; vendor access
+is in `vendor_access_log` (same transaction as the action, refusals in their own); lists and decisions are narrowed to the
+caller's outlets (another outlet's slot is 404; a brand or tenant stream needs an all-outlets grant); release, discard and
+confirm need a reason and write `audit_log` (actor, slot, reason, status before and after) in the same transaction as the
+status change; bodies are limited to 4 KiB (L4). Step-up: none added (the ADR-0005 A2 step-up list is closed); caution applies
+through `device.recover` (`strong_only`, checked when an unsealed tail is released: `approval_required` on a new device).
+
+Permissions to add to the catalogue (key, service, flags):
+
+| key | service | flags |
+|---|---|---|
+| `sync.quarantine.read` | sync | `support_viewable` |
+| `sync.exceptions.read` | sync | `support_viewable` (also guards the alerts list; vendor-audience alerts show to a support session only) |
+| `sync.register.read` | sync | `support_viewable` |
+| `sync.quarantine.manage` | sync | `sensitive` (release and discard; reason and audit record) |
+| `sync.quarantine.confirm` | sync | `support_actable` (Hostry's confirmation of a chain-broken, foreign-series or fork hold; the handler also refuses a non-support token) |
+| `device.recover` | identity | `sensitive`, `strong_only`, `owner_grant` (ADR-0002 A1.3) |
+
+Open for the security reviewer: `sync.quarantine.confirm` as the first `support_actable` permission (ADR-0005 A2.5 asks each
+product spec to propose and the reviewer to sign); and whether release should be `strong_only` rather than `sensitive`
+(a manager could not then release on a new device for 24 hours, which would be the simplest answer to "SIM-swapped manager
+releases a held bill"). The permission names `sync.quarantine.read` and `confirm` are new; the three old names are unchanged.
+
+**Placeholders, binding and conflicts (ADR-0002 A2.8, security ruling 4).** `engine/binding.go`, `contract/README.md`.
+Hubs and peers serve and accept no placeholder above an origin's sealed head (only the cloud does); a body over a held
+placeholder is checked against the hash held, the op below, a seal that names the slot and the op above, else marked
+`unbound`; unbound ops are never relayed; every direct cloud `hello` lists them and the gateway answers with its own hash;
+a contradiction is `chain_conflict` (refused, recorded, origin gated from that kind of upstream, reported at the next direct
+cloud `hello`, one vendor alert per slot). `DirectCloudDue` tells the app when to reach the cloud directly (24 hours, an
+unbound slot, an unreported conflict or a refused cloud seal). Seals that name placeholder slots are now stored and served.
+Stale cloud seals are refreshed by relays (`stale_seals` / `seal_refresh`); seal verification is under the named `kid`
+only (review L8). The signed body's `tenant_id` must be the node's tenant (review M3). Tests: `engine/a28_test.go` (PH1,
+PH2, PH3, KR1, M3, L8) and the simulator (300 seeds, all hazards).
+Not done here: the TypeScript engine in `client-core-sync` has none of this yet (hash-only promotion, trailing placeholders
+from any upstream, no `unbound`, `chain_conflict` or `stale_seals`); it must follow the same rules and the shared vectors
+before the `client-core` sync PR merges. The simulator does not yet script a lying hub end to end; the engine cases do.
+
+**Other.** Startup refuses a Postgres role that is a superuser or has BYPASSRLS (`CheckAppRole`; integration case). A
+non-UUID tenant on the outbox path is refused instead of silently skipping the event (L5). mDNS TXT values are bounded and
+fuzzed (L6); the discovery test runs on request only (L8). Sync contract still not in `api-specs` (M5): open.
 
 ## Not built (out of scope or later)
 
