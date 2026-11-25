@@ -363,7 +363,10 @@ func (s *State) Detect() []Violation {
 		if out[i].Kind != out[j].Kind {
 			return out[i].Kind < out[j].Kind
 		}
-		return out[i].Key < out[j].Key
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].Detail < out[j].Detail
 	})
 	return out
 }

@@ -2,6 +2,7 @@ package sim
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -119,7 +120,7 @@ func (w *World) CheckAll(ctx context.Context, exp *Expectations) []Problem {
 			bad("state-hash", "%s state hash differs from cloud (%d rows vs %d)", n.name, n.st.RowCount(), cs.RowCount())
 		}
 		if h := n.st.DetectorHash(); h != wantDet {
-			bad("detectors", "%s detector output differs from cloud", n.name)
+			bad("detectors", "%s detector output differs from cloud: %s", n.name, violDiff(n.st.Detect(), cs.Detect()))
 		}
 		if p := sumPayments(n.st); p != wantPay {
 			bad("payments", "%s payment total %d != cloud %d", n.name, p, wantPay)
@@ -310,4 +311,29 @@ func slotDetail(cloud map[string]repository.OpRec, node, cvec sp.Vector) string 
 	}
 	sort.Strings(out)
 	return " {" + strings.Join(out, ", ") + "}"
+}
+
+func violDiff(node, cloud []engine.Violation) string {
+	set := func(vs []engine.Violation) map[string]bool {
+		m := map[string]bool{}
+		for _, v := range vs {
+			b, _ := json.Marshal(v)
+			m[string(b)] = true
+		}
+		return m
+	}
+	a, b := set(node), set(cloud)
+	var out []string
+	for k := range a {
+		if !b[k] {
+			out = append(out, "only on node "+k)
+		}
+	}
+	for k := range b {
+		if !a[k] {
+			out = append(out, "only at cloud "+k)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, "; ")
 }

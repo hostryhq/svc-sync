@@ -370,7 +370,7 @@ func (r *runner) inject(ctx context.Context, step int) error {
 		it, err := d.BillOp(rng)
 		add(it, err, repository.StFlagged, "")
 	case 6: // a last-writer-wins edit stamped far ahead of the receiver: held for review
-		d.Skew = 3 * time.Hour
+		d.Skew = 36 * time.Hour
 		it, err := d.PriceOp(rng)
 		d.Skew = 0
 		add(it, err, repository.StQuarantined, service.ReasonClockReview)
