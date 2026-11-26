@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,6 +168,48 @@ func TestLT1_ARelayWithItsOwnCertificateGetsNoSession(t *testing.T) {
 		t.Fatalf("nothing but hello may be sent before the hub is proven: %v", paths)
 	}
 	if f.hub.SessionCount() != 0 {
+		t.Fatal("no session token may exist")
+	}
+}
+
+// LT1b: a relay on the second connection only. The hello goes to the real hub, the connection that opens the session shows another
+// certificate key: the device refuses it before it writes the proof, so no relay receives the proof or a token (P2R-L1).
+func TestLT1b_AHubThatSwapsItsCertificateBetweenTheStepsIsRefused(t *testing.T) {
+	f := newFixture(t)
+	other := f.startHub() // a hub with its own TLS key: the second connection's certificate
+	var conns atomic.Int32
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		if conns.Add(1) == 1 {
+			return f.hub.TLSConfig(), nil
+		}
+		return other.TLSConfig(), nil
+	}}
+	var paths []string
+	var mu sync.Mutex
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		f.hub.Handler().ServeHTTP(w, r)
+	}), ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(tls.NewListener(ln, cfg)) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	c := f.device("dev-pos", sp.KindPOS, sp.StoreProtected)
+	_, _, err = get(&http.Client{Transport: c.RoundTripper()}, "https://"+ln.Addr().String()+"/sync/v1/snapshot")
+	if err == nil || !errors.Is(err, hub.ErrHubProof) {
+		t.Fatalf("the device must refuse a hub whose key changed between the steps: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 1 || paths[0] != "/sync/v1/lan/hello" {
+		t.Fatalf("only the hello may reach the server; the proof must not be written on the swapped connection: %v", paths)
+	}
+	if f.hub.SessionCount() != 0 || other.SessionCount() != 0 {
 		t.Fatal("no session token may exist")
 	}
 }

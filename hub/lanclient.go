@@ -44,6 +44,7 @@ type LANClient struct {
 	exp      time.Time
 	proven   atomic.Value // string: the spki of the proven hub
 	handshak atomic.Bool
+	pin      atomic.Value // string: the spki of the step 1 connection, held while step 2 runs (P2R-L1)
 }
 
 // NewLANTransport is the HTTP transport of a device that talks TLS 1.3 to a hub: it accepts any certificate, because the
@@ -56,7 +57,11 @@ func NewLANTransport(c *LANClient) *http.Transport {
 				if len(cs.PeerCertificates) == 0 {
 					return ErrHubProof
 				}
-				if want, _ := c.proven.Load().(string); want != "" && !c.handshak.Load() && sp.SPKIOf(cs.PeerCertificates[0]) != want {
+				want, _ := c.proven.Load().(string)
+				if c.handshak.Load() {
+					want, _ = c.pin.Load().(string) // empty during step 1: that connection is what the proofs bind
+				}
+				if want != "" && sp.SPKIOf(cs.PeerCertificates[0]) != want {
 					return ErrHubProof
 				}
 				return nil
@@ -174,7 +179,8 @@ func (c *LANClient) post(ctx context.Context, base *http.Request, path string, i
 
 func (c *LANClient) handshake(base *http.Request) (string, error) {
 	c.handshak.Store(true)
-	defer c.handshak.Store(false)
+	c.pin.Store("")
+	defer func() { c.handshak.Store(false); c.pin.Store("") }()
 	ctx := base.Context()
 	nonceD, err := sp.NewNonce()
 	if err != nil {
@@ -191,6 +197,7 @@ func (c *LANClient) handshake(base *http.Request) (string, error) {
 	if json.Unmarshal(b, &hello) != nil || !sp.ValidNonce(hello.NonceH) {
 		return "", ErrHubProof
 	}
+	step1 := seen // the key the connection of step 1 really showed
 	if c.SPKISeen != nil {
 		seen = c.SPKISeen()
 	}
@@ -206,6 +213,7 @@ func (c *LANClient) handshake(base *http.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	c.pin.Store(step1) // step 2 must reach the same key: a relay on that connection alone would otherwise get the proof and the token
 	resp, b, _, err = c.post(ctx, base, "/sync/v1/lan/session", sp.LanSessionRequest{NonceD: nonceD, NonceH: hello.NonceH, DeviceProof: proof})
 	if err != nil {
 		return "", err
