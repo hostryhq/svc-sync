@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/hostryhq/svc-sync/hub"
 	"github.com/hostryhq/svc-sync/repository"
@@ -43,7 +42,7 @@ func filePack(ctx context.Context, get func(string) string, log *slog.Logger) (*
 	if err != nil {
 		return nil, true, err
 	}
-	cfg.Store, cfg.Now, cfg.Log = st, time.Now, log
+	cfg.Store, cfg.Now, cfg.Log = st, hubNow, log
 	cfg.PIIToUnprotected = get("SYNC_HUB_DEV_PII_LIFT") == "1"
 	h, err := hub.New(ctx, cfg)
 	if err != nil {

@@ -113,3 +113,12 @@ Contract api-specs-p2 `17de74f`; identity `d51e743` (hub packs). `docs/poc-notes
   `sim/emit_429_test.go`; `engine/entities_gen.go` regenerated for `credit_note.replacement_total_paise`.
 - `identityreal/` is pinned to svc-identity `d51e743` (pack `issuer_env`, identity-key pack JWS, hub peers); HP1 and HP2 pass against it.
 - HS1 (column encryption on DPAPI) needs a Windows PC (pilot gate).
+
+## Soak run-5 findings (F26, dev hub clock)
+
+- **F26** `keyprotect.NewDev`: a key file the provider created itself was seeded from the raw random bytes, while the next process hashed the base64 text it read back, so the next process could not unwrap. The seed is now the persisted text. The dev provider stays non-production (`store: unprotected`, refused outside HOSTRY_ENV dev, test, ci).
+- **Dev hub clock (T6 age cases, T13 stale blackout ticket).** `SYNC_HUB_DEV_CLOCK_ADDR=127.0.0.1:<port>` makes `cmd/hub` serve `/dev/clock` (plain HTTP, loopback host only) and use wall time plus an offset as the hub's clock (`hub.Config.Now`). The hub refuses to start with it unless HOSTRY_ENV is dev, test or ci, or if the host is not loopback. Unset, the hub uses `time.Now` and serves nothing extra.
+  - `GET /dev/clock` returns `{"now":"<RFC 3339>","offset_seconds":n}`.
+  - `POST /dev/clock` with exactly one of `{"offset_seconds":n}` (set; 0 returns to wall time) or `{"advance_seconds":n}` (add). Anything else is 400.
+  - Harness use: for the stale ticket, print the ticket, `POST {"advance_seconds":1500}` (25 minutes, past the 15-minute limit), let the hub list it, then `POST {"offset_seconds":0}`. The clock keeps ticking while offset, so only the hub's own age judgments move.
+  - Limits: identity and the gateway still judge tokens and credentials on wall time. Keep the offset within the hub credential's validity and reset it before the devices' next sync, or the devices' clock correction follows the hub (the run-5 trial that let the clock lead 25 minutes for a whole step broke convergence). The gateway has no clock control; the S6 approval window still waits in real time.

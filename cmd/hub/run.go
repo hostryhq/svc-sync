@@ -47,7 +47,7 @@ func identityNode(ctx context.Context, log *slog.Logger, get func(string) string
 	}
 	key.Kid = pack.Cred.Kid
 	cfg := hub.Config{Tenant: pack.Tenant, Outlet: pack.Outlet, Brand: pack.Brand, Cred: sp.CredentialEnvelope{Cred: pack.Cred}, CredJWS: pack.CredJWS, Key: key,
-		IdentityPub: pack.IdentityKeys[0], CloudKeys: map[string]*hub.PubKey{pack.OpKid: pack.OpKey}, Store: store, Now: time.Now, Log: log,
+		IdentityPub: pack.IdentityKeys[0], CloudKeys: map[string]*hub.PubKey{pack.OpKid: pack.OpKey}, Store: store, Now: hubNow, Log: log,
 		PIIToUnprotected: piiLift(get)}
 	if len(pack.IdentityKeys) > 1 {
 		cfg.IdentityNext = pack.IdentityKeys[1]
@@ -89,6 +89,14 @@ func run(log *slog.Logger, get func(string) string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	now, clockAddr, err := devClock(ctx, get)
+	if err != nil {
+		return err
+	}
+	hubNow = now
+	if clockAddr != "" {
+		log.Warn("DEV CLOCK is on: the hub clock can be moved at /dev/clock; dev, test and ci only", "addr", clockAddr)
+	}
 	n, ok, err := filePack(ctx, get, log)
 	if err != nil {
 		return err
