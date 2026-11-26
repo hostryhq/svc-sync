@@ -14,6 +14,14 @@ func TestRealGatewayPassesTheSharedContractSuite(t *testing.T) {
 	n := 0
 	suite.Run(t, suite.Target{
 		Handler: w.CloudH, Tenant: w.Tenant, Outlet: w.Outlet, Now: w.Clock.Now,
+		Brand: w.Brand,
+		ServiceToken: func(caller, tenant string) string {
+			tok, err := w.Services.Signer(caller).Sign("sync", tenant)
+			if err != nil {
+				panic(err)
+			}
+			return tok
+		},
 		IdentityPub: w.Identity.IdentityPub(), CloudPub: &w.Identity.CloudKey.Priv.PublicKey,
 		NewPOS: func() (suite.Dev, error) {
 			n++

@@ -61,7 +61,7 @@ func (w *World) CloudState(ctx context.Context) (*engine.State, sp.Vector, error
 				continue
 			}
 			h, _ := sp.ParseHLC(b.HLC)
-			st.Apply(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts)
+			st.ApplyPII(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts, b.PIIC)
 		}
 		return nil
 	})
@@ -99,6 +99,7 @@ func (w *World) Quiesce(ctx context.Context, maxRounds int) QuiesceReport {
 		if w.Hub != nil {
 			_, _ = w.Hub.SyncUpstream(ctx)
 		}
+		_ = w.GW.MaintainOnce(ctx) // the gateway's worker: pending proofs asked again, waiting configuration judged again
 		sig := w.signature(ctx)
 		if os.Getenv("SYNC_DEBUG") != "" && w.HubUp != nil && len(w.Hub.LastRefused()) > 0 {
 			fmt.Printf("round %d hub refused: %+v\n", r, w.Hub.LastRefused()[:min(3, len(w.Hub.LastRefused()))])

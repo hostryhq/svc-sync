@@ -1,11 +1,15 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +54,8 @@ type Caller struct {
 	Brand  string
 	// Drain is set for a drain or recovery-drain token (quarantine-upload only).
 	Drain bool
+	// Store is the caller's credential store claim (protected or unprotected).
+	Store string
 	// Recovers is the old origin a recovery drain token is limited to.
 	Recovers string
 	RecID    string
@@ -60,6 +66,9 @@ type Parsed struct {
 	Item   sp.Item
 	Body   sp.Body
 	Opaque bool // body hashes correctly but is not a valid op body
+	// PIIDropped counts pii fields of the item that did not match their commitment (syncproto/piic.go);
+	// Item.PII holds only the verified fields once the node has opened it.
+	PIIDropped int
 }
 
 // Verdict is the outcome for one op (S11).
@@ -129,7 +138,12 @@ type SeriesSource interface {
 
 // Config builds an Engine.
 type Config struct {
-	Role   Role
+	// Entropy is the source of pii salts (default crypto/rand); the simulator injects a seeded one.
+	Entropy io.Reader
+	Role    Role
+	// Kind is this node's credential kind (pos, waiter, personal, kds, hub); empty for the cloud. It decides whether the
+	// node expects the pii values of ops that carry commitments (ADR-0014 A3.1 item 4).
+	Kind   string
 	Tenant string
 	Outlet string
 	// Origin is this node's own origin id: the device id, or cloud-<epoch>. Empty for a hub that
@@ -143,6 +157,9 @@ type Config struct {
 	Series SeriesSource
 	// NoState skips the materialised state (the cloud keeps only the op log and verdicts).
 	NoState bool
+	// PIIToUnprotected lifts the placement rule of ADR-0002 A3.5 item 2 so an unprotected puller also receives another
+	// origin's pii. Only the dev, test and ci binaries may set it (the commands check HOSTRY_ENV).
+	PIIToUnprotected bool
 	// MaxAhead bounds the clock drift an observed stamp may drag the local clock by.
 	MaxAhead time.Duration
 }
@@ -255,7 +272,7 @@ func (e *Engine) applyBody(b sp.Body) {
 		return
 	}
 	h, _ := sp.ParseHLC(b.HLC)
-	e.st.Apply(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts)
+	e.st.ApplyPII(sp.Ref{Origin: b.Origin, Stream: b.Stream, Seq: b.Seq}, h, b.Muts, b.PIIC)
 	if b.Intent == sp.IntentVoid {
 		e.applyVoid(b)
 	}
@@ -268,9 +285,11 @@ type Input struct {
 	IntentV  int
 	Actor    string
 	SID      string
-	PackV    string
+	PackV    int
 	Approval string
 	Proof    string
+	// PinV accompanies Proof (session.open of a pin session, approval.grant; ADR-0005 A3.1).
+	PinV int
 	// DocType allocates the next legal number of the device's series for this document type.
 	DocType string
 	// Muts builds the mutations; number is the allocated legal number (empty without DocType).
@@ -303,6 +322,14 @@ func (e *Engine) Record(ctx context.Context, in Input) (sp.Item, error) {
 	}
 	e.applyBody(body)
 	return item, nil
+}
+
+// InTxLocked runs fn in one transaction of this node's tenant while holding the engine's write lock,
+// so that cloud-origin ops recorded in it (emit, erasure) cannot race an ingest for the next seq.
+func (e *Engine) InTxLocked(ctx context.Context, fn func(tx repository.Tx) error) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.Store.InTx(ctx, e.cfg.Tenant, fn)
 }
 
 // RecordTx is Record inside an existing transaction (the gateway emits voids in the verdict
@@ -347,7 +374,7 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	}
 	b := sp.Body{
 		V: 1, Origin: origin, Stream: in.Stream, Seq: seq + 1, PH: ph, HLC: e.cfg.Clock.Next().String(), Clk: in.Clk,
-		TenantID: e.cfg.Tenant, Actor: in.Actor, SID: in.SID, PackV: in.PackV, Approval: in.Approval, Proof: in.Proof,
+		TenantID: e.cfg.Tenant, Actor: in.Actor, SID: in.SID, PackV: in.PackV, Approval: in.Approval, Proof: in.Proof, PinV: in.PinV,
 		Intent: in.Intent, IntentV: in.IntentV, At: at.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 	if b.Clk == "" {
@@ -377,8 +404,42 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	if in.MutsFn != nil {
 		b.Muts = in.MutsFn(number)
 	}
-	item, err := sp.NewItem(b, in.PII)
+	var piiWire json.RawMessage
+	if len(in.PII) > 0 {
+		var values sp.PII
+		dec := json.NewDecoder(bytes.NewReader(in.PII))
+		dec.UseNumber()
+		if err := dec.Decode(&values); err != nil {
+			return sp.Item{}, sp.Body{}, fmt.Errorf("engine: pii must be entity -> row id -> field -> value: %w", err)
+		}
+		for _, rows := range values {
+			for _, fields := range rows {
+				for k, v := range fields {
+					if n, ok := v.(json.Number); ok {
+						x, err := n.Int64()
+						if err != nil {
+							return sp.Item{}, sp.Body{}, fmt.Errorf("engine: pii field %q is not an integer", k)
+						}
+						fields[k] = x
+					}
+				}
+			}
+		}
+		var commits sp.PIICommit
+		piiWire, commits, err = sp.CommitPII(values, e.cfg.Entropy)
+		if err != nil {
+			return sp.Item{}, sp.Body{}, err
+		}
+		b.PIIC = commits
+		if err := sp.CheckSize(0, len(piiWire)); err != nil {
+			return sp.Item{}, sp.Body{}, err
+		}
+	}
+	item, err := sp.NewItem(b, piiWire)
 	if err != nil {
+		return sp.Item{}, sp.Body{}, err
+	}
+	if err := sp.CheckSize(len(item.Body), 0); err != nil {
 		return sp.Item{}, sp.Body{}, err
 	}
 	// Re-decode so the applied body is exactly what peers will derive from the bytes.
@@ -391,8 +452,8 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 	if err := tx.PutOp(rec); err != nil {
 		return sp.Item{}, sp.Body{}, err
 	}
-	if len(in.PII) > 0 {
-		if err := tx.PutPII(in.Stream, origin, b.Seq, string(in.PII)); err != nil {
+	if len(piiWire) > 0 {
+		if err := tx.PutPII(in.Stream, origin, b.Seq, string(piiWire)); err != nil {
 			return sp.Item{}, sp.Body{}, err
 		}
 	}
@@ -400,7 +461,7 @@ func (e *Engine) recordTx(tx repository.Tx, in Input) (sp.Item, sp.Body, error) 
 		for _, m := range b.Muts {
 			if m.E == "session" {
 				st, _ := m.F["type"].(string)
-				if err := tx.PutSession(origin, m.ID, st); err != nil {
+				if err := tx.PutSession(origin, m.ID, st, b.At); err != nil {
 					return sp.Item{}, sp.Body{}, err
 				}
 			}
@@ -522,6 +583,9 @@ type OutboundOpts struct {
 	// Reoffer is set while the node's re-offer is open (A2.2): endorsed ops the upstream's vector
 	// counts are offered again with their endorsements.
 	Reoffer bool
+	// ResendPII offers the ops this node holds pii values for again to the cloud, for a day after a cloud restore: a relay
+	// that held no values may have given the cloud an op first (ADR-0014 A3.1 item 2).
+	ResendPII bool
 }
 
 // Outbound builds the push for an upstream whose vector is up: for each (origin, stream) the ops
@@ -594,7 +658,13 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 				if r.Body == "" || (!own && hasMarkS(r.Marks, MarkUnbound)) {
 					break // cannot offer a slot known only by hash; the body holder must. An unbound op is never relayed (A2.8 item 1.3).
 				}
-				req.Items = append(req.Items, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
+				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body}
+				if pii, ok, err := tx.GetPII(r.Stream, r.Origin, r.Seq); err != nil {
+					return err
+				} else if ok {
+					it.PII = json.RawMessage(pii) // the verified values with their salts; erased ones are gone
+				}
+				req.Items = append(req.Items, it)
 				n++
 			}
 			if n == 0 {
@@ -629,6 +699,11 @@ func (e *Engine) Outbound(ctx context.Context, up sp.Vector, o OutboundOpts) (sp
 				req.Attestations = append(req.Attestations, b.Atts...)
 			}
 			budget -= n
+		}
+		if o.ResendPII || o.Reoffer {
+			if err := e.reofferPII(tx, up, o, &req); err != nil {
+				return err
+			}
 		}
 		if o.Reoffer {
 			return e.reofferEndorsed(tx, up, o, &req)
@@ -733,6 +808,44 @@ func boundAt(tx repository.Tx, stream, origin string, after, cut int64) (*bound,
 		b.Atts = append(b.Atts, sp.Attestation{Origin: a.Origin, Stream: a.Stream, Seq: a.Seq, H: a.H, By: a.By, Rec: a.Rec, Kid: a.Kid, Sig: a.Sig})
 	}
 	return b, nil
+}
+
+// reofferPII adds, for a node whose re-offer is open, the ops this node holds pii values for that the upstream's vector already
+// counts. After a cloud restore the cloud may have taken such an op from a relay that held no values (a kds, a hub that was
+// wiped); only a node that holds them can complete it, and the upstream cannot ask. Ingest merges the verified fields into the
+// slot it holds (ADR-0014 A3.1 item 2, item 4).
+func (e *Engine) reofferPII(tx repository.Tx, up sp.Vector, o OutboundOpts, req *sp.PushRequest) error {
+	refs, err := tx.PIIRefs()
+	if err != nil {
+		return err
+	}
+	var extra []sp.Item
+	for _, k := range refs {
+		seq, _ := strconv.ParseInt(k[2], 10, 64)
+		stream, origin := k[0], k[1]
+		if (len(o.Streams) > 0 && !contains(o.Streams, stream)) || seq > up[sp.VKey(origin, stream)] || len(extra) >= o.Limit {
+			continue
+		}
+		if origin != e.cfg.Origin && !o.Others {
+			continue
+		}
+		r, ok, err := tx.GetOp(stream, origin, seq)
+		if err != nil {
+			return err
+		}
+		if !ok || r.Body == "" || (r.Status != repository.StAccepted && r.Status != repository.StFlagged) {
+			continue
+		}
+		it := sp.Item{Origin: origin, Stream: stream, Seq: seq, H: r.H, Body: r.Body}
+		if pii, ok, err := tx.GetPII(stream, origin, seq); err != nil {
+			return err
+		} else if ok {
+			it.PII = json.RawMessage(pii)
+		}
+		extra = append(extra, it)
+	}
+	req.Items = append(extra, req.Items...)
+	return nil
 }
 
 // reofferEndorsed adds, for a node whose re-offer is open (S16 item 4, A2.2), the endorsed ops the
@@ -895,7 +1008,17 @@ func groupItems(items []sp.Item) []*group {
 		}
 		g.items = append(g.items, it)
 	}
+	// Outlet streams first: a session.open is an outlet op, and the ops of its session in a brand or tenant stream
+	// are judged from the stored session row (ADR-0005 A3.1 item 3), so the row must exist when they are judged.
+	sort.SliceStable(out, func(i, j int) bool { return streamRank(out[i].stream) < streamRank(out[j].stream) })
 	return out
+}
+
+func streamRank(stream string) int {
+	if strings.HasPrefix(stream, "outlet:") {
+		return 0
+	}
+	return 1
 }
 
 // HoldCode maps a quarantine reason to the coarse code a device may be told (A1.2).
@@ -1008,6 +1131,11 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 		if !ok {
 			continue
+		}
+		if rec.H == it.H && !it.IsPlaceholder() && len(it.PII) > 0 && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) {
+			if err := e.refillPII(tx, it); err != nil {
+				return false, err
+			}
 		}
 		switch {
 		case rec.H == it.H && !it.IsPlaceholder() && rec.Status == repository.StQuarantined && e.cfg.Hooks.OnEndorsed != nil:
@@ -1130,6 +1258,16 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 			}
 			res.New = append(res.New, rec)
 			*apply = append(*apply, b)
+			// The values that come with a filled slot are verified and kept like those of any new op (ADR-0014 A3.1 item 2).
+			pf := &Parsed{Item: it, Body: b}
+			if len(it.PII) > 0 {
+				if err := e.openPII(tx, pf); err != nil {
+					return false, err
+				}
+			}
+			if err := e.notePIINeed(tx, it, pf); err != nil {
+				return false, err
+			}
 		}
 	}
 	if len(items) == 0 {
@@ -1358,6 +1496,14 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		if !p.Opaque {
 			rec.Intent, rec.HLC = p.Body.Intent, p.Body.HLC
 		}
+		if len(it.PII) > 0 {
+			if err := e.openPII(tx, p); err != nil {
+				return false, err
+			}
+		}
+		if err := e.notePIINeed(tx, it, p); err != nil {
+			return false, err
+		}
 		v := Verdict{Status: repository.StAccepted}
 		if e.cfg.Hooks.Verdict != nil {
 			v = e.cfg.Hooks.Verdict(tx, p, VerdictCtx{Caller: req.Caller, Own: own, Recovery: req.Recovery,
@@ -1387,11 +1533,6 @@ func (e *Engine) ingestGroup(tx repository.Tx, req IngestReq, g *group, seals ma
 		}
 		if err := e.storeOp(tx, &rec, &p.Body, v, res, apply, observed, p); err != nil {
 			return false, err
-		}
-		if len(it.PII) > 0 {
-			if err := tx.PutPII(it.Stream, it.Origin, it.Seq, string(it.PII)); err != nil {
-				return false, err
-			}
 		}
 	}
 	if req.FromUpstream && head > 0 && len(items) > 0 && !items[0].IsPlaceholder() {
@@ -1438,7 +1579,7 @@ func (e *Engine) storeOp(tx repository.Tx, rec *repository.OpRec, b *sp.Body, v 
 		for _, m := range b.Muts {
 			if m.E == "session" {
 				st, _ := m.F["type"].(string)
-				if err := tx.PutSession(rec.Origin, m.ID, st); err != nil {
+				if err := tx.PutSession(rec.Origin, m.ID, st, b.At); err != nil {
 					return err
 				}
 			}
@@ -1450,6 +1591,9 @@ func (e *Engine) storeOp(tx repository.Tx, rec *repository.OpRec, b *sp.Body, v 
 		}
 	}
 	if (v.Status == repository.StAccepted || v.Status == repository.StFlagged) && b != nil && !p.Opaque {
+		if err := ApplyErasure(tx, b); err != nil {
+			return err
+		}
 		*apply = append(*apply, *b)
 		if h, err := sp.ParseHLC(b.HLC); err == nil {
 			*observed = append(*observed, h)
@@ -1517,6 +1661,11 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H}
 				if r.Body != "" && (r.Status == repository.StAccepted || r.Status == repository.StFlagged) {
 					it.Body = r.Body
+					if e.piiTo(o.Caller, r.Origin) {
+						if it.PII, err = servedPII(tx, r); err != nil {
+							return err
+						}
+					}
 				}
 				resp.Items = append(resp.Items, it)
 				budget--
@@ -1545,7 +1694,13 @@ func (e *Engine) Serve(ctx context.Context, req sp.PullRequest, o ServeOpts, cre
 				return err
 			}
 			if ok && rec.Body != "" && (rec.Status == repository.StAccepted || rec.Status == repository.StFlagged) && (e.cfg.Role == RoleCloud || !hasMarkS(rec.Marks, MarkUnbound)) {
-				resp.Items = append(resp.Items, sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body})
+				rel := sp.Item{Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, H: rec.H, Body: rec.Body}
+				if e.piiTo(o.Caller, rec.Origin) {
+					if rel.PII, err = servedPII(tx, rec); err != nil {
+						return err
+					}
+				}
+				resp.Items = append(resp.Items, rel)
 				if en, ok, err := tx.GetEndorsement(rec.Stream, rec.Origin, rec.Seq); err != nil {
 					return err
 				} else if ok {
@@ -1773,7 +1928,13 @@ func (e *Engine) RecoveryUpload(ctx context.Context, old string, up sp.Vector, l
 			}
 			last := after
 			for _, r := range recs {
-				req.Items = append(req.Items, sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body})
+				it := sp.Item{Origin: r.Origin, Stream: r.Stream, Seq: r.Seq, H: r.H, Body: r.Body}
+				if pii, ok, err := tx.GetPII(r.Stream, r.Origin, r.Seq); err != nil {
+					return err
+				} else if ok {
+					it.PII = json.RawMessage(pii) // the adopter's copy of the values goes with the op (ADR-0014 A3.1 item 2)
+				}
+				req.Items = append(req.Items, it)
 				last = r.Seq
 			}
 			seals, err := tx.SealSeqs(h.Stream, old, after)

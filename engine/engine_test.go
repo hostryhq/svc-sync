@@ -41,9 +41,9 @@ func (v *env) node(role Role, id, kind string) *node {
 	}
 	v.t.Cleanup(func() { _ = st.Close() })
 	kp, _ := sp.NewKeyPair("k-"+id, nil)
-	cred, _ := sp.SignCredential(v.identity, sp.Credential{DeviceID: id, TenantID: v.tenant, OutletID: v.outlet, Kind: kind, Kid: kp.Kid, Pub: kp.PublicB64(), NotAfter: v.now.Add(time.Hour).Unix()})
+	cred, _ := sp.SignCredential(v.identity, sp.Credential{DeviceID: id, TenantID: v.tenant, OutletID: v.outlet, Kind: kind, Kid: kp.Kid, Pub: kp.PublicB64(), Store: sp.StoreProtected, NotAfter: v.now.Add(time.Hour).Unix()})
 	cache := NewCredCache(&v.identity.Priv.PublicKey, v.tenant, v.outlet, func() time.Time { return v.now })
-	cfg := Config{Role: role, Tenant: v.tenant, Outlet: v.outlet, Origin: id, Key: kp, Store: st, Trust: cache,
+	cfg := Config{Role: role, Kind: kind, Tenant: v.tenant, Outlet: v.outlet, Origin: id, Key: kp, Store: st, Trust: cache,
 		Clock: sp.NewClock(func() time.Time { return v.now }), Series: fixedSeries{"A07"}}
 	e := New(cfg)
 	if err := e.Open(context.Background()); err != nil {

@@ -292,7 +292,7 @@ func TestKL5_OldKeyHolderIsRefusedAndItsDrainBecomesAForkNeitherSideReleasable(t
 	clone := engine.New(engine.Config{Role: engine.RoleDevice, Tenant: w.Tenant, Outlet: w.Outlet, Origin: old, Key: oldKey, Store: st, Trust: a.Cache,
 		Clock: sp.NewClock(w.Clock.Now), Series: seriesSrc{&Device{saleCode: "AAA"}}})
 	for i := 0; i < 4; i++ {
-		must(clone.Record(bg, engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pCashier, PackV: "v1",
+		must(clone.Record(bg, engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pCashier, PackV: 1,
 			Muts: []sp.Mut{{E: "stock_level", ID: "forked", K: sp.KDelta, F: map[string]any{"qty_milli": int64(i + 1)}}}}))
 	}
 	req := must(clone.Outbound(bg, sp.Vector{}, engine.OutboundOpts{}))
@@ -397,8 +397,8 @@ func TestKL9_UnsealedOpsKeepTheirAttributionAndTheUnsealedMark(t *testing.T) {
 	w, _ := newTestWorld(t, 38, WorldOptions{Pos: 2})
 	a := w.Devices[0]
 	old := a.ID
-	good := stockOp(t, a, w.Identity.MintProof(a.ID, pCashier))
-	bad := stockOp(t, a, "bogus-proof")
+	good := stockOp(t, a)
+	bad := stockOpBad(t, a)
 	a.LoseKey()
 	rc := must(w.RecoverDevice(a, true))
 	w.uploadAll(t, a, rc)
@@ -493,7 +493,7 @@ func TestRestore_NewEpochNoIdentityReuseAndLostWindowOpsComeBack(t *testing.T) {
 		must(a.OrderOp(rng))
 	}
 	must(a.BillOp(rng))
-	em := must(w.GW.Emit(bg, w.Tenant, "brand:"+w.Brand, "cloud.emit",
+	em := must(w.GW.RecordCloudOp(bg, w.Tenant, "brand:"+w.Brand, "cloud.emit",
 		[]sp.Mut{{E: "menu_item", ID: "menu-cloud", K: sp.KInsert, F: map[string]any{"name": "cloud item", "price_paise": int64(500)}}}))
 	w.Quiesce(bg, 20)
 	late := must(w.AddDevice("dev-late", sp.KindPOS))
@@ -509,7 +509,7 @@ func TestRestore_NewEpochNoIdentityReuseAndLostWindowOpsComeBack(t *testing.T) {
 	if r := w.rec(t, em); r.Status != repository.StAccepted {
 		t.Fatal("the cloud op from the lost window is back")
 	}
-	em2 := must(w.GW.Emit(bg, w.Tenant, "brand:"+w.Brand, "cloud.emit",
+	em2 := must(w.GW.RecordCloudOp(bg, w.Tenant, "brand:"+w.Brand, "cloud.emit",
 		[]sp.Mut{{E: "menu_item", ID: "menu-cloud2", K: sp.KInsert, F: map[string]any{"name": "after", "price_paise": int64(600)}}}))
 	if em2.Origin != engine.CloudOriginPrefix+"restore-1" || em2.Seq != 1 {
 		t.Fatalf("new cloud origin per epoch starting at 1, got %s/%d", em2.Origin, em2.Seq)

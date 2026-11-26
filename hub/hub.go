@@ -9,11 +9,11 @@ package hub
 import (
 	"context"
 	"crypto/ecdsa"
-	"encoding/json"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hostryhq/svc-sync/api"
@@ -28,21 +28,28 @@ type PubKey = ecdsa.PublicKey
 // Config builds a Hub.
 type Config struct {
 	Tenant, Outlet, Brand string
-	// Cred and Key are the hub's own device credential and key (kind hub).
+	// Cred and Key are the hub's own device credential and key (kind hub). Cred.Cred holds the claims; its Sig is empty when the
+	// credential came only as a LAN credential JWS (a hub pack), which is all the LAN handshake needs.
 	Cred sp.CredentialEnvelope
 	Key  *sp.KeyPair
-	// IdentityPub verifies every credential; CloudKeys are the gateway op-signing keys of the pack.
-	IdentityPub *ecdsa.PublicKey
-	CloudKeys   map[string]*ecdsa.PublicKey
-	Store       repository.Store
-	Now         func() time.Time
-	Log         *slog.Logger
+	// CredJWS is the hub's LAN credential (compact JWS) that it shows to a device at helloLan.
+	CredJWS string
+	// IdentityPub verifies every credential, IdentityNext is the next identity key of the pack (may be nil); CloudKeys are the
+	// gateway op-signing keys of the pack.
+	IdentityPub  *ecdsa.PublicKey
+	IdentityNext *ecdsa.PublicKey
+	CloudKeys    map[string]*ecdsa.PublicKey
+	Store        repository.Store
+	Now          func() time.Time
+	Log          *slog.Logger
 	// Peers are the outlet's device credentials from the pack.
 	Peers []sp.CredentialEnvelope
 	// Members and SeriesOwner come from the pack: the staff the outlet knows, and which device
 	// holds which series code. They drive the structural check before relaying (S8).
 	Members     func(actor string) bool
 	SeriesOwner func(code string) (device string, ok bool)
+	// PIIToUnprotected lifts the placement rule of ADR-0002 A3.5 item 2 (dev, test and ci only).
+	PIIToUnprotected bool
 }
 
 // Hub is the relay node.
@@ -52,11 +59,21 @@ type Hub struct {
 	cache *engine.CredCache
 	cl    *engine.Client
 
-	mu      sync.Mutex
-	revoked map[string]bool
-	poke    int64
-	pokeCh  chan struct{}
-	held    []sp.HeldSlot // what the cloud last told about the origins relayed here (A1.2)
+	keys *tlsKeys
+	// The parts of the pack a refresh replaces while the hub runs.
+	credJWS atomic.Pointer[string]
+	idKeys  atomic.Pointer[[]*ecdsa.PublicKey]
+	members atomic.Pointer[map[string][]string]
+	// refresh is the pack refresher run at cloud contacts (SetPackRefresh).
+	refresh   func(ctx context.Context) error
+	refreshed time.Time
+	mu        sync.Mutex
+	pending   map[string]pendingHS
+	sessions  map[string]session
+	revoked   map[string]bool
+	poke      int64
+	pokeCh    chan struct{}
+	held      []sp.HeldSlot // what the cloud last told about the origins relayed here (A1.2)
 }
 
 // New builds a hub and opens its store.
@@ -64,18 +81,26 @@ func New(ctx context.Context, cfg Config) (*Hub, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	h := &Hub{cfg: cfg, revoked: map[string]bool{}, pokeCh: make(chan struct{})}
+	keys, err := newTLSKeys(cfg.Now)
+	if err != nil {
+		return nil, err
+	}
+	h := &Hub{cfg: cfg, keys: keys, pending: map[string]pendingHS{}, sessions: map[string]session{}, revoked: map[string]bool{}, pokeCh: make(chan struct{})}
+	h.credJWS.Store(&cfg.CredJWS)
+	h.idKeys.Store(&[]*ecdsa.PublicKey{cfg.IdentityPub, cfg.IdentityNext})
 	h.cache = engine.NewCredCache(cfg.IdentityPub, cfg.Tenant, cfg.Outlet, cfg.Now)
 	for kid, k := range cfg.CloudKeys {
 		h.cache.AddCloudKey(kid, k)
 	}
-	_ = h.cache.Add(cfg.Cred)
+	if err := h.cache.Add(cfg.Cred); err != nil {
+		h.cache.AddLAN(cfg.Cred.Cred)
+	}
 	for _, p := range cfg.Peers {
 		_ = h.cache.Add(p)
 	}
 	h.eng = engine.New(engine.Config{
-		Role: engine.RoleHub, Tenant: cfg.Tenant, Outlet: cfg.Outlet, Store: cfg.Store, Trust: h.cache,
-		Clock: sp.NewClock(cfg.Now),
+		Role: engine.RoleHub, Kind: sp.KindHub, Tenant: cfg.Tenant, Outlet: cfg.Outlet, Store: cfg.Store, Trust: h.cache,
+		Clock: sp.NewClock(cfg.Now), PIIToUnprotected: cfg.PIIToUnprotected,
 		Hooks: engine.Hooks{Authorize: h.authorize, Verdict: h.structural},
 	})
 	if err := h.eng.Open(ctx); err != nil {
@@ -94,7 +119,12 @@ func (h *Hub) Cache() *engine.CredCache { return h.cache }
 func (h *Hub) AddPeer(e sp.CredentialEnvelope) error { return h.cache.Add(e) }
 
 // Revoke refuses a device on the LAN from now on (pack refresh with a revocation).
-func (h *Hub) Revoke(device string) { h.mu.Lock(); h.revoked[device] = true; h.mu.Unlock() }
+func (h *Hub) Revoke(device string) {
+	h.mu.Lock()
+	h.revoked[device] = true
+	h.mu.Unlock()
+	h.dropSessions(device)
+}
 
 // IsRevoked reports whether the device is refused.
 func (h *Hub) IsRevoked(device string) bool {
@@ -120,7 +150,7 @@ func (h *Hub) authorize(_ repository.Tx, c engine.Caller, origin, stream string,
 	if len(origin) > len(engine.CloudOriginPrefix) && origin[:len(engine.CloudOriginPrefix)] == engine.CloudOriginPrefix {
 		return ""
 	}
-	if _, ok := h.cache.Get(origin); !ok {
+	if _, ok := h.cache.Claims(origin); !ok {
 		return sp.ReasonOrigin
 	}
 	// Revocation is enforced where ops are first accepted, not on pull, so the history of a
@@ -148,16 +178,22 @@ func (h *Hub) structural(_ repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		return ok
 	}
 	in, known := sp.Intents[b.Intent]
-	cred, have := h.cache.Get(b.Origin)
-	if !known || !have || !in.Allows(cred.Cred.Kind) {
+	cred, have := h.cache.Claims(b.Origin)
+	if !known || !have || !in.Allows(cred.Kind) {
 		return held
 	}
-	if h.cfg.Members != nil && (b.Actor == "" || !h.cfg.Members(b.Actor)) {
-		return held
-	}
-	if b.Doc != nil && h.cfg.SeriesOwner != nil {
-		if dev, found := h.cfg.SeriesOwner(b.Doc.SeriesCode()); !found || dev != b.Origin {
+	if m := h.members.Load(); m != nil {
+		if _, active := (*m)[b.Actor]; b.Actor == "" || !active {
 			return held
+		}
+	} else if h.cfg.Members != nil && (b.Actor == "" || !h.cfg.Members(b.Actor)) {
+		return held
+	}
+	if h.cfg.SeriesOwner != nil {
+		for _, doc := range b.Documents() {
+			if dev, found := h.cfg.SeriesOwner(doc.SeriesCode()); !found || dev != b.Origin {
+				return held
+			}
 		}
 	}
 	return ok
@@ -247,6 +283,9 @@ func (h *Hub) Snapshot(ctx context.Context, p api.Principal) (sp.Snapshot, error
 			snap.Voids = append(snap.Voids, sp.Ref{Origin: k})
 		}
 	})
+	if err := h.eng.SnapshotPII(ctx, snap.Rows, p.Caller); err != nil {
+		return sp.Snapshot{}, err
+	}
 	return snap, nil
 }
 
@@ -281,7 +320,9 @@ func (h *Hub) bump() {
 // Handler returns the hub's HTTP handler.
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
-	api.Mount(mux, api.Options{Auth: LANAuth{H: h}, Backend: h, Sign: h.Sign})
+	mux.HandleFunc("POST /sync/v1/lan/hello", h.handleHello)
+	mux.HandleFunc("POST /sync/v1/lan/session", h.handleSession)
+	api.Mount(mux, api.Options{Auth: LANAuth{H: h}, Backend: h})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
 	return mux
 }
@@ -326,6 +367,7 @@ func (h *Hub) RunUpstream(ctx context.Context, every time.Duration) {
 			delay = min(delay*2, 60*time.Second)
 		} else {
 			delay = every
+			h.refreshPack(ctx)
 		}
 		jitter := time.Duration(rand.Int64N(int64(delay)/4 + 1))
 		select {
@@ -334,24 +376,6 @@ func (h *Hub) RunUpstream(ctx context.Context, every time.Duration) {
 		case <-time.After(delay + jitter):
 		}
 	}
-}
-
-func encodeProof(hd http.Header, p sp.HubProof) error {
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	hd.Set(sp.HeaderHubProof, encodeB64(raw))
-	return nil
-}
-
-func decodeProof(hd http.Header) (sp.HubProof, error) {
-	var p sp.HubProof
-	raw, err := decodeB64(hd.Get(sp.HeaderHubProof))
-	if err != nil {
-		return p, err
-	}
-	return p, json.Unmarshal(raw, &p)
 }
 
 // LastRefused is what the cloud refused in the last upstream round.

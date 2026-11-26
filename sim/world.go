@@ -37,6 +37,8 @@ type WorldOptions struct {
 	Outbox bool
 	// NoHub builds a world with no LAN hub.
 	NoHub bool
+	// PIILift lifts the placement rule of ADR-0002 A3.5 item 2 on the gateway and the hub (the dev, test and ci switch).
+	PIILift bool
 }
 
 // World is one outlet with its devices, hub and cloud.
@@ -60,6 +62,7 @@ type World struct {
 	Hub         *hub.Hub
 	HubKey      *sp.KeyPair
 	HubCred     sp.CredentialEnvelope
+	HubJWS      string
 	HubDB       string
 	hubGen      int
 	HubUp       *engine.Client
@@ -69,6 +72,8 @@ type World struct {
 	Via     struct{ HubOK, HubFail, CloudDirect int }
 	Devices []*Device
 	byID    map[string]*Device
+	// PIIOps are the checks recorded with customer details beside them (CheckOp), for the placement check.
+	PIIOps []sp.Ref
 }
 
 const (
@@ -77,8 +82,13 @@ const (
 	pLeaver  = "m3"
 )
 
-var cashierPerms = []string{"order.create", "payment.take", "bill.finalize", "bill.refund", "stock.adjust", "kds.update", "session.open"}
-var managerPerms = append(append([]string{}, cashierPerms...), "menu.edit", "series.activate", "approval.grant")
+func init() { // stock.move and the demo entities exist only in the simulator and tests
+	sp.RegisterDemoIntents()
+	engine.RegisterDemoEntities()
+}
+
+var cashierPerms = []string{"order.create", "order.edit", "payment.record", "bill.finalize", "bill.credit_note.create", "demo.stock.move", "kds.bump", "session.open"}
+var managerPerms = append(append([]string{}, cashierPerms...), "menu.manage", "menu.price.edit", "series.activate", "approval.grant")
 
 // NewWorld builds the whole stack. Nothing is deployed anywhere: it is all in this process.
 func NewWorld(ctx context.Context, rng *Rand, opt WorldOptions) (*World, error) {
@@ -147,14 +157,14 @@ func (w *World) startGateway() error {
 	if err != nil {
 		return err
 	}
-	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Epoch: ep, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox})
+	gw, err := service.New(w.Ctx, service.Config{Store: w.GWStore, Epoch: ep, Dir: w.Identity, OpKey: w.Identity.CloudKey, Now: w.Clock.Now, Outbox: w.Opt.Outbox, PIIToUnprotected: w.Opt.PIILift})
 	if err != nil {
 		return err
 	}
 	w.GW = gw
 	mux := http.NewServeMux()
 	api.Mount(mux, api.Options{Auth: api.BearerAuth{Verifier: w.Issuer.Verifier(), Dir: w.Identity}, Backend: api.GatewayBackend{G: gw}})
-	w.Services = authtest.NewServiceRegistry(clock.Func(w.Clock.Now), "admin", "sync")
+	w.Services = authtest.NewServiceRegistry(clock.Func(w.Clock.Now), "admin", "sync", "catalog", "billing", "orders")
 	api.Admin(mux, gw, api.AdminAuth{Tenant: w.Issuer.Verifier(), Services: w.Services.Verifier("sync"),
 		Audit: &repository.AccessSink{S: w.GWStore.(*repository.SQL)}, Clock: clock.Func(w.Clock.Now)})
 	w.CloudH = mux
@@ -199,6 +209,10 @@ func (w *World) newHub(first bool) error {
 		if w.HubCred, err = w.Identity.Activate(w.Tenant, w.Outlet, w.Brand, "hub-01", sp.KindHub, kp, ""); err != nil {
 			return err
 		}
+		var ok bool
+		if w.HubJWS, ok = w.Identity.LANCredential("hub-01"); !ok {
+			return fmt.Errorf("sim: no LAN credential for the hub")
+		}
 	}
 	w.hubGen++
 	w.HubDB = filepath.Join(w.Opt.Dir, fmt.Sprintf("hub-%d.db", w.hubGen))
@@ -212,9 +226,9 @@ func (w *World) newHub(first bool) error {
 
 func (w *World) openHub(st repository.Store) {
 	h, err := hub.New(w.Ctx, hub.Config{
-		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, Key: w.HubKey,
+		Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, CredJWS: w.HubJWS, Key: w.HubKey,
 		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{w.Identity.CloudKey.Kid: &w.Identity.CloudKey.Priv.PublicKey},
-		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet),
+		Store: st, Now: w.Clock.Now, Peers: w.Identity.Devices(w.Tenant, w.Outlet), PIIToUnprotected: w.Opt.PIILift,
 		Members: func(actor string) bool { return w.Identity.InAnyPackOf(w.Tenant, w.Outlet, actor) },
 		SeriesOwner: func(code string) (string, bool) {
 			s, ok := w.Identity.Series(w.Tenant, code)

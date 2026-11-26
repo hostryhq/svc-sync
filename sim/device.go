@@ -12,6 +12,7 @@ import (
 	"github.com/hostryhq/svc-sync/directory"
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/hub"
+	"github.com/hostryhq/svc-sync/identitystub"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -39,13 +40,14 @@ type Device struct {
 	Recovered  []string // old origins this installation adopted
 	Recoveries []*Recovery
 
-	sessions  map[string]string
-	n         int
-	saleCode  string
-	cnCode    string
-	activated bool
-	badSeries string // when set, finalisation uses this series code (injected fault)
-	lastSeal  time.Time
+	sessions    map[string]string
+	badSessions map[string]string
+	n           int
+	saleCode    string
+	cnCode      string
+	activated   bool
+	badSeries   string // when set, finalisation uses this series code (injected fault)
+	lastSeal    time.Time
 	// Recorded is every op this installation recorded under any of its origins.
 	Recorded []sp.Ref
 	// Numbers are the legal numbers it allocated, in order, with the origin that numbered them.
@@ -69,11 +71,16 @@ func (s seriesSrc) Code(docType string) (string, bool) {
 
 // AddDevice registers and starts a device.
 func (w *World) AddDevice(id, kind string) (*Device, error) {
+	return w.AddDeviceStore(id, kind, sp.StoreProtected)
+}
+
+// AddDeviceStore is AddDevice with the device's declared store claim (ADR-0002 A3.5 item 1).
+func (w *World) AddDeviceStore(id, kind, store string) (*Device, error) {
 	kp, err := sp.NewKeyPair("k-"+id, nil)
 	if err != nil {
 		return nil, err
 	}
-	cred, err := w.Identity.Activate(w.Tenant, w.Outlet, w.Brand, id, kind, kp, "")
+	cred, err := w.Identity.ActivateStore(w.Tenant, w.Outlet, w.Brand, id, kind, kp.Kid, kp.PublicB64(), "", store)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +93,7 @@ func (w *World) AddDevice(id, kind string) (*Device, error) {
 		d.saleCode = w.Identity.IssueSeries(w.Tenant, id, "tax_invoice", directory.SeriesDormant)
 		d.cnCode = w.Identity.IssueSeries(w.Tenant, id, "credit_note", directory.SeriesDormant)
 	}
-	w.Identity.IssuePack(w.Tenant, id, "v1", 7*24*time.Hour)
+	w.Identity.IssuePack(w.Tenant, id, 1, 7*24*time.Hour)
 	d.DB = fmt.Sprintf("%s/%s.db", w.Opt.Dir, id)
 	if err := d.open(); err != nil {
 		return nil, err
@@ -119,18 +126,27 @@ func (d *Device) open() error {
 		_ = d.Cache.Add(d.Cred)
 	}
 	d.Eng = engine.New(engine.Config{
-		Role: engine.RoleDevice, Tenant: w.Tenant, Outlet: w.Outlet, Origin: d.ID, Key: d.Key, Store: st, Trust: d.Cache,
+		Role: engine.RoleDevice, Kind: d.Kind, Tenant: w.Tenant, Outlet: w.Outlet, Origin: d.ID, Key: d.Key, Store: st, Trust: d.Cache,
 		Clock: sp.NewClock(func() time.Time { return w.Clock.Now().Add(d.Skew) }), Series: seriesSrc{d},
 	})
 	if err := d.Eng.Open(w.Ctx); err != nil {
 		return err
 	}
 	streams := []string{"outlet:" + w.Outlet, "brand:" + w.Brand, "tenant:" + w.Tenant}
-	lan := &hub.LANClient{Cred: d.Cred, Key: d.Key, IdentityPub: w.Identity.IdentityPub(), Outlet: w.Outlet, Now: func() time.Time { return w.Clock.Now().Add(d.Skew) }}
+	jws, ok := w.Identity.LANCredential(d.ID)
+	if !ok {
+		return fmt.Errorf("sim: no LAN credential for %s", d.ID)
+	}
 	hubH := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) { w.HubH.ServeHTTP(rw, r) })
+	lan := &hub.LANClient{CredJWS: jws, Key: d.Key, DeviceID: d.ID, Tenant: w.Tenant, Outlet: w.Outlet,
+		Identity: func() []*ecdsaPub { return []*ecdsaPub{w.Identity.IdentityPub()} },
+		Revoked:  func(id string) bool { rev, _ := w.Identity.Revoked(w.Tenant, id); return rev },
+		Now:      func() time.Time { return w.Clock.Now().Add(d.Skew) },
+		Next:     w.Net.RoundTripper("dev-hub:"+d.ID, hubH),
+		// The in-memory network has no TLS: a device "sees" the certificate key of the hub it is wired to.
+		SPKISeen: func() string { return w.Hub.SPKI() }}
 	d.HubC = &engine.Client{E: d.Eng, Cache: d.Cache, Streams: streams, T: &engine.HTTPTransport{
-		Base: "http://hub", Client: &http.Client{Transport: w.Net.RoundTripper("dev-hub:"+d.ID, hubH)},
-		Authorize: lan.Authorize, VerifyResponse: lan.VerifyResponse}}
+		Base: "http://hub", Client: &http.Client{Transport: lan.RoundTripper()}}}
 	d.CloudC = &engine.Client{E: d.Eng, Cache: d.Cache, Streams: streams, UpstreamIsCloud: true, T: w.CloudTransport("dev-cloud:"+d.ID, d.ID)}
 	return nil
 }
@@ -206,28 +222,48 @@ func (d *Device) session(actor string) (string, error) {
 		return sid, nil
 	}
 	sid := fmt.Sprintf("s-%s-%s", d.ID, actor)
-	stype := "pin"
-	if actor == pManager {
-		stype = "user"
-	}
 	d.sessions[actor] = sid
-	_, err := d.record(engine.Input{Stream: "outlet:" + d.W.Outlet, Intent: sp.IntentSessionOpen, Actor: actor, SID: sid,
-		Muts: []sp.Mut{{E: "session", ID: sid, K: sp.KInsert, F: map[string]any{"type": stype, "device": d.ID}}}}, true)
-	return sid, err
+	return sid, d.openSession(actor, sid, "")
+}
+
+// openSession records a session.open of a pin session whose proof is the given one ("" means the right PIN).
+func (d *Device) openSession(actor, sid, proof string) error {
+	_, err := d.record(engine.Input{Stream: "outlet:" + d.W.Outlet, Intent: sp.IntentSessionOpen, Actor: actor, SID: sid, Proof: proof,
+		Muts: []sp.Mut{{E: "session", ID: sid, K: sp.KInsert, F: map[string]any{"type": sp.SessionPin, "device": d.ID}}}}, true)
+	return err
+}
+
+// SessionWith opens a new pin session with its own id and the given proof ("" the right PIN). The session is not cached.
+func (d *Device) SessionWith(actor, tag, proof string) (string, error) {
+	sid := fmt.Sprintf("s-%s-%s-%s", d.ID, actor, tag)
+	return sid, d.openSession(actor, sid, proof)
 }
 
 func (d *Device) record(in engine.Input, noSession bool) (sp.Item, error) {
 	if d.KeyLost {
 		return sp.Item{}, errors.New("sim: device key lost: nothing is recorded (K6)")
 	}
-	if in.PackV == "" {
-		in.PackV = "v1"
+	if in.PackV == 0 {
+		in.PackV = 1
 	}
-	if in.Proof == "" {
-		in.Proof = d.W.Identity.MintProof(d.ID, in.Actor)
-	}
-	if in.Proof == "none" {
-		in.Proof = ""
+	// The proof travels only on session.open of a pin session and on approval.grant, with the PIN version, and the
+	// open's `at` is the opening time it binds (ADR-0005 A3.1).
+	if in.Intent == sp.IntentSessionOpen && openType(in) == sp.SessionPin {
+		if in.PinV == 0 {
+			in.PinV = 1
+		}
+		if in.At.IsZero() {
+			in.At = d.Eng.Config().Clock.Time()
+		}
+		if in.Proof == "" {
+			in.Proof = d.W.Identity.MintProof(identitystub.ProofQuestion{Kind: "session", Device: d.ID, Member: in.Actor, SID: in.SID,
+				PackV: in.PackV, PinV: in.PinV, OpenedAt: in.At})
+		}
+		if in.Proof == "none" {
+			in.Proof = ""
+		}
+	} else if in.Intent != sp.IntentApprovalGrant {
+		in.Proof, in.PinV = "", 0
 	}
 	it, err := d.Eng.Record(d.W.Ctx, in)
 	if err != nil {
@@ -240,6 +276,31 @@ func (d *Device) record(in engine.Input, noSession bool) (sp.Item, error) {
 		}
 	}
 	return it, nil
+}
+
+// openType is the session type a session.open input opens.
+func openType(in engine.Input) string {
+	for _, m := range in.Muts {
+		if m.E == "session" && m.ID == in.SID {
+			t, _ := m.F["type"].(string)
+			return t
+		}
+	}
+	return ""
+}
+
+// BadSession opens, once per actor, a pin session whose proof is wrong (a tampered tablet): the one session identity
+// counts a failure for. Later ops of the session are judged from that verdict.
+func (d *Device) BadSession(actor string) (string, error) {
+	if sid, ok := d.badSessions[actor]; ok {
+		return sid, nil
+	}
+	if d.badSessions == nil {
+		d.badSessions = map[string]string{}
+	}
+	sid, err := d.SessionWith(actor, "bad", "bogus-proof")
+	d.badSessions[actor] = sid
+	return sid, err
 }
 
 // Do records an op as actor inside the actor's session, opening it if needed.

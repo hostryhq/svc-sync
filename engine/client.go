@@ -59,6 +59,11 @@ type SyncResult struct {
 // they differ. A hub's word may open it; only a direct cloud hello may close it.
 const metaEpoch, metaReoffered = "epoch", "reoffered_epoch"
 
+// metaPIIResend is the time until which this node offers its pii values to the cloud again (a day after it hears of a restore).
+const metaPIIResend = "pii_resend_until"
+
+const piiResendWindow = 24 * time.Hour
+
 // SyncOnce does hello, push until the upstream has everything offerable, then pull until caught
 // up. Every step is idempotent; an error leaves the node ready to run it again.
 func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
@@ -85,9 +90,20 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 			return res, err
 		}
 	}
+	if c.UpstreamIsCloud {
+		// Acknowledge the erasures applied since the last direct cloud contact (syncproto/piic.go).
+		if hreq.PIIErased, err = c.E.PendingErasureAcks(ctx); err != nil {
+			return res, err
+		}
+	}
 	hello, err := c.T.Hello(ctx, hreq)
 	if err != nil {
 		return res, err
+	}
+	if len(hreq.PIIErased) > 0 {
+		if err := c.E.ClearErasureAcks(ctx, hreq.PIIErased); err != nil {
+			return res, err
+		}
 	}
 	if c.UpstreamIsCloud {
 		if err := c.E.NoteCloudHello(ctx); err != nil {
@@ -120,6 +136,11 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 			if err := tx.SetMeta(metaEpoch, hello.Epoch); err != nil {
 				return err
 			}
+			if lastEpoch != "" {
+				if err := tx.SetMeta(metaPIIResend, cfg.Clock.Time().Add(piiResendWindow).UTC().Format(time.RFC3339)); err != nil {
+					return err
+				}
+			}
 			if first {
 				return tx.SetMeta(metaReoffered, hello.Epoch) // a new store has nothing to re-offer
 			}
@@ -137,10 +158,21 @@ func (c *Client) SyncOnce(ctx context.Context) (SyncResult, error) {
 		up = sp.Vector{}
 	}
 	others := c.IsHub || (c.UpstreamIsCloud && open)
+	resendPII := false
+	if c.UpstreamIsCloud {
+		_ = cfg.Store.InTx(ctx, cfg.Tenant, func(tx repository.Tx) error {
+			if v, ok, _ := tx.GetMeta(metaPIIResend); ok {
+				if until, err := time.Parse(time.RFC3339, v); err == nil && cfg.Clock.Time().Before(until) {
+					resendPII = true
+				}
+			}
+			return nil
+		})
+	}
 	refused := map[string]bool{}
 	// Push.
 	for round := 0; round < 200; round++ {
-		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams, Reoffer: open && c.UpstreamIsCloud && round == 0})
+		req, err := c.E.Outbound(ctx, up, OutboundOpts{Others: others, Streams: c.Streams, Reoffer: open && c.UpstreamIsCloud && round == 0, ResendPII: resendPII && round == 0})
 		if err != nil {
 			return res, err
 		}
@@ -258,6 +290,12 @@ func (c *Client) placeholders(ctx context.Context) ([]sp.Ref, error) {
 				break
 			}
 		}
+		// Ops whose pii values this node lacks (pii_incomplete, ADR-0014 A3.1 item 4): any upstream may complete them.
+		more, err := c.E.IncompletePII(tx, 200-len(out))
+		if err != nil {
+			return err
+		}
+		out = append(out, more...)
 		// Endorsements signed by a key this node no longer accepts (rotation, A2.1 item 6): ask
 		// for the op again, the answer carries the re-issued endorsement.
 		if c.Cache != nil {

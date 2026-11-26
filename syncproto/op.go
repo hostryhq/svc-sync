@@ -33,8 +33,20 @@ const (
 // Intent names the engine itself understands.
 const (
 	IntentVoid        = "sync.void"
+	IntentPIIErase    = "sync.pii.erase"
 	IntentSessionOpen = "session.open"
+	// IntentApprovalGrant is the manager override at the counter; it carries an action proof (ADR-0005 section 8).
+	IntentApprovalGrant = "approval.grant"
 )
+
+// Session types of a session.open (ADR-0005 section 7). Only a pin session carries a proof (A3.1).
+const (
+	SessionPin    = "pin"
+	SessionStrong = "strong"
+)
+
+// TimeLayout is the layout of Body.At.
+const TimeLayout = "2006-01-02T15:04:05.000Z"
 
 // Mut is one generic mutation inside an op.
 type Mut struct {
@@ -51,6 +63,8 @@ type Mut struct {
 type Doc struct {
 	Type   string `json:"type"`
 	Number string `json:"number"`
+	// ID is the id of the row that carries the number (the bill or credit note id); it is read from the mutation, never on the wire.
+	ID string `json:"-"`
 }
 
 // SeriesCode is the code part of the number.
@@ -73,16 +87,22 @@ type Body struct {
 	TenantID string `json:"tenant_id"`
 	Actor    string `json:"actor,omitempty"`
 	SID      string `json:"sid,omitempty"`
-	PackV    string `json:"pack_v,omitempty"`
+	// PackV is the offline pack version, a JSON integer >= 1 on every device-origin op (ADR-0005 A3.1).
+	PackV    int    `json:"pack_v,omitempty"`
 	Approval string `json:"approval,omitempty"`
-	// Proof is the opaque PIN-derived session or action proof (ADR-0005 section 7-8). Only the
-	// cloud can check it; a hub never looks at it.
-	Proof   string `json:"proof,omitempty"`
+	// Proof is the opaque PIN-derived session or action proof (ADR-0005 section 7-8). It travels only on
+	// session.open of a pin session and on approval.grant, together with PinV (A3.1). Only the cloud can
+	// check it; a hub never looks at it.
+	Proof string `json:"proof,omitempty"`
+	// PinV is the PIN version the proof was made under: the actor's on session.open, the approver's on approval.grant.
+	PinV    int    `json:"pin_v,omitempty"`
 	Intent  string `json:"intent"`
 	IntentV int    `json:"intent_v"`
 	At      string `json:"at"`
 	Doc     *Doc   `json:"doc,omitempty"`
-	Muts    []Mut  `json:"muts"`
+	// PIIC holds the salted per-field commitments of the op's pii (piic.go; provisional).
+	PIIC PIICommit `json:"pii_c,omitempty"`
+	Muts []Mut     `json:"muts"`
 }
 
 // Item is one op or one placeholder on the wire. Body is the canonical JSON text of the Body
@@ -277,6 +297,9 @@ type HelloRequest struct {
 	Unbound []Ref `json:"unbound,omitempty"`
 	// Conflicts reports the chain conflicts this node recorded and has not yet reported (A2.8 item 1.4).
 	Conflicts []Conflict `json:"chain_conflicts,omitempty"`
+	// PIIErased acknowledges the cloud-signed erasures (intent sync.pii.erase) this node applied to
+	// its rows, op log, caches and spool (PROVISIONAL; syncproto/piic.go, contract/README.md).
+	PIIErased []Ref `json:"pii_erased,omitempty"`
 }
 
 // SlotHash is a slot with the hash a node holds or the cloud states for it.
@@ -325,6 +348,9 @@ type PushRequest struct {
 	// a node re-offering after a cloud restore also sends endorsed ops the cloud already holds
 	// as quarantined, so that the cloud can take them as released.
 	Endorsements []Endorsement `json:"endorsements,omitempty"`
+	// DrainStatement is the device-signed list of everything a revoked device holds: the last, empty upload of
+	// a drain (ADR-0005 A3.3). Only quarantine-upload reads it.
+	DrainStatement *DrainStatement `json:"drain_statement,omitempty"`
 }
 
 // PushResponse reports what the upstream now holds.
@@ -382,7 +408,82 @@ type SnapshotRow struct {
 	ID     string         `json:"id"`
 	Fields map[string]any `json:"f"`
 	Gone   bool           `json:"gone,omitempty"`
+	// PIIC is the commitment of every pii field the row holds; PII the values with their `~s:<field>` salts, only
+	// for a caller whose credential kind receives them (ADR-0014 A3.1). Neither is part of Fields.
+	PIIC map[string]string `json:"pii_c,omitempty"`
+	PII  map[string]any    `json:"pii,omitempty"`
+	// PIISrc names, per pii field, the op that holds its value; it is never on the wire.
+	PIISrc map[string]Ref `json:"-"`
 }
 
 // VoidID is the row id of the sync_void record that names a refused op: "<stream>|<origin>|<seq>".
 func VoidID(r Ref) string { return r.Stream + "|" + r.Origin + "|" + strconv.FormatInt(r.Seq, 10) }
+
+// docFields names, per entity, the field marked doc_number in api-specs entities/ (checked against
+// the registry by a test) and where the document type comes from: a field of the row, or a fixed type.
+var docFields = map[string]struct{ Field, TypeField, Type string }{
+	"bill":        {Field: "number", TypeField: "doc_type"},
+	"credit_note": {Field: "number", Type: "credit_note"},
+}
+
+// DocFieldEntities lists the entities that carry a legal document number.
+func DocFieldEntities() []string {
+	out := make([]string, 0, len(docFields))
+	for e := range docFields {
+		out = append(out, e)
+	}
+	return out
+}
+
+// Documents lists every legal document number the op allocates: the one in `doc` first, then the
+// number of every inserted row of an entity with a doc_number field (protocol-v1 "Several document
+// numbers in one op": bill.rebill takes a credit note number and a new bill number in one
+// transaction). Duplicates are listed once.
+func (b Body) Documents() []Doc {
+	var out []Doc
+	seen := map[string]bool{}
+	add := func(d Doc) {
+		if d.Number == "" {
+			return
+		}
+		if !seen[d.Number] {
+			seen[d.Number] = true
+			out = append(out, d)
+			return
+		}
+		for i := range out { // the row behind a number named in `doc` gives it its id
+			if out[i].Number == d.Number && out[i].ID == "" {
+				out[i].ID = d.ID
+			}
+		}
+	}
+	if b.Doc != nil {
+		add(*b.Doc)
+	}
+	for _, m := range b.Muts {
+		df, ok := docFields[m.E]
+		if !ok || m.K != KInsert {
+			continue
+		}
+		n, _ := m.F[df.Field].(string)
+		t := df.Type
+		if df.TypeField != "" {
+			t, _ = m.F[df.TypeField].(string)
+		}
+		add(Doc{Type: t, Number: n, ID: m.ID})
+	}
+	return out
+}
+
+// ParseNumber splits <code>/<FY>/<running>.
+func (d Doc) ParseNumber() (code, fy string, n int64, ok bool) {
+	parts := strings.Split(d.Number, "/")
+	if len(parts) != 3 {
+		return "", "", 0, false
+	}
+	n, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || n < 1 {
+		return "", "", 0, false
+	}
+	return parts[0], parts[1], n, true
+}

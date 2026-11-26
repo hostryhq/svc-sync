@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +30,8 @@ const (
 	ReasonPermAbsent     = "permission_absent"
 	ReasonPermWithdrawn  = "permission_withdrawn"
 	ReasonDiscarded      = "discarded"
+	// ReasonDuplicateDocument holds an op whose legal number the register already keeps under another bill or credit note id.
+	ReasonDuplicateDocument = "duplicate_document"
 )
 
 // Marks recorded with a verdict (audit views, never sent to devices).
@@ -46,10 +47,16 @@ const (
 	MarkForeign               = "foreign_series"
 	MarkUnknownSeries         = "unknown_series"
 	MarkProofPending          = "proof_pending"
+	MarkManualBook            = "manual_book"
+	MarkAfterClosure          = "after_closure"
 	MarkActivationFlag        = "series_activation"
 	MarkFork                  = "fork"
 	MarkReleased              = "released"
+	MarkPIIDropped            = "pii_dropped"
+	MarkDuplicate             = "duplicate_document"
 )
+
+// (approval marks: approval.go)
 
 // releaseCtx tells judge which holds a manager's release has already cleared.
 type releaseCtx struct {
@@ -66,11 +73,41 @@ func hasMark(marks []string, m string) bool {
 	return false
 }
 
-// judge gives an op that passed chain and seal checks its verdict, in the order of S11 with the
+// judge gives an op that passed chain and seal checks its verdict. When the directory could not answer a question
+// while the op was judged, the verdict is not trusted (ADR-0005 A3.2 failure rule): a configuration op or a held
+// sale waits (config_pending, judged again by ReverifyPending), and an op stored as accepted or flagged carries the
+// pending mark. An unanswered question is never "found", "held" or "valid".
+func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
+	f, faulty := g.cfg.Dir.(directory.Faulty)
+	var before uint64
+	if faulty {
+		before = f.Faults()
+	}
+	v := g.judgeOnce(tx, p, vc, rel)
+	if !faulty || f.Faults() == before || strings.HasPrefix(p.Item.Origin, engine.CloudOriginPrefix) {
+		return v
+	}
+	switch v.Status {
+	case repository.StVoided:
+		return engine.Verdict{Status: repository.StQuarantined, Reason: ReasonConfigPending}
+	case repository.StQuarantined:
+		switch v.Reason {
+		case ReasonForeignSeries, ReasonActorUnknown, ReasonIntentNotAllow, ReasonPermAbsent, ReasonPermWithdrawn, ReasonProofFailed, ReasonProofLocked:
+			return engine.Verdict{Status: repository.StQuarantined, Reason: ReasonConfigPending}
+		}
+	case repository.StAccepted, repository.StFlagged:
+		if !hasMark(v.Marks, MarkProofPending) {
+			v.Marks = append(v.Marks, MarkProofPending)
+		}
+	}
+	return v
+}
+
+// judgeOnce gives an op that passed chain and seal checks its verdict, in the order of S11 with the
 // two A1.1 rows after "origin device is revoked" and A1.3's row for the unsealed tail. rel is
 // non-nil when a manager has released the op: the holds that caused the quarantine are skipped
 // and the remaining checks still run ("checked as above").
-func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
+func (g *Gateway) judgeOnce(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx, rel *releaseCtx) engine.Verdict {
 	tenant := tx.Tenant()
 	origin := p.Item.Origin
 	dir := g.cfg.Dir
@@ -79,6 +116,9 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	quarantine := func(reason string, marks ...string) engine.Verdict {
 		return engine.Verdict{Status: repository.StQuarantined, Reason: reason, Marks: marks}
+	}
+	if len(p.Item.Body) > sp.MaxBodyBytes {
+		return quarantine(ReasonOpaque) // over the size limit: malformed (S11), kept as an opaque body, never published with its body
 	}
 	if rel == nil {
 		if p.Opaque {
@@ -106,6 +146,9 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	if known && b.IntentV > in.MaxV {
 		return quarantine(ReasonOpaque) // no upcaster for this intent_v (S13)
+	}
+	if b.PackV < 1 {
+		return quarantine(ReasonMalformed) // every device-origin op carries pack_v, an integer of at least 1 (A3.1 item 1)
 	}
 	var marks []string
 	if rel != nil {
@@ -135,32 +178,70 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	flagged := false
 	flag := func(m string) { flagged = true; marks = append(marks, m) }
 
-	// A1.1: a legal document number must come from a series issued to the origin device.
-	if b.Doc != nil {
+	// A1.1: every legal document number must come from a series issued to the origin device. One op may
+	// carry several (bill.rebill: a credit note and a new bill); it never takes a series twice.
+	if docs := b.Documents(); len(docs) > 0 {
 		if config {
 			return quarantine(ReasonMalformed)
 		}
-		si, found := dir.Series(tenant, b.Doc.SeriesCode())
-		switch {
-		case !found && rel == nil:
-			return quarantine(ReasonForeignSeries, MarkUnknownSeries)
-		case !found:
-			flag(MarkUnknownSeries) // released by a manager after vendor confirmation: kept, flagged
-		case si.Device != origin && rel == nil:
-			return quarantine(ReasonForeignSeries, MarkForeign)
-		case si.Device != origin:
-			flag(MarkForeign)
-		default:
-			if si.State == directory.SeriesClosed && !revoked {
-				flag(MarkSeriesClosed)
+		codes := map[string]bool{}
+		for _, doc := range docs {
+			code, _, _, ok := doc.ParseNumber()
+			if !ok || codes[code] {
+				return quarantine(ReasonMalformed) // an op never takes a number twice from one series
 			}
-			if si.State == directory.SeriesDormant {
-				if on, _, _ := tx.GetMeta("activated:" + si.Code); on == "" {
-					flag(MarkDormantSeries)
+			codes[code] = true
+		}
+		for _, doc := range docs {
+			si, found := dir.SeriesFor(tenant, origin, cred.Cred.OutletID, doc.SeriesCode())
+			switch {
+			case found && si.ManualBook():
+				// A paper bill book: entry-only, typed numbers from a billing device of one of its outlets.
+				if !manualBookEntry(si, b.Intent, cred.Cred.OutletID) {
+					if rel == nil {
+						return quarantine(ReasonForeignSeries, MarkForeign)
+					}
+					flag(MarkForeign)
+				} else {
+					marks = append(marks, MarkManualBook)
+					if si.State == directory.SeriesClosed {
+						flag(MarkAfterClosure) // a page found after the book was closed is accepted and flagged
+					}
+				}
+			case !found && rel == nil:
+				return quarantine(ReasonForeignSeries, MarkUnknownSeries)
+			case !found:
+				flag(MarkUnknownSeries) // released by a manager after vendor confirmation: kept, flagged
+			case si.Device != origin && rel == nil:
+				return quarantine(ReasonForeignSeries, MarkForeign)
+			case si.Device != origin:
+				flag(MarkForeign)
+			default:
+				if si.State == directory.SeriesClosed && !revoked {
+					flag(MarkSeriesClosed)
+				}
+				if si.State == directory.SeriesDormant {
+					if on, _, _ := tx.GetMeta("activated:" + si.Code); on == "" {
+						flag(MarkDormantSeries)
+					}
+				}
+				if si.DocType != doc.Type {
+					flag(MarkDocTypeMismatch)
 				}
 			}
-			if si.DocType != b.Doc.Type {
-				flag(MarkDocTypeMismatch)
+		}
+		// The same number under a different document id is refused; the first op keeps it (protocol-v1 "Manual-book entries",
+		// intents/billing.yaml bill.finalize). A series hold above is the more specific reason. A manager's release keeps the op,
+		// flagged.
+		for _, doc := range docs {
+			if doc.ID == "" {
+				continue
+			}
+			if _, dup, err := tx.NumberHolder(doc.Number, doc.ID, origin, p.Item.Stream, p.Item.Seq); err == nil && dup {
+				if rel == nil {
+					return quarantine(ReasonDuplicateDocument, MarkDuplicate)
+				}
+				flag(MarkDuplicate)
 			}
 		}
 	}
@@ -171,8 +252,15 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		}
 		flag(ReasonIntentNotAllow) // a manager accepted the held sale: it stays, flagged
 	}
+	// A device session (no member, no PIN: the KDS screen) has an actor of its own, device:<device id> with the
+	// id equal to the op's origin (sync/protocol-v1.md, Attribution of device-session ops). It is allowed only
+	// for an intent whose registry row lists the device's kind and the device session type (a KOT bump), and
+	// only inside a session.open of type device by the same origin. No member is consulted and no proof exists;
+	// the permission is judged against the device role template of the kind. Free text such as device-kds, or
+	// another device's id, is an unknown actor.
+	devActor := known && b.Actor == DeviceActorPrefix+origin && in.Allows(kind) && in.AllowsSession(sp.SessionDevice) && deviceSession(tx, origin, b)
 	// Actor never appeared in any pack issued to the device.
-	if b.Actor == "" || !dir.InAnyPack(tenant, origin, b.Actor) {
+	if !devActor && (b.Actor == "" || !dir.InAnyPack(tenant, origin, b.Actor)) {
 		if rel == nil || config {
 			return refuse(ReasonActorUnknown)
 		}
@@ -188,7 +276,13 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	// Session and action proofs (identity only). A configuration op waits if identity is down;
 	// a sale never does (S11, A1.2 item 4).
-	switch dir.CheckProof(tenant, origin, b.Actor, b.SID, b.Proof, config) {
+	proof := directory.ProofValid
+	if !devActor {
+		proof = g.proofOf(tx, p)
+	} else if deviceSessionExpired(tx, origin, b) {
+		proof = directory.ProofInvalid // a device session lives 26 hours and is re-opened each business day: an older op is one of a closed session
+	}
+	switch proof {
 	case directory.ProofValid:
 	case directory.ProofMissing, directory.ProofInvalid:
 		if config {
@@ -199,6 +293,7 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 		if config {
 			return void(ReasonProofLocked)
 		}
+		flag(MarkAttributionUnverified) // identity answers locked for every op kind: a sale is kept, its actor unverified
 	case directory.ProofUnavailable:
 		if config {
 			return quarantine(ReasonConfigPending)
@@ -207,15 +302,44 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	}
 	// Permission held in the op's own pack, then since withdrawn or pack expired (H-3: flagged, never rejected).
 	pack, havePack := dir.PackFor(tenant, origin, b.PackV)
-	if in.Permission != "" {
-		if !havePack || !pack.Members[b.Actor][in.Permission] {
+	if devActor {
+		if in.Permission != "" && !DeviceRoleHolds(kind, in.Permission) {
+			if config {
+				return void(ReasonPermAbsent)
+			}
+			flag(MarkPermissionFlag)
+		}
+	} else if in.Permission != "" {
+		held := havePack && pack.Members[b.Actor][in.Permission]
+		if !held && in.Override && b.Approval != "" {
+			// An op of an override intent cites an approval: the permission is satisfied by the approver, or the op is
+			// flagged `approval_flag` with a reason; never `permission_flag` (ADR-0014 A3.3).
+			switch out := g.checkApproval(tx, b, in, p.Item.Stream, origin, cred.Cred.OutletID); out.State {
+			case approvalOK:
+				marks = append(marks, MarkApprovedBy+out.Approver)
+			case approvalPending:
+				if config {
+					return quarantine(ReasonConfigPending)
+				}
+				marks = append(marks, MarkApprovalPending)
+				if err := g.waitApproval(tx, p.Item.Stream, origin, b.Seq, b.Approval); err != nil {
+					return quarantine(ReasonConfigPending)
+				}
+			default:
+				if config {
+					return engine.Verdict{Status: repository.StVoided, Reason: ReasonApprovalFailed, Void: true, Marks: []string{MarkApprovalFlag, MarkApprovalReason + out.Reason}}
+				}
+				flag(MarkApprovalFlag)
+				marks = append(marks, MarkApprovalReason+out.Reason)
+			}
+		} else if !held {
 			if config {
 				return void(ReasonPermAbsent)
 			}
 			flag(MarkPermissionFlag)
 		} else {
 			at, _ := time.Parse("2006-01-02T15:04:05.000Z", b.At)
-			if !dir.StillHolds(tenant, b.Actor, in.Permission) || (!pack.Expires.IsZero() && at.After(pack.Expires)) {
+			if !dir.StillHolds(tenant, cred.Cred.OutletID, b.Actor, in.Permission) || (!pack.Expires.IsZero() && at.After(pack.Expires)) {
 				if config {
 					return void(ReasonPermWithdrawn)
 				}
@@ -237,9 +361,81 @@ func (g *Gateway) judge(tx repository.Tx, p *engine.Parsed, vc engine.VerdictCtx
 	return engine.Verdict{Status: repository.StAccepted, Marks: marks}
 }
 
+// DeviceActorPrefix starts the actor of a device session: device:<device id>.
+const DeviceActorPrefix = "device:"
+
+// deviceRoleTemplates are the permissions a device session holds, by device kind (x-provisional until the
+// ADR-0005 role templates exist; the KDS role is kds.bump and menu.availability.set).
+var deviceRoleTemplates = map[string][]string{
+	sp.KindKDS: {"kds.bump", "menu.availability.set"},
+}
+
+// DeviceRoleHolds reports whether the device role template of the kind holds the permission.
+func DeviceRoleHolds(kind, perm string) bool {
+	for _, p := range deviceRoleTemplates[kind] {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
+// deviceSession reports whether the op is recorded in a session of type device opened by the same origin: the
+// stored session row, or, for the session.open op itself, its own session mutation.
+func deviceSession(tx repository.Tx, origin string, b sp.Body) bool {
+	if b.Intent == sp.IntentSessionOpen {
+		for _, m := range b.Muts {
+			if m.E == "session" && m.ID == b.SID {
+				t, _ := m.F["type"].(string)
+				return t == sp.SessionDevice
+			}
+		}
+		return false
+	}
+	st, ok, _ := tx.SessionType(origin, b.SID)
+	return ok && st == sp.SessionDevice
+}
+
+// deviceSessionMaxAge is the longest a device session (a KDS; no member, no PIN) lasts. It is exempt from the 16-hour limit of
+// a pin session and is re-opened at the start of each business day, or after 26 hours when none is open
+// (sync/protocol-v1.md, Device-session lifetime).
+const deviceSessionMaxAge = 26 * time.Hour
+
+// deviceSessionExpired reports whether the op was recorded in a device session more than 26 hours after its opening, or before it.
+func deviceSessionExpired(tx repository.Tx, origin string, b sp.Body) bool {
+	if b.Intent == sp.IntentSessionOpen {
+		return false
+	}
+	row, ok, _ := tx.GetSession(origin, b.SID)
+	if !ok || row.OpenedAt == "" {
+		return false
+	}
+	at, err1 := time.Parse(sp.TimeLayout, b.At)
+	opened, err2 := time.Parse(sp.TimeLayout, row.OpenedAt)
+	return err1 != nil || err2 != nil || at.Before(opened) || at.After(opened.Add(deviceSessionMaxAge))
+}
+
+// manualBookEntry reports whether an op may take a number from a paper bill book: the intent types the
+// number (never allocates it) and the device's outlet is one the book was registered for.
+func manualBookEntry(si directory.SeriesInfo, intent, outlet string) bool {
+	in, known := sp.Intents[intent]
+	if !known || in.Numbering != "typed" {
+		return false
+	}
+	if len(si.Outlets) == 0 {
+		return true
+	}
+	for _, o := range si.Outlets {
+		if o == outlet {
+			return true
+		}
+	}
+	return false
+}
+
 func touchesLWW(muts []sp.Mut) bool {
 	for _, m := range muts {
-		if d, ok := engine.Entities[m.E]; ok && d.Policy == engine.PolLWW {
+		if d, ok := engine.Entities[m.E]; ok && d.HasLWW() {
 			return true
 		}
 	}
@@ -250,7 +446,13 @@ func touchesLWW(muts []sp.Mut) bool {
 // activation record and the void a refused configuration op needs.
 func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRec, p *engine.Parsed, v engine.Verdict) error {
 	marks := v.Marks
-	if !p.Opaque && p.Body.Doc != nil {
+	if hasMark(marks, MarkPIIDropped) {
+		// A value that does not match its commitment was stripped or altered in transit (P2-L2): told per origin, to the vendor.
+		if err := g.alert(tx, "vendor", "medium", "pii_commitment_mismatch", rec); err != nil {
+			return err
+		}
+	}
+	if !p.Opaque && len(p.Body.Documents()) > 0 {
 		if err := g.register(tx, rec, p.Body, v); err != nil {
 			return err
 		}
@@ -265,6 +467,11 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 			if err := g.alert(tx, "vendor", "high", "foreign_series", rec); err != nil {
 				return err
 			}
+		case ReasonDuplicateDocument:
+			sev = "high"
+			if err := g.alert(tx, "owner", "high", "duplicate_document", rec); err != nil {
+				return err
+			}
 		case ReasonChainBroken:
 			if err := g.alert(tx, "vendor", "high", "chain_broken", rec); err != nil {
 				return err
@@ -277,9 +484,35 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 		if err := tx.AddAlert(aud, sev, "quarantined:"+v.Reason, fmt.Sprintf("%s/%s/%d", rec.Origin, rec.Stream, rec.Seq)); err != nil {
 			return err
 		}
+		var body *sp.Body
+		if !p.Opaque {
+			body = &p.Body
+		}
+		if err := g.publishQuarantined(tx, rec, v.Reason, body); err != nil {
+			return err
+		}
 	case repository.StFlagged, repository.StAccepted:
 		if hasMark(marks, MarkAttributionUnverified) {
 			if err := g.alert(tx, "owner", "medium", "attribution_unverified", rec); err != nil {
+				return err
+			}
+		}
+		if hasMark(marks, MarkApprovalFlag) {
+			if err := g.alert(tx, "owner", "high", "approval_flag", rec); err != nil { // a trading fact is accepted at high severity
+				return err
+			}
+		}
+		if (rec.Intent == sp.IntentApprovalGrant || rec.Intent == sp.IntentApprovalSelfConfirm) && !p.Opaque {
+			for _, m := range p.Body.Muts {
+				if m.E == "approval" {
+					if err := g.resolveApprovalWaiters(tx, rec.Origin, m.ID); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if rec.Intent == "series.close" && !p.Opaque {
+			if err := g.noteSeriesClose(tx, rec, p.Body); err != nil {
 				return err
 			}
 		}
@@ -295,6 +528,11 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 		if err := g.publish(tx, rec); err != nil {
 			return err
 		}
+		if v.Status == repository.StFlagged {
+			if err := g.publishFlagged(tx, rec, marks); err != nil {
+				return err
+			}
+		}
 	}
 	if v.Void && !p.Opaque {
 		_, err := e.RecordAndSealTx(tx, engine.Input{Stream: rec.Stream, Intent: sp.IntentVoid, Muts: []sp.Mut{{
@@ -306,22 +544,14 @@ func (g *Gateway) stored(tx repository.Tx, e *engine.Engine, rec repository.OpRe
 	return nil
 }
 
-// register keeps the series register: every number seen, whatever its verdict (S7, A1.1).
+// register keeps the series register: every number the op carries, whatever its verdict (S7, A1.1).
 func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v engine.Verdict) error {
-	parts := strings.Split(b.Doc.Number, "/")
-	if len(parts) != 3 {
-		return nil
-	}
-	n, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil {
-		return nil
-	}
 	state := v.Status
 	if state == repository.StVoided {
 		state = repository.StQuarantined
 	}
 	mark := ""
-	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkUnsealed, MarkRecoveredSealed} {
+	for _, m := range []string{MarkForeign, MarkUnknownSeries, MarkDuplicate, MarkUnsealed, MarkRecoveredSealed, MarkManualBook} {
 		if hasMark(v.Marks, m) {
 			mark = m
 			break
@@ -330,8 +560,20 @@ func (g *Gateway) register(tx repository.Tx, rec repository.OpRec, b sp.Body, v 
 	if mark == MarkUnsealed {
 		mark = "recovered_unsealed"
 	}
-	return tx.PutRegister(repository.RegisterEntry{Code: parts[0], FY: parts[1], Num: n, Number: b.Doc.Number, DocType: b.Doc.Type,
-		Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark})
+	for _, doc := range b.Documents() {
+		code, fy, n, ok := doc.ParseNumber()
+		if !ok {
+			continue
+		}
+		if err := tx.PutRegister(repository.RegisterEntry{Code: code, FY: fy, Num: n, Number: doc.Number, DocType: doc.Type,
+			Origin: rec.Origin, Stream: rec.Stream, Seq: rec.Seq, State: state, Mark: mark, DocID: doc.ID}); err != nil {
+			return err
+		}
+		if err := g.recheckSeries(tx, code, fy); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // onFork keeps a slot whose content differs from what the cloud holds: both versions stay, a
@@ -343,7 +585,8 @@ func (g *Gateway) onFork(tx repository.Tx, c engine.Caller, rec repository.OpRec
 	}
 	if rec.Status == repository.StQuarantined && rec.Reason != ReasonFork {
 		rec.Reason = ReasonFork
-		rec.Marks = strings.Trim(rec.Marks+","+MarkFork, ",")
+		// A support confirmation was of the earlier cause and of that content (P2-L1): the fork needs its own.
+		rec.Marks = strings.Trim(strings.Join(dropMarks(splitMarks(rec.Marks), MarkVendorConfirmed), ",")+","+MarkFork, ",")
 		if err := tx.UpdateOp(rec); err != nil {
 			return err
 		}

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+
+	"github.com/hostryhq/svc-sync/contract/specs"
 )
 
-// The golden vectors in contract/vectors are the shared conformance data for every implementation
-// of Sync Protocol v1 (Go here, TypeScript in client-core). Regenerate with SYNC_UPDATE_VECTORS=1.
+// The shared conformance vectors live in api-specs (sync/conformance/v1.json, ADR-0002 S15) and are
+// run here against this implementation; the same file is run by go-common and client-core.
 type vectorFile struct {
 	Canonical []struct {
 		In, Out string
@@ -33,7 +35,6 @@ type vectorFile struct {
 		Seq                 int64
 		H, By, Rec, Message string
 	} `json:"attest_message"`
-	// EndorseVerify: Valid is what a conforming verifier answers for the endorsement under Pub.
 	EndorseVerify []struct {
 		Case, Pub, Origin, Stream string
 		Seq                       int64
@@ -45,110 +46,109 @@ type vectorFile struct {
 		Counter uint16
 		Hex     string
 	} `json:"hlc"`
+	SizeLimit []struct {
+		Field string
+		Bytes int
+		Valid bool
+	} `json:"size_limit"`
+	EmitBatch []struct {
+		Ops   int
+		Valid bool
+	} `json:"emit_batch"`
+	DrainStatement []struct {
+		Case, Pub     string
+		Statement     DrainStatement
+		SignedMessage string `json:"signed_message"`
+		StatementJCS  string `json:"statement_jcs"`
+		StatementHash string `json:"statement_hash"`
+		SigValid      bool   `json:"sig_valid"`
+	} `json:"drain_statement"`
+	ExamplePack map[string]string `json:"example_pack"`
 }
 
-// Fixed signed examples (ES256 is randomised, so they are constants): an op-signing key, its
-// signature over EndorseMessage and over the seal message of the same fields.
-const (
-	vecOpPub      = "BOLI_Yh8Lf-I2q3k5a-Wy_qIWWENpyprT7vOic-59ecsNzmvrxu6gNGfVU_8JWxHt8ep-v_qHuUStn5jSFzxjck"
-	vecEndorseSig = "SDnPSTTpcZEnKfi60KnAKUgEhrBOvoWG4n-jQVOMGHuT6IPDFXl-JNmSbTSbi7KFho4wE3U2OfZRpbRY9XDvKw"
-	vecSealSig    = "ScPMPCEs8sh6fUtAmfwofFU7Ydwh0rHC5uN1Dxf2up-Mj84Ty6YuI49uiecVG55fSPeweb39t0fStaW73SrYjg"
-)
-
-const vectorPath = "../contract/vectors/v1.json"
-
-func buildVectors() vectorFile {
+func loadVectors(t *testing.T) vectorFile {
+	t.Helper()
+	p, err := specs.Path("sync", "conformance", "v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var v vectorFile
-	for _, in := range []string{
-		`{"b":1,"a":[3,2,{"z":true,"y":null}],"c":"x"}`,
-		`{"é":1,"e":2,"éx":3}`,
-		"{\"s\":\"tab\\there \\u0001 \\\"q\\\" \\\\ é 中\"}",
-		`{"n":-0,"m":9007199254740991,"k":[ ]}`,
-		`{"emoji":"😀","😀":1,"￿":2}`,
-	} {
-		out, err := Canonicalize([]byte(in))
-		if err != nil {
-			panic(err)
-		}
-		v.Canonical = append(v.Canonical, struct{ In, Out string }{in, string(out)})
-	}
-	for _, b := range []string{`{"v":1}`, `{"a":"é"}`} {
-		v.Hash = append(v.Hash, struct{ Body, H string }{b, Hash(b)})
-	}
-	v.Genesis = append(v.Genesis, struct{ Origin, Stream, H string }{"dev-a", "outlet:o1", GenesisHash("dev-a", "outlet:o1")})
-	v.SealMessage = append(v.SealMessage, struct {
-		Origin, Stream string
-		Seq            int64
-		H, Message     string
-	}{"dev-a", "outlet:o1", 7, Hash("x"), SealMessage("dev-a", "outlet:o1", 7, Hash("x"))})
-	v.EndorseMessage = append(v.EndorseMessage, struct {
-		Origin, Stream  string
-		Seq             int64
-		H, Rec, Message string
-	}{"dev-a", "outlet:o1", 7, Hash("x"), "rec-1", EndorseMessage("dev-a", "outlet:o1", 7, Hash("x"), "rec-1")})
-	at := Attestation{Origin: "dev-a", Stream: "outlet:o1", Seq: 9, H: Hash("y"), By: "dev-a-r1", Rec: "rec-1"}
-	v.AttestMessage = append(v.AttestMessage, struct {
-		Origin, Stream      string
-		Seq                 int64
-		H, By, Rec, Message string
-	}{at.Origin, at.Stream, at.Seq, at.H, at.By, at.Rec, AttestationMessage(at)})
-	pub, _ := DecodePub(vecOpPub)
-	for _, c := range []struct {
-		name, rec, sig string
-		seq            int64
-	}{
-		{"valid endorsement", "rec-1", vecEndorseSig, 7},
-		{"different rec", "rec-2", vecEndorseSig, 7},
-		{"different seq", "rec-1", vecEndorseSig, 8},
-		{"seal-tag signature over the same fields is not an endorsement", "rec-1", vecSealSig, 7},
-	} {
-		e := Endorsement{Origin: "dev-a", Stream: "outlet:o1", Seq: c.seq, H: Hash("x"), Rec: c.rec, Kid: "gateway-op-1", Sig: c.sig}
-		v.EndorseVerify = append(v.EndorseVerify, struct {
-			Case, Pub, Origin, Stream string
-			Seq                       int64
-			H, Rec, Kid, Sig          string
-			Valid                     bool
-		}{c.name, vecOpPub, e.Origin, e.Stream, e.Seq, e.H, e.Rec, e.Kid, e.Sig, e.Verify(pub)})
-	}
-	for _, c := range []struct {
-		ms int64
-		c  uint16
-	}{{1795000000000, 0}, {1795000000000, 65535}, {0, 1}} {
-		v.HLC = append(v.HLC, struct {
-			Ms      int64
-			Counter uint16
-			Hex     string
-		}{c.ms, c.c, MakeHLC(c.ms, c.c).String()})
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
 	}
 	return v
 }
 
-func TestGoldenVectors(t *testing.T) {
-	want := buildVectors()
-	if os.Getenv("SYNC_UPDATE_VECTORS") == "1" {
-		raw, _ := json.MarshalIndent(want, "", "  ")
-		if err := os.WriteFile(vectorPath, append(raw, '\n'), 0o644); err != nil {
-			t.Fatal(err)
+func TestConformanceVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.Canonical) == 0 || len(v.SizeLimit) < 4 || len(v.EmitBatch) < 4 {
+		t.Fatal("the vector file lacks canonical, size_limit or emit_batch cases")
+	}
+	for _, c := range v.Canonical {
+		got, err := Canonicalize([]byte(c.In))
+		if err != nil || string(got) != c.Out {
+			t.Errorf("canonical %q: got %q (%v), want %q", c.In, got, err, c.Out)
 		}
 	}
-	raw, err := os.ReadFile(vectorPath)
-	if err != nil {
-		t.Fatal(err)
+	for _, c := range v.Hash {
+		if got := Hash(c.Body); got != c.H {
+			t.Errorf("hash %q: %s want %s", c.Body, got, c.H)
+		}
 	}
-	var got vectorFile
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatal(err)
+	for _, c := range v.Genesis {
+		if got := GenesisHash(c.Origin, c.Stream); got != c.H {
+			t.Errorf("genesis %s/%s: %s want %s", c.Origin, c.Stream, got, c.H)
+		}
 	}
-	a, _ := json.Marshal(got)
-	b, _ := json.Marshal(want)
-	if string(a) != string(b) {
-		t.Fatalf("vectors file is out of date; run with SYNC_UPDATE_VECTORS=1\n%s\n%s", a, b)
+	for _, c := range v.SealMessage {
+		if got := SealMessage(c.Origin, c.Stream, c.Seq, c.H); got != c.Message {
+			t.Errorf("seal message %q want %q", got, c.Message)
+		}
 	}
-	// Canonical output must be a fixed point.
-	for _, c := range got.Canonical {
-		again, err := Canonicalize([]byte(c.Out))
-		if err != nil || string(again) != c.Out {
-			t.Fatalf("not idempotent: %q", c.Out)
+	for _, c := range v.EndorseMessage {
+		if got := EndorseMessage(c.Origin, c.Stream, c.Seq, c.H, c.Rec); got != c.Message {
+			t.Errorf("endorse message %q want %q", got, c.Message)
+		}
+	}
+	for _, c := range v.AttestMessage {
+		a := Attestation{Origin: c.Origin, Stream: c.Stream, Seq: c.Seq, H: c.H, By: c.By, Rec: c.Rec}
+		if got := AttestationMessage(a); got != c.Message {
+			t.Errorf("attest message %q want %q", got, c.Message)
+		}
+	}
+	for _, c := range v.EndorseVerify {
+		pub, err := DecodePub(c.Pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := Endorsement{Origin: c.Origin, Stream: c.Stream, Seq: c.Seq, H: c.H, Rec: c.Rec, Kid: c.Kid, Sig: c.Sig}
+		if got := e.Verify(pub); got != c.Valid {
+			t.Errorf("endorsement case %q: valid=%v want %v", c.Case, got, c.Valid)
+		}
+	}
+	for _, c := range v.HLC {
+		if got := MakeHLC(c.Ms, c.Counter).String(); got != c.Hex {
+			t.Errorf("hlc %d/%d: %s want %s", c.Ms, c.Counter, got, c.Hex)
+		}
+	}
+	for _, c := range v.SizeLimit {
+		body, pii := 0, 0
+		if c.Field == "body" {
+			body = c.Bytes
+		} else {
+			pii = c.Bytes
+		}
+		if got := CheckSize(body, pii) == nil; got != c.Valid {
+			t.Errorf("size %s %d bytes: valid=%v want %v", c.Field, c.Bytes, got, c.Valid)
+		}
+	}
+	for _, c := range v.EmitBatch {
+		if got := c.Ops >= MinEmitOps && c.Ops <= MaxEmitOps; got != c.Valid {
+			t.Errorf("emit batch %d: valid=%v want %v", c.Ops, got, c.Valid)
 		}
 	}
 }
@@ -161,11 +161,29 @@ func TestCanonicalRejectsFractionsAndExponents(t *testing.T) {
 	}
 }
 
-func TestEndorsementVectorsHaveTheExpectedVerdicts(t *testing.T) {
-	want := []bool{true, false, false, false}
-	for i, c := range buildVectors().EndorseVerify {
-		if c.Valid != want[i] {
-			t.Fatalf("%s: valid=%v want %v", c.Case, c.Valid, want[i])
+func TestDrainStatementVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.DrainStatement) < 3 {
+		t.Fatal("drain_statement vectors are required (ADR-0005 A3.3)")
+	}
+	for _, c := range v.DrainStatement {
+		msg, err := c.Statement.SignedMessage()
+		if err != nil || msg != c.SignedMessage {
+			t.Errorf("%s: signed message %q (%v), vector %q", c.Case, msg, err, c.SignedMessage)
+		}
+		pub, err := DecodePub(c.Pub)
+		if err != nil {
+			t.Fatalf("%s: %v", c.Case, err)
+		}
+		if got := c.Statement.Verify(pub); got != c.SigValid {
+			t.Errorf("%s: signature valid=%v, vector says %v", c.Case, got, c.SigValid)
+		}
+		raw, err := drainJCS(c.Statement, true)
+		if err != nil || string(raw) != c.StatementJCS {
+			t.Errorf("%s: JCS with sig differs from the vector (%v)", c.Case, err)
+		}
+		if h, err := c.Statement.Hash(); err != nil || h != c.StatementHash {
+			t.Errorf("%s: statement_hash %s (%v), vector %s", c.Case, h, err, c.StatementHash)
 		}
 	}
 }

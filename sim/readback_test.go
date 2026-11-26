@@ -18,11 +18,19 @@ import (
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
 
-// stockOp records a trading op with an explicit proof, as a member of the cashier role.
-func stockOp(t *testing.T, d *Device, proof string) sp.Item {
+// stockOp records a trading op as a member of the cashier role in a session opened with the right PIN.
+func stockOp(t *testing.T, d *Device) sp.Item {
 	t.Helper()
 	sid := must(d.session(pCashier))
-	return must(d.record(engine.Input{Stream: "outlet:" + d.W.Outlet, Intent: "stock.move", Actor: pCashier, SID: sid, Proof: proof,
+	return must(d.record(engine.Input{Stream: "outlet:" + d.W.Outlet, Intent: "stock.move", Actor: pCashier, SID: sid,
+		Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1000)}}}}, true))
+}
+
+// stockOpBad records the same op in a session whose session.open carried a wrong proof (A3.1: the proof travels once).
+func stockOpBad(t *testing.T, d *Device) sp.Item {
+	t.Helper()
+	sid := must(d.BadSession(pCashier))
+	return must(d.record(engine.Input{Stream: "outlet:" + d.W.Outlet, Intent: "stock.move", Actor: pCashier, SID: sid,
 		Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1000)}}}}, true))
 }
 
@@ -43,8 +51,8 @@ func pushAndPull(t *testing.T, d *Device) (string, string) {
 func TestRB1_AValidAndAnInvalidProofGiveTheDeviceIdenticalAnswers(t *testing.T) {
 	good, _ := newTestWorld(t, 21, WorldOptions{Pos: 1})
 	badW, _ := newTestWorld(t, 21, WorldOptions{Pos: 1})
-	stockOp(t, good.Devices[0], good.Identity.MintProof(good.Devices[0].ID, pCashier))
-	stockOp(t, badW.Devices[0], "bogus-proof")
+	stockOp(t, good.Devices[0])
+	stockOpBad(t, badW.Devices[0])
 	gp, gl := pushAndPull(t, good.Devices[0])
 	bp, bl := pushAndPull(t, badW.Devices[0])
 	if gp != bp || gl != bl {
@@ -57,7 +65,9 @@ func TestRB1_AValidAndAnInvalidProofGiveTheDeviceIdenticalAnswers(t *testing.T) 
 	}
 	// The flag exists in the cloud and is readable only with a member token.
 	ex := must(badW.GW.Exceptions(bg, badW.Tenant))
-	if len(ex) != 1 || ex[0].Marks[0] != service.MarkAttributionUnverified {
+	// The session.open that carried the wrong proof and the sale made in that session (A3.1: the verdict is stored
+	// once and every later op of the session is judged from it).
+	if len(ex) != 2 || ex[0].Marks[0] != service.MarkAttributionUnverified || ex[1].Marks[0] != service.MarkAttributionUnverified {
 		t.Fatalf("exceptions: %+v", ex)
 	}
 	get := func(w *World, tok string) int {
@@ -157,15 +167,18 @@ func (d *Device) rowOf(entity, id string) (map[string]any, bool) {
 func TestRB4_ThreeKindsOfRefusedConfigurationLookTheSameToTheDevice(t *testing.T) {
 	w, _ := newTestWorld(t, 24, WorldOptions{Pos: 1})
 	a := w.Devices[0]
-	price := func(actor, proof string) sp.Item {
+	price := func(actor string, bad bool) sp.Item {
 		sid := must(a.session(actor))
-		return must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: actor, SID: sid, Proof: proof,
+		if bad {
+			sid = must(a.BadSession(actor))
+		}
+		return must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: actor, SID: sid,
 			Muts: []sp.Mut{{E: "menu_item", ID: "menu-1", K: sp.KSet, F: map[string]any{"price_paise": int64(500)}, Prev: map[string]string{"price_paise": engine.ZeroStamp}}}}, true))
 	}
-	failedProof := price(pManager, "bogus-proof")
-	missingPerm := price(pCashier, w.Identity.MintProof(a.ID, pCashier)) // the cashier role has no menu.edit
+	failedProof := price(pManager, true)
+	missingPerm := price(pCashier, false) // the cashier role has no menu.edit
 	w.Identity.RemoveMember(w.Tenant, pManager)
-	removed := price(pManager, w.Identity.MintProof(a.ID, pManager))
+	removed := price(pManager, false)
 	w.toCloud(t, a)
 	reasons := map[string]string{}
 	for _, it := range []sp.Item{failedProof, missingPerm, removed} {
@@ -204,10 +217,10 @@ func guessRun(t *testing.T, batch bool) *World {
 	for i := 0; i < 244; i++ {
 		proof := fmt.Sprintf("guess-%03d", i)
 		if i == 100 {
-			proof = w.Identity.MintProof(a.ID, pManager)
+			proof = "" // the real PIN: SessionWith mints the right proof
 		}
-		sid := fmt.Sprintf("guess-session-%d", i)
-		it := must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid, Proof: proof,
+		sid := must(a.SessionWith(pManager, fmt.Sprintf("g%03d", i), proof))
+		it := must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid,
 			Muts: []sp.Mut{{E: "menu_item", ID: "menu-1", K: sp.KSet, F: map[string]any{"price_paise": int64(100 + i)}, Prev: map[string]string{"price_paise": engine.ZeroStamp}}}}, true))
 		items = append(items, it)
 		if !batch {
@@ -247,13 +260,14 @@ func guessRun(t *testing.T, batch bool) *World {
 	if r := w.rec(t, ok); r.Status != repository.StAccepted {
 		t.Fatalf("same member, other device: %s/%s", r.Status, r.Reason)
 	}
-	// Trading facts by that member on the locked device are still verified, and flagged if invalid.
+	// Identity answers locked for every op kind (security final verdict): a sale by that member on the
+	// locked device is kept, never rejected, and its attribution is flagged as unverified, valid proof or not.
 	good := must(a.Do(pManager, engine.Input{Intent: "stock.move", Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1)}}}}))
-	invalid := must(a.record(engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pManager, SID: "other-sid", Proof: "bogus",
+	invalid := must(a.record(engine.Input{Stream: "outlet:" + w.Outlet, Intent: "stock.move", Actor: pManager, SID: must(a.BadSession(pManager)),
 		Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1)}}}}, true))
 	w.toCloud(t, a)
-	if r := w.rec(t, good); r.Status != repository.StAccepted {
-		t.Fatalf("valid trading proof on a locked pair: %s", r.Status)
+	if r := w.rec(t, good); r.Status != repository.StFlagged || !strings.Contains(r.Marks, service.MarkAttributionUnverified) {
+		t.Fatalf("valid trading proof on a locked pair: %s %s", r.Status, r.Marks)
 	}
 	if r := w.rec(t, invalid); r.Status != repository.StFlagged {
 		t.Fatalf("invalid trading proof on a locked pair: %s", r.Status)
@@ -271,9 +285,10 @@ func TestRB5_TokenRequestFailuresShareTheCounterAndRestoreDoesNotCount(t *testin
 	for i := 0; i < 4; i++ { // four failed PIN checks at the pin token request
 		w.Identity.PinTokenFailure(w.Tenant, pManager, a.ID, fmt.Sprintf("tok-%d", i))
 	}
-	sid := must(a.session(pManager))
-	bad := must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid, Proof: "bogus",
+	badSid := must(a.BadSession(pManager))
+	bad := must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: pManager, SID: badSid,
 		Muts: []sp.Mut{{E: "menu_item", ID: "menu-1", K: sp.KSet, F: map[string]any{"price_paise": int64(1)}, Prev: map[string]string{"price_paise": engine.ZeroStamp}}}}, true))
+	sid := must(a.session(pManager)) // the right PIN, asked after the fifth failure
 	real := must(a.record(engine.Input{Stream: "brand:" + w.Brand, Intent: "menu.price.set", Actor: pManager, SID: sid,
 		Muts: []sp.Mut{{E: "menu_item", ID: "menu-1", K: sp.KSet, F: map[string]any{"price_paise": int64(2)}, Prev: map[string]string{"price_paise": engine.ZeroStamp}}}}, true))
 	w.toCloud(t, a)
@@ -299,8 +314,9 @@ func TestRB5_TokenRequestFailuresShareTheCounterAndRestoreDoesNotCount(t *testin
 		t.Fatalf("an unverifiable proof must not count, counter=%d", n)
 	}
 	w2.Identity.SetDown(false)
-	if n := must(w2.GW.ReverifyPending(bg, w2.Tenant)); n != 1 {
-		t.Fatalf("reverified %d", n)
+	// The session's proof is asked again (A3.1 item 4), then the op that waited is judged again.
+	if n := must(w2.GW.ResolveSessions(bg, w2.Tenant)); n != 1 {
+		t.Fatalf("resolved %d sessions", n)
 	}
 	if r := w2.rec(t, pend); r.Status != repository.StAccepted {
 		t.Fatalf("after identity returns: %s/%s", r.Status, r.Reason)

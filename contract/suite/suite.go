@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostryhq/svc-sync/contract/specs"
 	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
@@ -38,7 +39,14 @@ type Target struct {
 	IdentityPub *ecdsa.PublicKey
 	CloudPub    *ecdsa.PublicKey
 	NewPOS      func() (Dev, error)
+	// Brand is the brand of the tenant's devices (a stream a cloud emit may write to).
+	Brand string
+	// ServiceToken mints a service token of the calling service for a tenant ("" mints one that carries none).
+	ServiceToken func(caller, tenant string) string
 }
+
+// api is the contract of record, read once from the api-specs checkout.
+var api *specs.OpenAPI
 
 type node struct {
 	d   Dev
@@ -82,8 +90,37 @@ func (tg Target) do(t *testing.T, method, path, token string, in, out any) *http
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	return tg.send(t, method, path, req, out)
+}
+
+// send serves req and checks the answer against openapi/sync/v1: a 200 body validates against the
+// operation's response schema, any other answer is an RFC 9457 problem with a code.
+func (tg Target) send(t *testing.T, method, path string, req *http.Request, out any) *httptest.ResponseRecorder {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	tg.Handler.ServeHTTP(rec, req)
+	if op, ok := api.Find(method, path); ok {
+		var v any
+		switch {
+		case rec.Code == http.StatusOK:
+			if sc := api.ResponseSchema(op, 200); sc != nil {
+				if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+					t.Fatalf("%s %s: answer is not JSON: %v", method, path, err)
+				}
+				if err := api.Validate(sc, v); err != nil {
+					t.Fatalf("%s %s (%s): the answer does not conform to the contract: %v: %s", method, path, op.ID, err, rec.Body.String())
+				}
+			}
+		case rec.Code >= 400:
+			var p struct {
+				Code string `json:"code"`
+				Type string `json:"type"`
+			}
+			if !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/problem+json") || json.Unmarshal(rec.Body.Bytes(), &p) != nil || p.Code == "" || !strings.HasPrefix(p.Type, "urn:hostry:problem:") {
+				t.Fatalf("%s %s: %d is not an RFC 9457 problem with a code: %q", method, path, rec.Code, rec.Body.String())
+			}
+		}
+	}
 	if out != nil && rec.Code == http.StatusOK {
 		if err := json.Unmarshal(rec.Body.Bytes(), out); err != nil {
 			t.Fatalf("%s %s: response is not the documented shape: %v", method, path, err)
@@ -94,8 +131,8 @@ func (tg Target) do(t *testing.T, method, path, token string, in, out any) *http
 
 func record(t *testing.T, n *node, code string) sp.Item {
 	t.Helper()
-	it, err := n.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + n.eng.Config().Outlet, Intent: "stock.move", Actor: "m1", SID: "s1", PackV: "v1",
-		Muts: []sp.Mut{{E: "stock_level", ID: "item-1", K: sp.KDelta, F: map[string]any{"qty_milli": int64(1000)}}}})
+	it, err := n.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + n.eng.Config().Outlet, Intent: "payment.record", Actor: "m1", SID: "s1", PackV: 1,
+		Muts: []sp.Mut{{E: "payment", ID: "pay-1", K: sp.KInsert, F: map[string]any{"amount_paise": int64(1000)}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +141,10 @@ func record(t *testing.T, n *node, code string) sp.Item {
 
 // Run executes the suite.
 func Run(t *testing.T, tg Target) {
+	var err error
+	if api, err = specs.LoadOpenAPI(); err != nil {
+		t.Fatal(err)
+	}
 	t.Run("hello answers the documented shape and refuses anonymous callers", func(t *testing.T) {
 		n := tg.node(t)
 		var h sp.HelloResponse
@@ -159,7 +200,7 @@ func Run(t *testing.T, tg Target) {
 		_ = b
 		a.eng = engine.New(engine.Config{Role: engine.RoleDevice, Tenant: tg.Tenant, Outlet: tg.Outlet, Origin: a.d.ID, Key: a.d.Key, Store: a.eng.Config().Store, Trust: a.eng.Config().Trust,
 			Clock: sp.NewClock(tg.Now), Series: series(b.d.SaleCode)})
-		it, err := a.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + tg.Outlet, Intent: "bill.finalize", Actor: "m1", SID: "s1", PackV: "v1", DocType: "tax_invoice",
+		it, err := a.eng.Record(context.Background(), engine.Input{Stream: "outlet:" + tg.Outlet, Intent: "bill.finalize", Actor: "m1", SID: "s1", PackV: 1, DocType: "tax_invoice",
 			MutsFn: func(n string) []sp.Mut {
 				return []sp.Mut{{E: "bill", ID: "b1", K: sp.KInsert, F: map[string]any{"number": n, "total_paise": int64(100)}}}
 			}})
@@ -184,6 +225,9 @@ func Run(t *testing.T, tg Target) {
 		}
 	})
 
+	tg.runEmit(t)
+	tg.runErase(t)
+
 	t.Run("token rules: drain tokens only at the upload, device tokens not there, admin needs a member", func(t *testing.T) {
 		a := tg.node(t)
 		if rec := tg.do(t, "POST", "/sync/v1/push", a.d.DrainToken(""), sp.PushRequest{}, nil); rec.Code != 401 {
@@ -199,3 +243,15 @@ func Run(t *testing.T, tg Target) {
 }
 
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+// doSvc calls with a service token instead of a bearer token.
+func (tg Target) doSvc(t *testing.T, method, path, svcToken string, in, out any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(in)
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if svcToken != "" {
+		req.Header.Set("Hostry-Service-Token", svcToken)
+	}
+	return tg.send(t, method, path, req, out)
+}

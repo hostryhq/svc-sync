@@ -15,7 +15,7 @@ func target(t *testing.T, d *Double) suite.Target {
 	t.Helper()
 	return suite.Target{
 		Handler: d.Handler(), Tenant: Tenant, Outlet: Outlet, Now: d.Now,
-		IdentityPub: d.Identity.IdentityPub(), CloudPub: &d.Identity.CloudKey.Priv.PublicKey,
+		Brand: Brand, ServiceToken: d.ServiceToken, IdentityPub: d.Identity.IdentityPub(), CloudPub: &d.Identity.CloudKey.Priv.PublicKey,
 		NewPOS: func() (suite.Dev, error) {
 			v, err := d.NewDevice(sp.KindPOS)
 			if err != nil {

@@ -1,141 +1,89 @@
-# Sync Protocol v1 wire contract (PoC)
+# Sync Protocol v1: where the contract lives
 
-`sync-v1.openapi.yaml` is the machine-readable contract; this file holds the rules JSON Schema cannot
-state. `vectors/v1.json` is the shared conformance data (canonical JSON, hashes, genesis hash, seal
-message, HLC, endorsement and attestation messages, endorsement verification cases). Go checks it in `syncproto/vectors_test.go`; client-core checks the same file. Owned by
-svc-sync during the Phase 1 proof of concept; it should move to `api-specs` (`openapi/sync`,
-`sync/conformance`) when that repo takes sync.
+svc-sync keeps no copy of the contract. It reads the **api-specs** repository (ADR-0002 A2.3):
 
-## Framing and hashing
-- An op travels as `Item{origin, stream, seq, h, body, pii}`. `body` is the **canonical JSON text of the op
-  body as a JSON string**. Relays forward it byte for byte; every verifier hashes the UTF-8 bytes it
-  received: `h = lowercase hex SHA-256(body)`. Nobody re-serialises (S17).
-- Canonical form is RFC 8785 for the integer-only subset: sorted keys (UTF-16 order), no whitespace, minimal
-  escapes, integers only within +-(2^53-1). Fractions and exponents are refused (money is paise).
-- Chain: `ph` of op n is `h` of op n-1 of the same origin and stream; op 1 chains to
-  `sha256("hostry-genesis-v1\n" + origin + "\n" + stream)`.
-- Seal: ES256 (raw r||s, base64url) over `sha256("hostry-seal-v1\n" + origin + "\n" + stream + "\n" + seq + "\n" + h)`.
-  A push group (origin, stream) must end at a sealed op; a node accepts nothing a valid seal does not cover.
-  The hub and cloud serve ops only up to a seal boundary.
-- **Endorsement (ADR-0002 A2.1; replaces the PoC rule "an op-signing key may seal any origin").** The released,
-  previously unsealed tail of a key-lost origin has no origin seal. The gateway signs a separate object
-  `endorsement = {origin, stream, seq, h, rec, kid, sig}`: ES256 by an op-signing key (`cloud_keys` of the pack, named
-  by `kid`) over `sha256("hostry-endorse-v1\n" + origin + "\n" + stream + "\n" + seq + "\n" + h + "\n" + rec)`; `rec` is
-  the recovery id. One endorsement per released op, made in the release transaction (a voided configuration op gets none).
-  Wire fields: `endorsements` and `attestations` (arrays) in the pull response, in the push request and in the
-  quarantine-upload; the adopting device's credential travels in `creds` of a pull. **Seal rule:** a signature by an
-  op-signing key under the `hostry-seal-v1` tag is valid only for a `cloud-<epoch>` origin (the seal's `kid` selects the
-  key; a key the node does not hold, or has revoked, verifies nothing). It never seals a device origin.
-- **Verifier rule (hub, device, gateway; identical).** An op of origin X that no seal of X covers is accepted only if
-  (1) an endorsement for exactly `(origin, stream, seq, h)` verifies under a *current* op-signing key; (2) the node holds
-  an identity-signed credential of a device Y with `recovers: X`; (3) an attestation for `(X, stream)` with the same `rec`
-  verifies under Y's key, the op's `seq` is at or below the attested `seq`, and the op the node holds (or has in the
-  batch) at the attested `seq` has the attested `h`. The chain check (`ph`) does the rest, so the highest verified
-  endorsement of a batch covers the chain below it. Every op accepted this way is marked `unsealed` in the node's audit
-  views. Anything else unsealed is refused (`unsealed`).
-- **Serving and relaying endorsements (the client must do this too).** An endorsement counts as a seal boundary: a hub,
-  device or gateway cuts a served or pushed batch at a seal *or* an endorsement. A batch whose cut is an endorsement carries
-  **every endorsement in the range** (not only the last), the last origin seal in the range (so that the sealed part stays
-  unmarked), the stored attestation(s), and in a pull the credential(s) of the adopting device. A node therefore must
-  *store* what it verified (endorsements, attestations) and re-serve it with the ops. A released op answered for a
-  `placeholders` entry carries its endorsement, attestation and the credential the same way. A node holding the
-  placeholder verifies an endorsement that arrives with the body by the rule above and marks the op `unsealed`. A body that
-  arrives with no endorsement is taken by hash under the A2.8 rules below.
-- **Placeholders and bodies taken by hash (ADR-0002 A2.8 item 1).**
-  1. *No placeholder above the proven head.* A node accepts a placeholder only inside a range a valid seal (or an
-     endorsement under the A2.1 rule) covers. A placeholder after the last covered slot is accepted only from the **cloud**
-     (the node's upstream is the cloud itself: a hub's own upstream, or a device's direct cloud route); from a hub or any
-     other relay it is refused (`unsealed`) and nothing is stored. A relay never **serves** a trailing placeholder either,
-     and a seal that names a placeholder slot is stored and served with it.
-  2. *Bind whenever it can be bound.* A body for a held placeholder must hash to the held `h`; it must chain to the op
-     held at `seq-1` (genesis for 1); if a seal names `(seq, h)` it must match; if the op at `seq+1` is held with a body
-     (and is not itself `unbound`) its `ph` must equal the body's hash. A body for a slot above the origin's sealed head is
-     taken only from the cloud. When a later pull supplies the op above a slot taken `unbound`, the link is checked then and
-     clears the mark.
-  3. *Mark and cross-check.* A body taken with nothing to bind it is marked `unbound` in the node's audit views. A node
-     **never relays an `unbound` op** (a hub's `pull` and `push` stop before it, and before everything after it in that
-     origin's chain). At every **direct cloud `hello`** the node lists them in `unbound`; the gateway answers `unbound_h`
-     with its own `h` for each slot it holds; equal clears the mark. A node that reaches the cloud only through a hub must
-     do a direct `hello` at least every 24 hours when the cloud is reachable (`Engine.DirectCloudDue`).
-  4. *A mismatch is never silent.* A body that contradicts the held hash, a seal or a link, and an `unbound_h` that
-     differs, is a **`chain_conflict`**: the slot is refused (`chain_conflict` in `refused`), the node keeps what it holds,
-     takes nothing more of that origin and stream from that kind of upstream (cloud or relay), and sends the conflict in
-     `chain_conflicts` of its next direct cloud `hello`; the gateway raises one vendor alert (`chain_conflict`) per slot.
-- **After a cloud restore (A2.1 item 5).** While its re-offer is open a node's push also carries `items` + `endorsements`
-  (+ `attestations`) for endorsed ops *at or below* the cloud's vector. The gateway takes a slot it holds as `quarantined`
-  (`unsealed_tail`) as released, marked `unsealed`, with no owner action, if endorsement, credential and attestation
-  verify. Tail ops that come back without an endorsement go back to quarantine through the recovery re-upload.
-- **Key rotation (A2.1 item 6).** After an emergency rotation the gateway re-signs its cloud-origin seals and every
-  endorsement under the new key. A node refreshes its pack (adds the new `cloud_keys` entry, drops the old) and then
-  lists any op whose stored endorsement is under a dropped key in `placeholders`; the answer carries the re-issued
-  endorsement and replaces the stored one. A node that holds only the new key converges from the cloud (or from a hub
-  that has refreshed).
-- **Stale cloud seals (A2.8 item 2).** A relay also refreshes the cloud-origin **seals** it stored: `pull` carries
-  `stale_seals` (the `origin/stream/seq` of every stored seal under a dropped key, at most 200) and the answer carries
-  `seal_refresh` (the seals as the upstream holds them now). A refreshed seal replaces the stored one only if it verifies
-  under a key the node accepts, **under the `kid` it names** (never another held key), and names the hash already held.
-  Interim: a node that refuses a cloud-origin seal under a dropped key marks a direct cloud read as due, so it does not
-  stall silently.
-- Vectors are flat maps keyed `origin/stream`. Placeholders (no `body`) fill held slots and carry `h`.
+| What | Path in api-specs |
+|---|---|
+| HTTP surface, including `emitOps` | `openapi/sync/v1/openapi.yaml` |
+| Normative rules a schema cannot state (canonical form, hashing, chain, seal, endorsement, size limit, the op event) | `sync/protocol-v1.md` |
+| Shared vectors (Go and TypeScript engines) | `sync/conformance/v1.json` |
+| Intent registry (permissions, kinds, entities) | `sync/intents/*.yaml` |
+| Entity registry (owners, policies, `doc_number`, `replicated_to`) | `entities/` |
+| Bus events | `events/sync/*` |
 
-## Sync void (answer to "is the assumed encoding right")
-Confirmed with one correction: intent `sync.void` from origin `cloud-<epoch>`, one mutation
-`{e:"sync_void", id:"<stream>|<origin>|<seq>", k:"insert", f:{origin, stream, seq, reason:"refused"}}`. The `id`
-is `stream|origin|seq` (the client's form; the gateway now emits exactly this). `reason` is always `refused`.
-The void is sealed by the gateway like any cloud-origin op. A node adds the named op to its void set.
+Pinned version: branch `feat/phase2-specs` at `1c94c67` (round 5: ADR-0014 A3, `14c76fd` plus the fix that intent binds name only fields the citing op records; before it `6e63014`, round 4b, ADR-0005 A3). The Go libraries are pinned in `go.mod` (go-common
+`feat/phase2-libs` @ `92884d6`, go-auth `feat/phase2-auth` @ `94f1970`); svc-identity `feat/phase2-identity` @ `2ba5adc` and svc-tenancy
+`feat/phase2-tenancy` @ `3792f07` in `identityreal/go.mod`. The checkout is found through `API_SPECS_DIR`, or as a sibling directory
+`../api-specs-p2`, then `../api-specs` (`contract/specs`). Tests fail, not skip, without it.
 
-## Keys: how the op-signing key reaches clients
-Through the **signed offline pack** (ADR-0005 section 6), as `cloud_keys: {kid: pub}` (X9.62 uncompressed P-256 point,
-base64url), together with the identity verification key. Never through `hello` (trust on first use would
-defeat the seal). `KeyRing.addCloudKey(kid, pub)` is the right entry. Seals carry `kid`.
+## What is checked here
+- `syncproto/vectors_test.go`: the shared vectors against this implementation.
+- `syncproto/registry_test.go`: `intents_gen.go` is exactly what `go run ./cmd/genintents` writes from the registry; every
+  device permission is a catalogue key (`common/permissions.yaml`); the document-number fields the gateway reads are the
+  `doc_number` fields of `entities/`.
+- `api/spec_test.go`: every OpenAPI example decodes strictly into the wire types and matches its own schema; emit callers.
+- `contract/suite` (run against the real gateway in `sim` and against `double/`): every answer is validated against the
+  operation's response schema, every error is an RFC 9457 problem with a code, and the emit contract (below).
 
-## Authentication
-- Cloud: `Authorization: Bearer` go-auth device token (typ `device`). Drain tokens only at
-  `quarantine-upload`; a recovery drain token has subject `recovers:<old device id>`.
-- LAN hub: `Hostry-Device-Assertion` = base64url JSON `{cred, ts, sig}`, `sig` over
-  `sha256("hostry-lan-v1\n" + METHOD + "\n" + path + "\n" + ts + "\n" + hex SHA-256 of the request body bytes **as sent**
-  (after gzip, if gzipped))`. The hub answers every call with `Hostry-Hub-Proof` = base64url JSON `{cred, sig}`, `sig`
-  over `sha256("hostry-hub-v1\n" + requestSig + "\n" + hex SHA-256 of the response body)`. Timestamp window 2 minutes.
-  TLS is not in the PoC.
+## Emit (`POST /internal/v1/emit`)
+Service token from `catalog` or `billing`; the gateway stamps `cloud-<epoch>`, seq, ph, hlc and seals each op. The tenant is the
+**service token's** and must equal the request's `tenant_id` (403 `emit.tenant_mismatch`); a token without a tenant is refused (401)
+(O2-11; go-common `emit.TokenSource(ctx, tenant)` mints it).
 
-## hello
-- `snapshot_required` is always `false`; the PoC does not need a snapshot client (`GET /snapshot` exists in its
-  simplest form for tooling).
-- A hub's `cloud_vector` is what the cloud confirmed to **that hub** at its last upstream contact. A device may
-  treat its ops under it as delivered to the cloud (`in_cloud` via the hub). Intended.
-- `epoch` is the cloud epoch. **Re-offer (ADR-0002 A2.2).** Each node persists two meta values: `epoch` (the newest epoch
-  heard from any upstream) and `reoffered_epoch` (the epoch it last finished re-offering for). The re-offer is **open** while
-  they differ. A hub's `hello.epoch` may open it (when it differs from both values; a hub that repeats the already
-  re-offered epoch is stale and ignored); the cloud's `hello.epoch` is authoritative. While it is open a device whose
-  upstream is a hub also runs `hello` and push **against the cloud directly**, on its ordinary retry schedule, and keeps
-  syncing with the hub: the hub may hold only a placeholder for a slot whose body the cloud lost, so the origin is the
-  only node that can deliver it (simulator seed 1). The first push round of an open re-offer also carries the endorsed ops
-  below the cloud's vector (above). **Closing:** only a direct cloud `hello` whose epoch equals the newest epoch, after
-  which nothing is left to push, sets `reoffered_epoch = epoch`. An op the cloud refused (listed in `refused` of the push
-  response) does not count as left to push, so one op refused for ever cannot hold the re-offer open. Every direct cloud
-  contact for another reason (pack refresh, delivery of an op a hub will not relay) compares epoch and vector the same way.
-  A device with no cloud route stays open; the gateway raises "unrecoverable origin gap" 24 hours after a node first reports
-  a vector above the cloud's, and clears it when the node's vector is no longer above.
+## Personal data (in api-specs since round 3, O2-12)
+`syncproto/piic.go` is the only place that knows the construction and matches `go-common/sync` and `protocol-v1.md`: the sealed body
+carries `pii_c` = per field `SHA-256(salt || JCS(value))`; wire `pii` = entity -> row id -> field -> value plus the field's salt under
+`~s:<field>`; a node keeps only fields that verify (value and salt together). **The gateway publishes the verified values with their
+salts** in the op event; the owning service verifies again. Erasure (`sync.pii.erase`, record `pii_erase`) removes values AND salts; the
+commitments stay. The next direct cloud hello carries `pii_erased` (refs of the target ops).
 
-## Manager and vendor endpoints
-Cloud only, on go-auth's `Guard`: tenant-realm user or support token, never a device token. A support token is accepted
-only with the `admin` service token (ADR-0013 V2), never carries `*`, a sensitive, strong-only or owner-grant permission,
-and every request on its authority is written to `vendor_access_log` in the transaction of the action (a refusal in a short
-one of its own). Lists and decisions are scoped by outlet: a slot of another outlet is 404, a brand or tenant stream needs
-an all-outlets grant. `release`, `discard` and `confirm` take `{origin, stream, seq, reason}` (reason 1 to 200 characters)
-and write the tenant-visible `audit_log` record (actor, action, slot, reason, status before and after) in the same
-transaction as the status change. Release of a chain-broken, foreign-series or fork hold needs the vendor confirmation first:
-`confirm` (a support token in act mode, permission `sync.quarantine.confirm`, `support_actable`) marks the slot
-`vendor_confirmed` and releases nothing. An unsealed tail also needs `device.recover` (`strong_only`): refused with
-`approval_required` on a binding under caution. The permissions and flags are in `docs/poc-notes.md`.
+## Wire fields of ADR-0002 A2.8 that api-specs does not carry (for the spec owner)
+Implemented here and in `client-core-sync`; `protocol-v1.md` still says "no settled field name" and the OpenAPI has none of them.
+| Where | Field | Shape | Meaning |
+|---|---|---|---|
+| `HelloRequest` | `unbound` | `[{origin, stream, seq}]` | slots the node took by hash with no binding yet; only the cloud answers; listed at every direct cloud hello |
+| `HelloRequest` | `chain_conflicts` | `[{origin, stream, seq, held, seen?}]` | chain conflicts the node recorded and has not reported (`held` = hash the node holds, `seen` = the hash that contradicted it) |
+| `HelloResponse` | `unbound_h` | `[{origin, stream, seq, h}]` | the cloud's own hash for each slot named in `unbound` that it holds |
+| `PullRequest` | `stale_seals` | `[{origin, stream, seq}]` | stored cloud-origin seals under an op-signing key the caller no longer accepts |
+| `PullResponse` | `seal_refresh` | `[Seal]` | the current seal for each `stale_seals` entry |
+| `Refusal.reason` | `chain_conflict` | enum value | a body or link contradicts what the node holds or a seal states (add to the enum beside `fork_evidence_kept`) |
 
-## Verdicts and read-back
-Devices learn about their own held slots only as `held` (push) and `own_held` (pull) with one of
-`pending | held_manager | held_support`, and about refused configuration only through the `sync.void` op.
-Flags, reasons and attribution labels exist only behind member-token admin endpoints.
+## ADR-0005 A3 on this side (resolved; was "open questions")
+1. **Proof on the wire (A3.1).** `pack_v` is an integer on every device op; `proof` and `pin_v` ride only on `session.open` of a `pin` session and on
+   `approval.grant`, and `at` of `session.open` is the opening time the proof binds (`syncproto.Body`). The gateway asks identity once per proof
+   (`service/session.go`, `Idempotency-Key` from origin, stream and seq) and stores the verdict per `(tenant, origin, sid)` in `sessions`
+   (migration 0013); every later op is judged from that row (same actor, within 16 hours); a strong session is judged from `getSession`.
+   Identity unreachable is `pending`; `ResolveSessions` (the worker in `cmd/gateway`) asks again, clears the mark and flags a failure.
+2. **Directory routes (A3.2).** `realdir` answers credential, pack grants, member grants, recovery, session facts, pack history (any pack),
+   revocations with `reason` and `recovery_id` (cursor and set persisted), device series, outlet paper books and stream owner from
+   `identityclient/gen` and `tenancyclient/gen` (generated from the bundled specs). Caches follow A3.2. A lookup that cannot be asked counts a fault
+   (`directory.Faulty`): a configuration op then waits (`config_pending`), a trading fact keeps the pending mark.
+3. **Drain statement (A3.3).** `quarantine-upload` takes `PushRequest.drain_statement` (`hostry-drain-v1`, `syncproto/drain.go`, the three vectors of
+   `sync/conformance/v1.json`). The gateway reports drained only for a statement signed with the device's credential key that names exactly the ops it
+   holds (`service/drain.go`); anything else is stored as evidence with a vendor alert. `ReportPendingDrains` calls `recordDeviceDrained` with the
+   statement hash as its key until identity answers; nothing else calls it.
 
-## Document numbers
-`<code>/<FY>/<running>`, `code` 3 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no I, O, 0, 1), FY as four
-digits, six-digit running number. ADR-0002 S7 excludes `0` yet shows `A07/...`; the registry rule is followed and
-the example is not a valid code (the stub registry issues `AAA`, `AAB`, ...). The PoC intent registry is
-`syncproto/intents.go`; it also lists the demo intent names the TypeScript client uses.
+## Still open
+- **Wire fields of A2.8** (table above) are in `protocol-v1.md` since round 4; `Refusal.reason` `chain_conflict` is in the OpenAPI.
+- **Approval record fields.** `approval.grant` carries its record as a mutation `approval` (`id` = approval id; `permission`, `target`, `requester`,
+  `approver`, `action_hash`, `reason`); the gateway reads those names for `verifyProof` (`ProofVerification` kind approval). The entity file does not
+  name them yet.
+- `cmd/gateway` series events: `tenancy.series.issued` and `.closed` do not list `sync` as subscriber, so a series is seen within the 60-second cache time.
+
+## ADR-0014 A3 on this side (round 5, `1c94c67`)
+- **Vectors.** `syncproto/a3_vectors_test.go` runs `pii_placement` (`ServesPII`), `digest_row` (`RowText`), `action_hash` (`ActionHash`,
+  including the OV2 mismatch case) and `approval_proof` (`SessionProofMessage`, `ApprovalProofMessage`, `ProofMAC`) from the checkout.
+- **A3.1 placement.** `engine.Serve` and `Gateway.Snapshot`/`Hub.Snapshot` give `pii` (values with their salts) to a puller of kind `pos`,
+  `waiter`, `personal` or `hub` and never to a `kds`; the commitments (`pii_c`, in the body and on every snapshot row) reach every kind.
+  A node of those kinds keeps `pii-need:<op>` for an op whose commitments have no value (`pii_incomplete`) and lists it in the `placeholders`
+  of its next pull; the answer carries the op with its values, and a held op that arrives again with values is completed (verified, merged).
+  The cloud restore re-offer (and a day after it) offers the pii-bearing ops again, so an op the cloud took first from a relay that held no
+  values is completed (`engine.reofferPII`). The recovery upload carries the adopter's values.
+- **A3.2 hash.** `State.ApplyPII` adds the commitment of each `pii` field (`entities_gen.go` marks them) as the candidate `~c:<field>`,
+  merged by the field's own rule; `State.Hash` therefore covers commitments and no value, equal on every kind and unchanged by erasure.
+- **A3.3 approval citation.** `service/approval.go`; table `approval_verdicts` holds the record (migration 0015). Wire addition read from the
+  contract: intent `approval.self_confirm`; `Exception.reason` (`approval_flag`). Marks: `approval_flag` + `approval_reason:<reason>`,
+  `approval_pending`, `approved_by:<member>`. An approval cited from another origin is not found and stays `pending` (it is keyed by origin).
+- **Device sessions.** `deviceSessionExpired`: 26 hours, no PIN-session limit; the opening time is kept by `PutSession`.
+- **A3.4.** Stream binding uses the credential's `brand_id` only (no tenancy lookup per op; a device with none is bound to no brand stream); identity answers 503 until it has one.
+  Dev routes: `brand_id` is required at registration and answered with `kid` (also in `device`), the hub pack carries `kid`.

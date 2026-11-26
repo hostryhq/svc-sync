@@ -60,9 +60,9 @@ func (w *World) ActivateRecovery(d *Device, code string) (*Recovery, error) {
 		d.Recovered = d.Recovered[:len(d.Recovered)-1]
 		return nil, err
 	}
-	w.Identity.IssuePack(w.Tenant, newID, "v1", 7*24*time.Hour)
+	w.Identity.IssuePack(w.Tenant, newID, 1, 7*24*time.Hour)
 	d.ID, d.Key, d.Cred, d.KeyLost = newID, kp, env, false
-	d.sessions = map[string]string{}
+	d.sessions, d.badSessions = map[string]string{}, nil
 	for _, s := range w.Identity.SeriesOf(w.Tenant, newID) {
 		switch s.DocType {
 		case "tax_invoice":

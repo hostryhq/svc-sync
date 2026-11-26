@@ -72,7 +72,7 @@ func appDSN(t *testing.T, admin string) string {
 
 func clean(t *testing.T, st repository.Store) {
 	t.Helper()
-	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state, vendor_access_log, audit_log`)
+	_, err := st.DB().ExecContext(bg, `TRUNCATE ops, op_pii, seals, counters, meta, sessions, numbers, series_register, forks, recoveries, alerts, outbox, endorsements, attestations, restore_state, vendor_access_log, audit_log, approval_verdicts, drain_statements, series_numbers, emit_dedup`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ func TestSupportConfirmIsAuditedOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	tok := w.Issuer.Mint(authtest.Spec{Type: auth.TypeSupport, Tenant: ids.ID(w.Tenant), Mode: auth.ModeAct, Grants: authtest.Grants(nil, service.PermQuarantineConfirm)})
-	body, _ := json.Marshal(map[string]any{"origin": it.Origin, "stream": it.Stream, "seq": it.Seq, "reason": "cause confirmed"})
+	body, _ := json.Marshal(map[string]any{"origin": it.Origin, "stream": it.Stream, "seq": it.Seq, "reason": "cause confirmed", "h": it.H})
 	req := httptest.NewRequest(http.MethodPost, "/sync/v1/quarantine/confirm", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set(auth.ServiceTokenHeader, svc)

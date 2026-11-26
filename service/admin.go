@@ -10,6 +10,7 @@ import (
 	"github.com/hostryhq/go-common/apperr"
 	"github.com/hostryhq/go-common/logx"
 	"github.com/hostryhq/go-common/tenancy"
+	"github.com/hostryhq/svc-sync/engine"
 	"github.com/hostryhq/svc-sync/repository"
 	sp "github.com/hostryhq/svc-sync/syncproto"
 )
@@ -30,10 +31,50 @@ const (
 	ActionRelease = "release"
 	ActionDiscard = "discard"
 	ActionConfirm = "confirm"
+	ActionEmit    = "emit"
 )
 
 // MaxReason bounds the free-text reason of a decision.
 const MaxReason = 200
+
+// Errors of the conditions on manager decisions (security ruling, Phase 1 final verdict).
+var (
+	// ErrSelfRelease: a member may not release or discard a hold on an op recorded in their own name.
+	ErrSelfRelease = errors.New("service: a member cannot decide a hold on their own op")
+	// ErrConfirmHash: a vendor confirmation must name the hash of the held op it is for.
+	ErrConfirmHash = errors.New("service: the confirmation must carry the hash of the held op")
+)
+
+// A hold on an op that touches a guarded entity of the registry (money, tax, bill numbers) or carries a legal
+// number is a money or bill-number hold.
+func moneyHold(rec repository.OpRec) bool {
+	b, err := sp.DecodeBody(rec.Body)
+	if err != nil {
+		return false
+	}
+	if len(b.Documents()) > 0 {
+		return true
+	}
+	for _, m := range b.Muts {
+		if engine.Entities[m.E].Guarded {
+			return true
+		}
+	}
+	return false
+}
+
+// decisionConditions applies the conditions on release and discard: no self-decision, and for a money or
+// bill-number hold the approval a binding under caution needs (ADR-0005 A2.2).
+func (g *Gateway) decisionConditions(ctx context.Context, rec repository.OpRec) error {
+	p, _ := auth.PrincipalFrom(ctx)
+	if b, err := sp.DecodeBody(rec.Body); err == nil && b.Actor != "" && b.Actor == p.Subject {
+		return ErrSelfRelease
+	}
+	if moneyHold(rec) && p.UnderCaution(g.cfg.Now()) && !p.Approved {
+		return apperr.New(apperr.Forbidden, auth.CodeApprovalRequired, "approval required for this operation on a new device")
+	}
+	return nil
+}
 
 // ErrReasonRequired is returned when a sensitive decision carries no reason.
 var ErrReasonRequired = errors.New("service: a reason is required")
@@ -88,6 +129,13 @@ func (g *Gateway) list(ctx context.Context, perm, status string, withReason bool
 		recs, err := tx.ByStatus(status)
 		if err != nil {
 			return err
+		}
+		if status == repository.StFlagged { // an op that waits for its approval is an exception until it is final (P2-H1)
+			pend, err := pendingApprovalOps(tx)
+			if err != nil {
+				return err
+			}
+			recs = append(recs, pend...)
 		}
 		for _, r := range recs {
 			if !inScope(scope, r.Stream) {
@@ -196,6 +244,9 @@ func (g *Gateway) ReleaseAs(ctx context.Context, ref sp.Ref, reason string) (str
 		if err != nil {
 			return err
 		}
+		if err := g.decisionConditions(ctx, rec); err != nil {
+			return err
+		}
 		o := ReleaseOpts{}
 		if rec.Reason == ReasonUnsealedTail {
 			if rerr := auth.Require(ctx, PermDeviceRecover, outletOf(rec.Stream)); rerr != nil {
@@ -214,6 +265,9 @@ func (g *Gateway) ReleaseAs(ctx context.Context, ref sp.Ref, reason string) (str
 		}
 		after, _, _ := tx.GetOp(ref.Stream, ref.Origin, ref.Seq)
 		auth.SetAuditTarget(ctx, ref.Key())
+		if err := g.alert(tx, "owner", "medium", "hold_released", rec); err != nil { // the owner is told
+			return err
+		}
 		return g.record(ctx, tx, ActionRelease, rec, reason, before, after.Status)
 	})
 	if err == nil && status != "" {
@@ -234,11 +288,17 @@ func (g *Gateway) DiscardAs(ctx context.Context, ref sp.Ref, reason string) erro
 		if err != nil {
 			return err
 		}
+		if err := g.decisionConditions(ctx, rec); err != nil {
+			return err
+		}
 		before, err := g.discardIn(tx, ref)
 		if err != nil {
 			return err
 		}
 		auth.SetAuditTarget(ctx, ref.Key())
+		if err := g.alert(tx, "owner", "medium", "hold_discarded", rec); err != nil {
+			return err
+		}
 		return g.record(ctx, tx, ActionDiscard, rec, reason, before, repository.StVoided)
 	})
 	if err == nil {
@@ -252,7 +312,7 @@ func (g *Gateway) DiscardAs(ctx context.Context, ref sp.Ref, reason string) erro
 // hold (S11: "released only after vendor support has confirmed the cause"). It needs a support
 // token in act mode and the support_actable permission; it releases nothing, it marks the slot so
 // that the owner's manager can. A tenant member holding the permission is refused.
-func (g *Gateway) ConfirmAs(ctx context.Context, ref sp.Ref, reason string) error {
+func (g *Gateway) ConfirmAs(ctx context.Context, ref sp.Ref, reason, h string) error {
 	reason, err := checkReason(reason)
 	if err != nil {
 		return err
@@ -271,6 +331,9 @@ func (g *Gateway) ConfirmAs(ctx context.Context, ref sp.Ref, reason string) erro
 		default:
 			return ErrCannotRelease
 		}
+		if h == "" || h != rec.H {
+			return ErrConfirmHash // bound to the content the supporter looked at
+		}
 		if hasMark(splitMarks(rec.Marks), MarkVendorConfirmed) {
 			return nil
 		}
@@ -279,6 +342,10 @@ func (g *Gateway) ConfirmAs(ctx context.Context, ref sp.Ref, reason string) erro
 			return err
 		}
 		auth.SetAuditTarget(ctx, ref.Key())
+		// The tenant is told (an owner alert) and the decision is in the tenant-visible audit log.
+		if err := g.alert(tx, "owner", "high", "vendor_confirmed_hold", rec); err != nil {
+			return err
+		}
 		return g.record(ctx, tx, ActionConfirm, rec, reason, repository.StQuarantined, repository.StQuarantined)
 	})
 }

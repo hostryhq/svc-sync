@@ -252,7 +252,7 @@ func freshHub(t *testing.T, w *World, noRecoverer bool) *hub.Hub {
 	}
 	st := must(repository.Open("file:" + filepath.Join(t.TempDir(), "h.db")))
 	t.Cleanup(func() { _ = st.Close() })
-	return must(hub.New(bg, hub.Config{Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, Key: w.HubKey,
+	return must(hub.New(bg, hub.Config{Tenant: w.Tenant, Outlet: w.Outlet, Brand: w.Brand, Cred: w.HubCred, CredJWS: w.HubJWS, Key: w.HubKey,
 		IdentityPub: w.Identity.IdentityPub(), CloudKeys: map[string]*ecdsaPub{w.Identity.CloudKey.Kid: &w.Identity.CloudKey.Priv.PublicKey},
 		Store: st, Now: w.Clock.Now, Peers: peers,
 		Members:     func(actor string) bool { return w.Identity.InAnyPackOf(w.Tenant, w.Outlet, actor) },
