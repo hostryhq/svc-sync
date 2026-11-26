@@ -30,9 +30,11 @@ func NewDev(env, keyFile string) (*Dev, error) {
 	case keyFile != "":
 		b, err := os.ReadFile(keyFile)
 		if errors.Is(err, os.ErrNotExist) {
-			b = make([]byte, 32)
-			if _, err = rand.Read(b); err == nil {
-				err = os.WriteFile(keyFile, []byte(base64.RawURLEncoding.EncodeToString(b)), 0o600)
+			raw := make([]byte, 32)
+			if _, err = rand.Read(raw); err == nil {
+				// The seed is the persisted text, which is what the next process reads back and hashes.
+				b = []byte(base64.RawURLEncoding.EncodeToString(raw))
+				err = os.WriteFile(keyFile, b, 0o600)
 			}
 		}
 		if err != nil {
